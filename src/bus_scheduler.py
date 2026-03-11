@@ -108,16 +108,18 @@ def _check_p6(buses, trip, dep):
             return False
     return True
 
-def _bumped_ready_time(buses, trip, rt):
+def _bumped_ready_time(buses, trip, rt, natural_gap=None):
     """
-    Return rt bumped forward in SAME_DIR_GAP increments until P6 is satisfied.
-    Caps at 10 bumps to avoid infinite loops.
+    Return rt bumped forward until P6 is satisfied.
+    If natural_gap is provided, bumps by natural_gap to re-sync with fleet phase.
+    Otherwise falls back to SAME_DIR_GAP increments.
     """
-    for _ in range(10):
+    bump = natural_gap if natural_gap and natural_gap > SAME_DIR_GAP else SAME_DIR_GAP
+    for _ in range(20):
         if _check_p6(buses, trip, rt):
             return rt
-        rt += timedelta(minutes=SAME_DIR_GAP)
-    return rt  # return best-effort even if still violating after 10 bumps
+        rt += timedelta(minutes=bump)
+    return rt
 
 
 def _make_dead(bus, to_loc, dist, tt):
@@ -209,7 +211,7 @@ def _find_and_reposition(buses, trip, config, min_break):
                 travel_time_min=t, distance_km=d, shift=bus.shift)
     return bus, dead
 
-def _select_bus(buses, trip, config, min_break):
+def _select_bus(buses, trip, config, min_break, natural_gap=None):
     avg_km = _fleet_avg_km(buses)
     min_km = getattr(config, 'min_km_per_bus', 0) or 0
     candidates = []
@@ -217,8 +219,8 @@ def _select_bus(buses, trip, config, min_break):
         if bus.current_location != trip.start_location: continue
         if bus.soc_after_trip(trip.distance_km) < SOC_FLOOR: continue
         rt = _ready_time(bus, min_break)
-        # P6: bump until gap satisfied (re-checks after each increment)
-        rt = _bumped_ready_time(buses, trip, rt)
+        # P6: bump using natural_gap to re-sync fleet phase after charging
+        rt = _bumped_ready_time(buses, trip, rt, natural_gap=natural_gap)
         km_deficit = bus.total_km - avg_km
         below_min  = -50 if (min_km > 0 and bus.total_km < min_km) else 0
         km_penalty = max(0, km_deficit - KM_BALANCE_MAX) * 5.0
@@ -280,6 +282,13 @@ def schedule_buses(config: RouteConfig, trips: list[Trip]) -> list[BusState]:
         # bus is now at nearest_node, current_time = arrive_at
 
     # ── Phase 2: Revenue trips — P4-first (bus ready time = departure time) ─
+    # natural_gap = cycle_time / fleet — used to re-sync buses after charging detour
+    if dn_pool and up_pool:
+        cycle_time  = dn_pool[0].travel_time_min + min_break + up_pool[0].travel_time_min + min_break
+        natural_gap = cycle_time / max(1, config.fleet_size)
+    else:
+        natural_gap = None
+
     for idx, trip in enumerate(revenue_trips):
         trip_time = trip.earliest_departure
 
@@ -292,14 +301,14 @@ def schedule_buses(config: RouteConfig, trips: list[Trip]) -> list[BusState]:
                     _charging_detour(bus, config,
                                      resume_by=EVENING_PEAK_START, min_break=min_break)
 
-        best, rt = _select_bus(buses, trip, config, min_break)
+        best, rt = _select_bus(buses, trip, config, min_break, natural_gap=natural_gap)
 
         if best is None:
             repo = _find_and_reposition(buses, trip, config, min_break)
             if repo:
                 bus, dead = repo
                 bus.assign(dead)
-                best, rt = _select_bus(buses, trip, config, min_break)
+                best, rt = _select_bus(buses, trip, config, min_break, natural_gap=natural_gap)
 
         if best is None or rt is None:
             unassigned.append(trip)
