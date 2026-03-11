@@ -55,14 +55,10 @@ st.markdown("""
   /* Section headers */
   .section-title { font-size: 1.1rem; font-weight: 700; color: #1a1a2e; margin: 1.2rem 0 0.4rem 0; padding-bottom: 6px; border-bottom: 2px solid #e8eaed; }
 
-  /* Sidebar */
-  section[data-testid="stSidebar"] { background: #1a1a2e; }
-  section[data-testid="stSidebar"] * { color: #e2e8f0 !important; }
-  section[data-testid="stSidebar"] .stButton button { background: #4f46e5; color: white !important; border: none; border-radius: 8px; font-weight: 600; width: 100%; }
-  section[data-testid="stSidebar"] .stButton button:hover { background: #4338ca; }
-
   div[data-testid="stDownloadButton"] button { background: #4f46e5; color: white; border: none; border-radius: 8px; font-weight: 600; padding: 0.5rem 1.5rem; }
   div[data-testid="stDownloadButton"] button:hover { background: #4338ca; }
+  section[data-testid="stSidebar"] .stButton button { background: #4f46e5; color: white !important; border: none; border-radius: 8px; font-weight: 600; width: 100%; }
+  section[data-testid="stSidebar"] .stButton button:hover { background: #4338ca; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -353,11 +349,8 @@ if st.session_state.get("has_results"):
                         pi, _ = STATUS.get(prev_compliance[prev_idx]["status"], ("❓",""))
                         badge = f' <span style="font-size:.75rem;color:#888">{pi}→{icon}</span>'
 
-                with st.expander(
-                    f'<span class="rule-badge">{icon}</span> '
-                    f'<span class="rule-name">{rule["rule"]}</span>{badge}',
-                    expanded=(effective == "FAIL"),
-                ):
+                label = f"{icon} {rule['rule']}"
+                with st.expander(label, expanded=(effective == "FAIL")):
                     st.caption(rule.get("details", ""))
                     if viols:
                         for v in viols: st.markdown(f"- {v}")
@@ -548,19 +541,6 @@ if st.session_state.get("has_results"):
                     value=int(config.max_headway_deviation_min), min_value=0, step=1,
                     help="Max minutes the safety-net pass can shift a trip to enforce the driver break. Formerly 'Max Headway Deviation'.")
 
-            st.markdown("#### 📊 Headway Profile")
-            st.caption("Controls service frequency (trips per day). Smaller = more trips.")
-            raw_hw = st.session_state.get("raw_headway_df")
-            edited_headway = st.data_editor(
-                raw_hw if raw_hw is not None else pd.DataFrame(),
-                key="headway_editor", hide_index=True,
-                column_config={
-                    "time_from":   st.column_config.TextColumn("From", disabled=True),
-                    "time_to":     st.column_config.TextColumn("To",   disabled=True),
-                    "headway_min": st.column_config.NumberColumn("Headway (min)", min_value=5, max_value=120, step=1),
-                },
-            )
-
             # Segment distances (read-only)
             with st.expander("📍 Segment Distances & Times (read-only)"):
                 seg_rows = [{"Segment": k, "Distance (km)": d,
@@ -591,10 +571,7 @@ if st.session_state.get("has_results"):
 
             with st.spinner("Regenerating..."):
                 try:
-                    result = rerun_from_overrides(
-                        overrides,
-                        headway_overrides=edited_headway if not edited_headway.empty else None,
-                    )
+                    result = rerun_from_overrides(overrides)
                 except Exception as e:
                     st.error(f"Error: {e}"); result = None
 
