@@ -91,6 +91,19 @@ def _last_revenue_in_direction(bus, direction, start_location):
             return t
     return None
 
+def _last_revenue_any_direction(buses, start_location):
+    """Most-recent revenue departure from start_location across ALL buses."""
+    latest = None
+    for bus in buses:
+        for t in reversed(bus.trips):
+            if (t.trip_type == "Revenue" and
+                    t.start_location == start_location and
+                    t.actual_departure is not None):
+                if latest is None or t.actual_departure > latest.actual_departure:
+                    latest = t
+                break  # only need most recent per bus
+    return latest
+
 def _check_p6(buses, trip, dep):
     """
     P6: 5-min gap from the most-recent same-direction revenue trip of ANY other bus.
@@ -108,16 +121,64 @@ def _check_p6(buses, trip, dep):
             return False
     return True
 
-def _bumped_ready_time(buses, trip, rt):
+def _bumped_ready_time(buses, trip, rt, natural_gap=None):
     """
-    Return rt bumped forward in SAME_DIR_GAP increments until P6 is satisfied.
-    Caps at 10 bumps to avoid infinite loops.
+    Return rt bumped forward until P6 is satisfied.
+    If natural_gap is provided, bumps by natural_gap to re-sync with fleet phase.
+    Otherwise falls back to SAME_DIR_GAP increments.
     """
-    for _ in range(10):
+    bump = natural_gap if natural_gap and natural_gap > SAME_DIR_GAP else SAME_DIR_GAP
+    for _ in range(20):
         if _check_p6(buses, trip, rt):
             return rt
-        rt += timedelta(minutes=SAME_DIR_GAP)
-    return rt  # return best-effort even if still violating after 10 bumps
+        rt += timedelta(minutes=bump)
+    return rt
+
+
+def _snap_to_phase(rt: datetime, phase_index: int, natural_gap: float,
+                   fleet_size: int, op_start: datetime) -> datetime:
+    """
+    Snap rt forward to this bus's designated phase slot.
+
+    After any disruption (charging, dead run, P6 bump) a bus may be displaced
+    from its phase.  Absolute phase locking snaps it back to the nearest future
+    slot in its own lane rather than nudging relative to other buses.
+
+    Phase slots for bus i (anchor = op_start):
+        op_start + i*natural_gap + k*cycle_time   for k = 0, 1, 2, ...
+    where cycle_time = natural_gap * fleet_size.
+
+    Using op_start as epoch is intentional: it matches the Phase-1 stagger
+    (arrive_at = op_start + i * stagger_min) so phase 0 == first slot, etc.
+
+    Args:
+        rt:           earliest the bus could depart (may be between slots)
+        phase_index:  bus's permanent phase index (0 … fleet_size-1)
+        natural_gap:  cycle_time / fleet_size (minutes, float)
+        fleet_size:   number of buses on route
+        op_start:     operating start datetime (REF_DATE + hour/min)
+
+    Returns:
+        Earliest datetime >= rt that falls on this bus's phase lane.
+    """
+    if natural_gap <= 0 or fleet_size <= 0:
+        return rt
+
+    cycle_time   = natural_gap * fleet_size
+    phase_anchor = op_start + timedelta(minutes=phase_index * natural_gap)
+    delta_min    = (rt - phase_anchor).total_seconds() / 60
+
+    # rt is before the first slot for this bus — snap to first slot
+    if delta_min <= 0:
+        return phase_anchor
+
+    remainder = delta_min % cycle_time
+    # Within 0.5 min of a slot: treat as already on-slot (float-precision guard)
+    if remainder < 0.5:
+        return rt
+
+    snap_ahead = cycle_time - remainder
+    return rt + timedelta(minutes=snap_ahead)
 
 
 def _make_dead(bus, to_loc, dist, tt):
@@ -209,7 +270,7 @@ def _find_and_reposition(buses, trip, config, min_break):
                 travel_time_min=t, distance_km=d, shift=bus.shift)
     return bus, dead
 
-def _select_bus(buses, trip, config, min_break):
+def _select_bus(buses, trip, config, min_break, natural_gap=None):
     avg_km = _fleet_avg_km(buses)
     min_km = getattr(config, 'min_km_per_bus', 0) or 0
     candidates = []
@@ -217,8 +278,20 @@ def _select_bus(buses, trip, config, min_break):
         if bus.current_location != trip.start_location: continue
         if bus.soc_after_trip(trip.distance_km) < SOC_FLOOR: continue
         rt = _ready_time(bus, min_break)
-        # P6: bump until gap satisfied (re-checks after each increment)
-        rt = _bumped_ready_time(buses, trip, rt)
+        # Absolute phase lock: snap rt to this bus's permanent phase lane.
+        # Replaces the old relative natural_gap/2 check which only reduced
+        # bunching; this eliminates it by assigning each bus a fixed clock lane.
+        # _snap_to_phase uses op_start as epoch, consistent with Phase-1 stagger.
+        if natural_gap and hasattr(bus, 'phase_index'):
+            op_start_dt = REF_DATE.replace(
+                hour=config.operating_start.hour,
+                minute=config.operating_start.minute,
+            )
+            rt = _snap_to_phase(rt, bus.phase_index, natural_gap,
+                                 config.fleet_size, op_start_dt)
+        # P6 safety-net: bump by natural_gap (= one full cycle slot) so that any
+        # residual violation advances rt to the same bus's next valid phase slot.
+        rt = _bumped_ready_time(buses, trip, rt, natural_gap=natural_gap)
         km_deficit = bus.total_km - avg_km
         below_min  = -50 if (min_km > 0 and bus.total_km < min_km) else 0
         km_penalty = max(0, km_deficit - KM_BALANCE_MAX) * 5.0
@@ -277,9 +350,19 @@ def schedule_buses(config: RouteConfig, trips: list[Trip]) -> list[BusState]:
         arrive_at = op_start_dt + timedelta(minutes=i * stagger_min)
         bus.current_time = arrive_at - timedelta(minutes=nearest_tt)
         _morning_dead_run(bus, config)
+        # Permanent phase index — set once here, never changed.
+        # Matches the stagger: bus i's first revenue slot is op_start + i*stagger_min.
+        bus.phase_index = i
         # bus is now at nearest_node, current_time = arrive_at
 
     # ── Phase 2: Revenue trips — P4-first (bus ready time = departure time) ─
+    # natural_gap = cycle_time / fleet — used to re-sync buses after charging detour
+    if dn_pool and up_pool:
+        cycle_time  = dn_pool[0].travel_time_min + min_break + up_pool[0].travel_time_min + min_break
+        natural_gap = cycle_time / max(1, config.fleet_size)
+    else:
+        natural_gap = None
+
     for idx, trip in enumerate(revenue_trips):
         trip_time = trip.earliest_departure
 
@@ -292,14 +375,14 @@ def schedule_buses(config: RouteConfig, trips: list[Trip]) -> list[BusState]:
                     _charging_detour(bus, config,
                                      resume_by=EVENING_PEAK_START, min_break=min_break)
 
-        best, rt = _select_bus(buses, trip, config, min_break)
+        best, rt = _select_bus(buses, trip, config, min_break, natural_gap=natural_gap)
 
         if best is None:
             repo = _find_and_reposition(buses, trip, config, min_break)
             if repo:
                 bus, dead = repo
                 bus.assign(dead)
-                best, rt = _select_bus(buses, trip, config, min_break)
+                best, rt = _select_bus(buses, trip, config, min_break, natural_gap=natural_gap)
 
         if best is None or rt is None:
             unassigned.append(trip)
