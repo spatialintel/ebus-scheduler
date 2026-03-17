@@ -4,9 +4,31 @@ config_loader.py — Reads the eBus Config Input Excel and returns:
     2. headway_df (pandas DataFrame: time_from, time_to, headway_min)
     3. travel_time_df (pandas DataFrame: time_from, time_to, up_min, dn_min)
 
-Usage:
-    from src.config_loader import load_config
-    config, headway_df, travel_time_df = load_config("config/eBus_Config_Input.xlsx")
+Supports both the legacy Excel layout and the v5 template layout.
+
+Layout differences handled transparently:
+
+  Field map columns
+    Legacy  : column B = parameter name, column C = value
+    v5      : column A = parameter name, column B = value
+
+  Travel-time sheet name
+    Legacy  : "TravelTime_Profile"
+    v5      : "Travel_Time"   (either is accepted)
+
+  Segment table
+    Legacy  : embedded in Route_Config, "Sr." header, resolved names in cols G/H
+    v5      : standalone "Distances" sheet (A=from, B=to, C=dist_km, D=time_min)
+
+  Coordinates
+    Legacy  : embedded in Route_Config with "Location Label" header (cols B-E)
+    v5      : standalone "Coordinates" sheet (A=name, B=lat, C=lon)
+
+New fields added in v5 (read with safe defaults so legacy files continue working):
+    avg_speed_kmph              default 30.0  — fallback when segment time is missing
+    max_layover_min             default 20    — P4 upper break limit
+    midday_charge_soc_percent   default 65.0  — P5 trigger SOC
+    off_peak_layover_extra_min  default 0     — extra break 11:00-16:00
 """
 
 from __future__ import annotations
@@ -50,88 +72,234 @@ def _parse_int(val, field_name: str) -> int:
     return int(_parse_float(val, field_name))
 
 
+def _find_sheet(wb, *names: str):
+    """Return the first worksheet whose name matches any of *names (case-insensitive)."""
+    name_map = {s.lower(): s for s in wb.sheetnames}
+    for candidate in names:
+        found = name_map.get(candidate.lower())
+        if found:
+            return wb[found]
+    return None
+
+
+# ── Field-map builder ────────────────────────────────────────────────
+
 def _build_field_map(ws) -> dict[str, tuple]:
     """
-    Scan column B of Route_Config sheet. Build a dict of field_name -> (row, value_from_C).
-    Skips section headers (value in C is None and label doesn't contain underscore).
+    Scan the Route_Config sheet and build {field_name: (row, value)}.
+
+    Supports two layouts:
+      Legacy (v4 and earlier): col B = parameter name, col C = value
+      v5 template:             col A = parameter name, col B = value
+
+    Detection: if any cell in column A looks like a parameter name (contains
+    underscore or is a known key), use A/B layout; otherwise fall back to B/C.
     """
-    field_map = {}
+    # Detect layout by sampling column A — if it has snake_case keys, use A/B
+    col_a_vals = [ws.cell(r, 1).value for r in range(1, min(ws.max_row + 1, 60))]
+    has_snake_in_a = any(
+        isinstance(v, str) and "_" in v
+        for v in col_a_vals if v is not None
+    )
+    label_col = 1 if has_snake_in_a else 2   # 1=A, 2=B
+    value_col = label_col + 1                 # B or C
+
+    field_map: dict[str, tuple] = {}
     for row in range(1, ws.max_row + 1):
-        label = ws.cell(row, 2).value
+        label = ws.cell(row, label_col).value
         if label is None:
             continue
         label_clean = str(label).strip()
-        field_map[label_clean] = (row, ws.cell(row, 3).value)
+        field_map[label_clean] = (row, ws.cell(row, value_col).value)
     return field_map
 
 
 def _get(field_map: dict, key: str):
-    """Look up a field value. Raises ConfigError if missing."""
+    """Look up a field value by exact key. Raises ConfigError if missing."""
     if key not in field_map:
         raise ConfigError(f"Field '{key}' not found in Route_Config sheet")
     return field_map[key][1]
 
 
+def _get_opt(field_map: dict, key: str, default=None):
+    """Look up a field value, return default instead of raising if missing."""
+    entry = field_map.get(key)
+    if entry is None:
+        return default
+    val = entry[1]
+    return val if val is not None else default
+
+
 # ── Location parser ──────────────────────────────────────────────────
 
-def _parse_locations(ws, field_map: dict):
+def _parse_locations(ws, wb, field_map: dict):
     """
-    Read the Locations table. Returns:
-        locations: dict  {label: name}  e.g. {"Depot": "DEPOT", "Start point": "GANGAJALIA BUS STAND"}
-        coords: dict     {name: (lat, lon)}  only for locations that have lat/lon filled
+    Read locations (depot, start, end, intermediates) and coordinates.
+
+    Strategy (tries in order):
+      1. Standalone "Coordinates" sheet (v5 layout)
+      2. Embedded "Location Label" table in Route_Config (legacy layout)
+
+    Returns:
+        locations : dict  {label: name}
+        coords    : dict  {name: (lat, lon)}
     """
-    # Find the "Location Label" header row
-    header_row = None
-    for row in range(1, ws.max_row + 1):
-        if ws.cell(row, 2).value == "Location Label":
-            header_row = row
-            break
-    if header_row is None:
-        raise ConfigError("Cannot find 'Location Label' header in Route_Config")
+    locations: dict[str, str] = {}
+    coords:    dict[str, tuple] = {}
 
-    locations = {}
-    coords = {}
-    r = header_row + 1
-    while r <= ws.max_row:
-        label = ws.cell(r, 2).value
-        name = ws.cell(r, 3).value
-        if label is None or name is None:
-            break
-        label = str(label).strip()
-        name = str(name).strip()
-        locations[label] = name
+    # ── Strategy 1: standalone Coordinates sheet ─────────────────────────────
+    coord_ws = _find_sheet(wb, "Coordinates", "Coords", "Locations")
+    if coord_ws is not None:
+        # Expect header row with "location_name" / "latitude" / "longitude"
+        # or just read from row 2 onwards with A=name, B=lat, C=lon
+        header_found = False
+        for r in range(1, coord_ws.max_row + 1):
+            v = coord_ws.cell(r, 1).value
+            if v and str(v).lower() in ("location_name", "location", "name"):
+                header_found = True
+                continue
+            if v is None:
+                break
+            name = str(v).strip()
+            lat  = coord_ws.cell(r, 2).value
+            lon  = coord_ws.cell(r, 3).value
+            if name and lat is not None and lon is not None:
+                try:
+                    coords[name] = (float(lat), float(lon))
+                except (ValueError, TypeError):
+                    pass
 
-        lat = ws.cell(r, 4).value
-        lon = ws.cell(r, 5).value
-        if lat is not None and lon is not None:
-            try:
-                coords[name] = (float(lat), float(lon))
-            except (ValueError, TypeError):
-                pass
-        r += 1
+    # Also read location labels from the field map (v5 stores them as plain fields)
+    for key in ("depot", "start_point", "end_point",
+                "intermediate_1", "intermediate_2"):
+        val = _get_opt(field_map, key)
+        if val:
+            # Map to legacy location label style
+            label_map = {
+                "depot":          "Depot",
+                "start_point":    "Start point",
+                "end_point":      "End point",
+                "intermediate_1": "Intermediate point 1",
+                "intermediate_2": "Intermediate point 2",
+            }
+            locations[label_map[key]] = str(val).strip()
+
+    # ── Strategy 2: legacy embedded "Location Label" table ───────────────────
+    if not locations:
+        header_row = None
+        for row in range(1, ws.max_row + 1):
+            if ws.cell(row, 2).value == "Location Label":
+                header_row = row
+                break
+        if header_row is None:
+            # Also try col 1 (v5 layout)
+            for row in range(1, ws.max_row + 1):
+                if ws.cell(row, 1).value == "Location Label":
+                    header_row = row
+                    break
+
+        if header_row is not None:
+            r = header_row + 1
+            while r <= ws.max_row:
+                # Determine offset from detection above
+                label = ws.cell(r, 2).value
+                name  = ws.cell(r, 3).value
+                if label is None or name is None:
+                    break
+                label = str(label).strip()
+                name  = str(name).strip()
+                locations[label] = name
+                lat = ws.cell(r, 4).value
+                lon = ws.cell(r, 5).value
+                if lat is not None and lon is not None:
+                    try:
+                        coords[name] = (float(lat), float(lon))
+                    except (ValueError, TypeError):
+                        pass
+                r += 1
 
     return locations, coords
 
 
 # ── Segment parser ───────────────────────────────────────────────────
 
-def _parse_segments(ws):
+def _parse_segments(ws, wb, avg_speed_kmph: float = 30.0):
     """
-    Read the segment distance/time table. Uses the 'Resolved From' (col G) and
-    'Resolved To' (col H) columns for the actual location names.
+    Read segment distances and travel times.
+
+    Strategy (tries in order):
+      1. Standalone "Distances" sheet (v5 layout):
+            A=from_location, B=to_location, C=distance_km, D=time_min
+         time_min may be blank → estimated from distance / avg_speed_kmph.
+      2. Embedded "Sr." table in Route_Config (legacy layout):
+            resolved names in cols G/H, distance col E, time col F.
+
     Returns: segment_distances dict, segment_times dict
     """
-    # Find the "Sr." header row
+    distances: dict[str, float] = {}
+    times:     dict[str, int]   = {}
+
+    # ── Strategy 1: standalone Distances sheet ────────────────────────────────
+    dist_ws = _find_sheet(wb, "Distances", "Segment_Distances", "Segments")
+    if dist_ws is not None:
+        # Skip header row(s): scan until we find a row where A looks like a location
+        data_start = None
+        for r in range(1, dist_ws.max_row + 1):
+            v = dist_ws.cell(r, 1).value
+            if v and str(v).lower() not in (
+                "from_location", "from", "origin", "segment", "sr", "sr."
+            ):
+                data_start = r
+                break
+
+        if data_start is not None:
+            for r in range(data_start, dist_ws.max_row + 1):
+                fr   = dist_ws.cell(r, 1).value
+                to   = dist_ws.cell(r, 2).value
+                dist = dist_ws.cell(r, 3).value
+                tt   = dist_ws.cell(r, 4).value
+
+                if fr is None or to is None or dist is None:
+                    continue
+                try:
+                    fr   = str(fr).strip()
+                    to   = str(to).strip()
+                    dist = float(dist)
+                except (ValueError, TypeError):
+                    continue
+
+                if dist <= 0:
+                    continue
+
+                # Fallback: estimate time from avg_speed if not provided
+                if tt is None or str(tt).strip() == "":
+                    tt = round(dist / max(avg_speed_kmph, 1) * 60)
+                else:
+                    try:
+                        tt = int(float(tt))
+                    except (ValueError, TypeError):
+                        tt = round(dist / max(avg_speed_kmph, 1) * 60)
+
+                key = RouteConfig.segment_key(fr, to)
+                distances[key] = dist
+                times[key]     = tt
+
+        if distances:
+            return distances, times
+        # Fall through to legacy if Distances sheet was empty
+
+    # ── Strategy 2: legacy embedded "Sr." table ──────────────────────────────
     header_row = None
     for row in range(1, ws.max_row + 1):
         if ws.cell(row, 2).value == "Sr.":
             header_row = row
             break
     if header_row is None:
-        raise ConfigError("Cannot find 'Sr.' header in segment table")
+        raise ConfigError(
+            "No segment data found. Expected either a 'Distances' sheet "
+            "or an embedded 'Sr.' table in Route_Config."
+        )
 
-    distances = {}
-    times = {}
     r = header_row + 1
     while r <= ws.max_row:
         sr = ws.cell(r, 2).value
@@ -142,33 +310,33 @@ def _parse_segments(ws):
         except (ValueError, TypeError):
             break
 
-        # Resolved names from formula columns G, H
         res_from = ws.cell(r, 7).value
-        res_to = ws.cell(r, 8).value
+        res_to   = ws.cell(r, 8).value
 
-        # Fall back to generic labels + location lookup if resolved is empty
         if not res_from or not res_to:
             r += 1
             continue
 
         res_from = str(res_from).strip()
-        res_to = str(res_to).strip()
+        res_to   = str(res_to).strip()
 
         dist = ws.cell(r, 5).value
-        tt = ws.cell(r, 6).value
+        tt   = ws.cell(r, 6).value
 
-        if dist is None or tt is None:
+        if dist is None:
             r += 1
             continue
 
         dist = float(dist)
-        tt = int(float(tt))
+        if tt is None:
+            tt = round(dist / max(avg_speed_kmph, 1) * 60)
+        else:
+            tt = int(float(tt))
 
-        # Skip zero-distance pairs (unused intermediate points)
         if dist > 0:
             key = RouteConfig.segment_key(res_from, res_to)
             distances[key] = dist
-            times[key] = tt
+            times[key]     = tt
 
         r += 1
 
@@ -179,30 +347,41 @@ def _parse_segments(ws):
 
 def _parse_headway(wb) -> pd.DataFrame:
     """Read Headway_Profile sheet into a DataFrame."""
-    ws = wb["Headway_Profile"]
+    ws = _find_sheet(wb, "Headway_Profile", "Headway")
+    if ws is None:
+        raise ConfigError("Missing required sheet: 'Headway_Profile'")
 
-    # Find the header row with "Time From"
+    # Find header row containing "Time From" in col B or col A
     header_row = None
     for row in range(1, ws.max_row + 1):
-        if ws.cell(row, 2).value == "Time From":
-            header_row = row
+        for col in (1, 2):
+            if str(ws.cell(row, col).value or "").strip().lower() in ("time from", "time_from"):
+                header_row = row
+                # Detect which column the data starts in
+                data_col = col
+                break
+        if header_row:
             break
+
     if header_row is None:
         raise ConfigError("Cannot find 'Time From' header in Headway_Profile")
 
     rows = []
     r = header_row + 1
     while r <= ws.max_row:
-        tf = ws.cell(r, 2).value
-        tt = ws.cell(r, 3).value
-        hw = ws.cell(r, 4).value
+        tf = ws.cell(r, data_col).value
+        tt = ws.cell(r, data_col + 1).value
+        hw = ws.cell(r, data_col + 2).value
         if tf is None:
             break
-        rows.append({
-            "time_from": str(tf).strip(),
-            "time_to": str(tt).strip(),
-            "headway_min": int(float(hw)),
-        })
+        try:
+            rows.append({
+                "time_from":   str(tf).strip(),
+                "time_to":     str(tt).strip(),
+                "headway_min": int(float(hw)),
+            })
+        except (ValueError, TypeError):
+            pass
         r += 1
 
     if not rows:
@@ -214,36 +393,50 @@ def _parse_headway(wb) -> pd.DataFrame:
 # ── Travel time parser ───────────────────────────────────────────────
 
 def _parse_travel_time(wb) -> pd.DataFrame:
-    """Read TravelTime_Profile sheet into a DataFrame."""
-    ws = wb["TravelTime_Profile"]
+    """Read TravelTime_Profile or Travel_Time sheet into a DataFrame."""
+    ws = _find_sheet(wb, "TravelTime_Profile", "Travel_Time",
+                     "TravelTime", "Travel Time")
+    if ws is None:
+        raise ConfigError(
+            "Missing required sheet: expected 'TravelTime_Profile' or 'Travel_Time'"
+        )
 
     header_row = None
+    data_col = 2
     for row in range(1, ws.max_row + 1):
-        if ws.cell(row, 2).value == "Time From":
-            header_row = row
+        for col in (1, 2):
+            if str(ws.cell(row, col).value or "").strip().lower() in ("time from", "time_from"):
+                header_row = row
+                data_col = col
+                break
+        if header_row:
             break
+
     if header_row is None:
-        raise ConfigError("Cannot find 'Time From' header in TravelTime_Profile")
+        raise ConfigError("Cannot find 'Time From' header in travel-time sheet")
 
     rows = []
     r = header_row + 1
     while r <= ws.max_row:
-        tf = ws.cell(r, 2).value
-        tt = ws.cell(r, 3).value
-        up = ws.cell(r, 4).value
-        dn = ws.cell(r, 5).value
+        tf = ws.cell(r, data_col).value
+        tt = ws.cell(r, data_col + 1).value
+        up = ws.cell(r, data_col + 2).value
+        dn = ws.cell(r, data_col + 3).value
         if tf is None:
             break
-        rows.append({
-            "time_from": str(tf).strip(),
-            "time_to": str(tt).strip(),
-            "up_min": int(float(up)),
-            "dn_min": int(float(dn)),
-        })
+        try:
+            rows.append({
+                "time_from": str(tf).strip(),
+                "time_to":   str(tt).strip(),
+                "up_min":    int(float(up)),
+                "dn_min":    int(float(dn)),
+            })
+        except (ValueError, TypeError):
+            pass
         r += 1
 
     if not rows:
-        raise ConfigError("TravelTime_Profile sheet has no data rows")
+        raise ConfigError("Travel-time sheet has no data rows")
 
     return pd.DataFrame(rows)
 
@@ -257,8 +450,7 @@ def load_config(excel_path: str | Path) -> tuple[RouteConfig, pd.DataFrame, pd.D
         headway_df      DataFrame with columns: time_from, time_to, headway_min
         travel_time_df  DataFrame with columns: time_from, time_to, up_min, dn_min
 
-    The Excel must have been recalculated (formulas resolved to values).
-    Use data_only=True to read calculated values from formula cells.
+    Accepts both legacy (v4) and v5 template layouts transparently.
     """
     path = Path(excel_path)
     if not path.exists():
@@ -266,23 +458,26 @@ def load_config(excel_path: str | Path) -> tuple[RouteConfig, pd.DataFrame, pd.D
 
     wb = load_workbook(path, data_only=True)
 
-    # Verify required sheets
-    required_sheets = ["Route_Config", "Headway_Profile", "TravelTime_Profile"]
-    for s in required_sheets:
-        if s not in wb.sheetnames:
-            raise ConfigError(f"Missing required sheet: '{s}'")
+    # ── Find the main config sheet (accept both name variants) ───────────────
+    ws = _find_sheet(wb, "Route_Config", "Config", "route_config")
+    if ws is None:
+        raise ConfigError(
+            f"Missing required sheet: expected 'Route_Config' or 'Config'. "
+            f"Found sheets: {wb.sheetnames}"
+        )
 
-    ws = wb["Route_Config"]
-
-    # 1. Parse key-value fields
+    # ── Field map ─────────────────────────────────────────────────────────────
     fm = _build_field_map(ws)
 
-    # 2. Parse locations and coordinates
-    locations, coords = _parse_locations(ws, fm)
+    # ── Read avg_speed early — needed by segment parser ───────────────────────
+    avg_speed = float(_get_opt(fm, "avg_speed_kmph", 30.0) or 30.0)
 
-    depot = locations.get("Depot")
+    # ── Parse locations and coordinates ───────────────────────────────────────
+    locations, coords = _parse_locations(ws, wb, fm)
+
+    depot       = locations.get("Depot")
     start_point = locations.get("Start point")
-    end_point = locations.get("End point")
+    end_point   = locations.get("End point")
 
     if not all([depot, start_point, end_point]):
         raise ConfigError(
@@ -296,13 +491,21 @@ def load_config(excel_path: str | Path) -> tuple[RouteConfig, pd.DataFrame, pd.D
         if name:
             intermediates.append(name)
 
-    # 3. Parse segment distances and times
-    seg_distances, seg_times = _parse_segments(ws)
+    # ── Parse segment distances and times ─────────────────────────────────────
+    seg_distances, seg_times = _parse_segments(ws, wb, avg_speed_kmph=avg_speed)
 
     if not seg_distances:
-        raise ConfigError("No valid segment distances found in the segment table")
+        raise ConfigError("No valid segment distances found")
 
-    # 4. Build RouteConfig
+    # ── Build RouteConfig ─────────────────────────────────────────────────────
+    # Legacy field name for consumption rate has a unit suffix; v5 uses plain name
+    consumption_key = ("consumption_rate (kWh/km)"
+                       if "consumption_rate (kWh/km)" in fm
+                       else "consumption_rate")
+
+    fleet_raw = _get(fm, "fleet_size")
+    fleet_size = int(float(fleet_raw)) if fleet_raw is not None else 0
+
     config = RouteConfig(
         route_code=str(_get(fm, "route_code")).strip(),
         route_name=str(_get(fm, "route_name")).strip(),
@@ -310,15 +513,15 @@ def load_config(excel_path: str | Path) -> tuple[RouteConfig, pd.DataFrame, pd.D
         start_point=start_point,
         end_point=end_point,
         intermediates=intermediates,
-        fleet_size=_parse_int(_get(fm, "fleet_size"), "fleet_size"),
+        fleet_size=fleet_size,
         battery_kwh=_parse_float(_get(fm, "battery_kwh"), "battery_kwh"),
-        consumption_rate=_parse_float(
-            _get(fm, "consumption_rate (kWh/km)"), "consumption_rate"
-        ),
+        consumption_rate=_parse_float(_get(fm, consumption_key), "consumption_rate"),
         initial_soc_percent=_parse_float(
             _get(fm, "initial_soc_percent"), "initial_soc_percent"
         ),
-        depot_charger_kw=_parse_float(_get(fm, "depot_charger_kw"), "depot_charger_kw"),
+        depot_charger_kw=_parse_float(
+            _get(fm, "depot_charger_kw"), "depot_charger_kw"
+        ),
         depot_charger_efficiency=_parse_float(
             _get(fm, "depot_charger_efficiency"), "depot_charger_efficiency"
         ),
@@ -343,7 +546,9 @@ def load_config(excel_path: str | Path) -> tuple[RouteConfig, pd.DataFrame, pd.D
         operating_start=_parse_time(_get(fm, "operating_start")),
         operating_end=_parse_time(_get(fm, "operating_end")),
         shift_split=_parse_time(_get(fm, "shift_split")),
-        min_layover_min=_parse_int(_get(fm, "min_layover_min"), "min_layover_min"),
+        min_layover_min=_parse_int(
+            _get(fm, "min_layover_min"), "min_layover_min"
+        ),
         preferred_layover_min=_parse_int(
             _get(fm, "preferred_layover_min"), "preferred_layover_min"
         ),
@@ -359,11 +564,24 @@ def load_config(excel_path: str | Path) -> tuple[RouteConfig, pd.DataFrame, pd.D
         segment_distances=seg_distances,
         segment_times=seg_times,
         location_coords=coords,
-        min_km_per_bus=_parse_float(fm.get("min_km_per_bus", (0, 0))[1] or 0, "min_km_per_bus"),
+        # ── New v5 fields — safe defaults when not present in Excel ──────────
+        min_km_per_bus=float(
+            _get_opt(fm, "min_km_per_bus", 0) or 0
+        ),
+        max_layover_min=int(float(
+            _get_opt(fm, "max_layover_min", 20) or 20
+        )),
+        midday_charge_soc_percent=float(
+            _get_opt(fm, "midday_charge_soc_percent", 65.0) or 65.0
+        ),
+        off_peak_layover_extra_min=int(float(
+            _get_opt(fm, "off_peak_layover_extra_min", 0) or 0
+        )),
+        avg_speed_kmph=avg_speed,
     )
 
-    # 5. Parse headway and travel time profiles
-    headway_df = _parse_headway(wb)
+    # ── Parse headway and travel time profiles ─────────────────────────────────
+    headway_df     = _parse_headway(wb)
     travel_time_df = _parse_travel_time(wb)
 
     wb.close()
