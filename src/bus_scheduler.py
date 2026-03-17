@@ -52,7 +52,7 @@ def _effective_break(config, current_time: datetime, base_break: int) -> int:
     capped at max_layover_min so P4 is never violated by construction.
     """
     if _is_off_peak(current_time):
-        extra = getattr(config, 'off_peak_layover_extra_min', 10)
+        extra = getattr(config, 'off_peak_layover_extra_min', 0)
         max_b = getattr(config, 'max_layover_min', MAX_BREAK)
         return min(base_break + extra, max_b)
     return base_break
@@ -350,7 +350,7 @@ def _select_bus(buses, trip, config, min_break, natural_gap=None):
             )
             snap_gap = natural_gap
             if _is_off_peak(rt):
-                extra = getattr(config, 'off_peak_layover_extra_min', 10)
+                extra = getattr(config, 'off_peak_layover_extra_min', 0)
                 snap_gap = natural_gap + extra / max(1, config.fleet_size)
             rt = _snap_to_phase(rt, bus.phase_index, snap_gap,
                                  config.fleet_size, op_start_dt)
