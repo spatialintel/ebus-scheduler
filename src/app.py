@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, time as dtime
 
 import streamlit as st
 import pandas as pd
+import plotly.graph_objects as go
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -145,6 +146,224 @@ def build_route_depiction(config, buses):
         df = df.sort_values(["Bus", "_dep_dt"]).reset_index(drop=True)
     return df
 
+def build_route_diagram(config, buses):
+    """
+    Straight-line schematic of the route topology.
+
+    Layout
+    ------
+    • Main route nodes (depot-nearest → intermediates → terminals) on y=1.
+    • Depot placed below the line at y=0, connected to nearest-node by a
+      dashed vertical+horizontal leader.
+    • X-axis = cumulative distance from the left-most node (0 km).
+    • Segment distance + travel-time labels sit above/below each arc.
+    • Per-stop trip counters and colour-coded arrows show service intensity.
+    """
+    from src.bus_scheduler import _nearest_node_from_depot
+
+    PALETTE = {
+        "terminal":    "#4338CA",   # indigo
+        "nearest":     "#059669",   # emerald – nearest node special role
+        "intermediate":"#0369A1",   # sky-blue
+        "depot":       "#D97706",   # amber
+        "route_line":  "#6366F1",
+        "depot_line":  "#D97706",
+        "up_arrow":    "#4338CA",
+        "dn_arrow":    "#16a34a",
+        "dead_arrow":  "#9CA3AF",
+    }
+
+    nearest_name, _, _ = _nearest_node_from_depot(config)
+
+    # ── Build ordered node list: start → intermediates → end ────────────────
+    route_nodes = [config.start_point]
+    for n in getattr(config, "intermediates", []):
+        if n and n.strip(): route_nodes.append(n.strip())
+    if config.end_point not in route_nodes:
+        route_nodes.append(config.end_point)
+
+    # Assign cumulative x-positions (proportional to segment distance)
+    x_pos = {route_nodes[0]: 0.0}
+    for i in range(1, len(route_nodes)):
+        seg = f"{route_nodes[i-1]}|{route_nodes[i]}"
+        dist = config.segment_distances.get(seg,
+               config.segment_distances.get(f"{route_nodes[i]}|{route_nodes[i-1]}", 0))
+        x_pos[route_nodes[i]] = x_pos[route_nodes[i-1]] + dist
+
+    total_km = max(x_pos.values()) or 1.0
+
+    # Depot x = x of nearest_node (connected vertically below)
+    depot_x = x_pos.get(nearest_name, 0.0)
+    depot_y = -0.45
+
+    # ── Count trips per stop ─────────────────────────────────────────────────
+    stop_up   = {n: 0 for n in route_nodes}
+    stop_dn   = {n: 0 for n in route_nodes}
+    stop_dead = {n: 0 for n in route_nodes + [config.depot]}
+    for bus in buses:
+        for t in bus.trips:
+            if t.trip_type == "Revenue":
+                if t.direction == "UP"  and t.start_location in stop_up:
+                    stop_up[t.start_location]   += 1
+                if t.direction == "DN" and t.start_location in stop_dn:
+                    stop_dn[t.start_location] += 1
+            elif t.trip_type == "Dead":
+                for loc in [t.start_location, t.end_location]:
+                    if loc in stop_dead: stop_dead[loc] += 1
+
+    fig = go.Figure()
+
+    # ── Route backbone line ──────────────────────────────────────────────────
+    fig.add_trace(go.Scatter(
+        x=[x_pos[n] for n in route_nodes], y=[1] * len(route_nodes),
+        mode="lines",
+        line=dict(color=PALETTE["route_line"], width=4),
+        hoverinfo="skip", showlegend=False,
+    ))
+
+    # ── Segment labels (distance + time) ────────────────────────────────────
+    for i in range(len(route_nodes) - 1):
+        fr, to = route_nodes[i], route_nodes[i+1]
+        seg1 = f"{fr}|{to}"; seg2 = f"{to}|{fr}"
+        dist = config.segment_distances.get(seg1, config.segment_distances.get(seg2, None))
+        tt   = config.segment_times.get(seg1,      config.segment_times.get(seg2, None))
+        if dist is None: continue
+        mid_x = (x_pos[fr] + x_pos[to]) / 2
+        label = f"<b>{dist:.1f} km</b>"
+        if tt: label += f"<br>{tt} min"
+        fig.add_annotation(
+            x=mid_x, y=1.18, text=label, showarrow=False,
+            font=dict(size=11, color="#374151"), bgcolor="rgba(255,255,255,0.85)",
+            borderpad=3, align="center",
+        )
+
+    # ── Depot connector (dashed vertical + horizontal to nearest_node) ───────
+    fig.add_trace(go.Scatter(
+        x=[depot_x, depot_x], y=[depot_y, 0.78],
+        mode="lines",
+        line=dict(color=PALETTE["depot_line"], width=2, dash="dot"),
+        hoverinfo="skip", showlegend=False,
+    ))
+    # Depot–nearest segment label
+    try:
+        d2n_seg = f"{config.depot}|{nearest_name}"
+        d2n_dist = config.segment_distances.get(d2n_seg, None)
+        d2n_tt   = config.segment_times.get(d2n_seg, None)
+        if d2n_dist:
+            dlabel = f"<b>{d2n_dist:.1f} km</b>"
+            if d2n_tt: dlabel += f"<br>{d2n_tt} min"
+            fig.add_annotation(
+                x=depot_x + total_km * 0.02, y=(depot_y + 0.78) / 2,
+                text=dlabel, showarrow=False,
+                font=dict(size=10, color=PALETTE["depot"]),
+                bgcolor="rgba(255,255,255,0.85)", borderpad=2, align="left",
+            )
+    except Exception:
+        pass
+
+    # ── Route-node markers ───────────────────────────────────────────────────
+    for node in route_nodes:
+        is_terminal    = node in (config.start_point, config.end_point)
+        is_nearest     = node == nearest_name
+        marker_symbol  = "circle"   if is_terminal else \
+                         "diamond"  if is_nearest  else "square"
+        marker_size    = 20 if is_terminal else 16
+        node_color     = PALETTE["terminal"]   if is_terminal else \
+                         PALETTE["nearest"]    if is_nearest  else \
+                         PALETTE["intermediate"]
+        short_name = node.replace("BUS STAND","BS").replace("GAM","").replace("  "," ").strip()
+        hover = (f"<b>{node}</b><br>"
+                 f"UP departures: {stop_up.get(node, 0)}<br>"
+                 f"DN departures: {stop_dn.get(node, 0)}<br>"
+                 + (f"<i>Nearest depot node</i>" if is_nearest else ""))
+        fig.add_trace(go.Scatter(
+            x=[x_pos[node]], y=[1],
+            mode="markers+text",
+            marker=dict(symbol=marker_symbol, size=marker_size,
+                        color=node_color, line=dict(color="white", width=2)),
+            text=[f"<b>{short_name}</b>"], textposition="bottom center",
+            textfont=dict(size=11, color=node_color),
+            hovertemplate=hover + "<extra></extra>",
+            showlegend=False,
+        ))
+
+    # ── Depot marker ─────────────────────────────────────────────────────────
+    depot_hover = (f"<b>{config.depot}</b><br>"
+                   f"Dead-run legs: {stop_dead.get(config.depot, 0)}<br>"
+                   f"Nearest node: {nearest_name}")
+    fig.add_trace(go.Scatter(
+        x=[depot_x], y=[depot_y],
+        mode="markers+text",
+        marker=dict(symbol="square", size=22,
+                    color=PALETTE["depot"], line=dict(color="white", width=2)),
+        text=[f"<b>DEPOT</b>"], textposition="bottom center",
+        textfont=dict(size=11, color=PALETTE["depot"]),
+        hovertemplate=depot_hover + "<extra></extra>",
+        showlegend=False,
+    ))
+
+    # ── Fleet summary annotation box ─────────────────────────────────────────
+    total_rev  = sum(1 for b in buses for t in b.trips if t.trip_type == "Revenue")
+    total_dead = sum(1 for b in buses for t in b.trips if t.trip_type == "Dead")
+    total_chg  = sum(1 for b in buses for t in b.trips if t.trip_type == "Charging")
+    avg_soc    = sum(b.soc_percent for b in buses) / max(len(buses), 1)
+    summary = (f"<b>Fleet summary</b><br>"
+               f"{config.fleet_size} buses · "
+               f"{total_rev} revenue trips · "
+               f"{total_dead} dead runs · "
+               f"{total_chg} charge stops<br>"
+               f"Avg final SOC {avg_soc:.0f}%")
+    fig.add_annotation(
+        x=total_km / 2, y=1.42,
+        text=summary, showarrow=False,
+        font=dict(size=12, color="#1F2937"),
+        bgcolor="rgba(238,242,255,0.95)", borderpad=8,
+        bordercolor="#6366F1", borderwidth=1, align="center",
+    )
+
+    # ── Direction arrows legend strip ─────────────────────────────────────────
+    for label, color, sym in [("DN service", PALETTE["dn_arrow"],   "arrow-right"),
+                               ("UP service", PALETTE["up_arrow"],   "arrow-left"),
+                               ("Dead / Depot", PALETTE["dead_arrow"],"arrow")]:
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="markers",
+            marker=dict(symbol=sym, size=12, color=color),
+            name=label, showlegend=True,
+        ))
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+    x_pad = total_km * 0.08
+    fig.update_layout(
+        height=340,
+        margin=dict(l=20, r=20, t=60, b=20),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(
+            title="Cumulative distance from start (km)",
+            range=[-x_pad, total_km + x_pad],
+            showgrid=False, zeroline=False,
+            tickformat=".1f", ticksuffix=" km",
+            color="#6B7280",
+        ),
+        yaxis=dict(
+            range=[depot_y - 0.3, 1.55],
+            showgrid=False, zeroline=False,
+            showticklabels=False, showline=False,
+        ),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02,
+            xanchor="right", x=1,
+            font=dict(size=11), bgcolor="rgba(0,0,0,0)",
+        ),
+        hovermode="closest",
+        title=dict(
+            text=f"Route {config.route_code} — {config.route_name}",
+            font=dict(size=14, color="#1F2937"), x=0.0, xanchor="left",
+        ),
+    )
+    return fig
+
+
 def build_headway_chart_data(config, buses):
     rows = []
     for bus in buses:
@@ -183,6 +402,14 @@ def _apply_config_overrides(config, overrides):
         segment_distances=config.segment_distances, segment_times=config.segment_times,
         location_coords=config.location_coords,
         min_km_per_bus=overrides.get("min_km_per_bus", config.min_km_per_bus),
+        max_layover_min=overrides.get("max_layover_min",
+                                      getattr(config, "max_layover_min", 20)),
+        midday_charge_soc_percent=overrides.get("midday_charge_soc_percent",
+                                                 getattr(config, "midday_charge_soc_percent", 65.0)),
+        off_peak_layover_extra_min=overrides.get("off_peak_layover_extra_min",
+                                                  getattr(config, "off_peak_layover_extra_min", 10)),
+        avg_speed_kmph=overrides.get("avg_speed_kmph",
+                                     getattr(config, "avg_speed_kmph", 30.0)),
     )
 
 def _run_core(config, headway_df, travel_time_df, optimize):
@@ -201,6 +428,45 @@ def _run_core(config, headway_df, travel_time_df, optimize):
         out = Path(f.name).read_bytes()
     return config, buses, metrics, trips, out, compliance
 
+def auto_detect_fleet(raw_config, headway_df, travel_time_df, max_fleet=20):
+    """
+    Find the minimum fleet_size (1..max_fleet) where all P1-P6 rules PASS
+    and every revenue trip is assigned.  Distances are enriched once and
+    shared across all trials via the same dict reference.
+    Returns (detected_n, config, buses, metrics, trips, output_bytes, compliance).
+    """
+    # Enrich distances once (mutations are in-place on the shared dict)
+    seed_cfg = _apply_config_overrides(raw_config, {"fleet_size": 1})
+    enrich_distances(seed_cfg)
+
+    last_result = None
+    for n in range(1, max_fleet + 1):
+        cfg = _apply_config_overrides(raw_config, {"fleet_size": n})
+        trips = generate_trips(cfg, headway_df, travel_time_df)
+        buses = schedule_buses(cfg, trips)
+        rev_total    = sum(1 for t in trips   if t.trip_type == "Revenue")
+        rev_assigned = sum(1 for b in buses for t in b.trips if t.trip_type == "Revenue")
+        compliance   = check_compliance(cfg, buses)
+        hard_pass    = all(r["status"] == "PASS"
+                           for r in compliance if r.get("priority", 99) <= 6)
+        if hard_pass and rev_assigned == rev_total:
+            metrics = compute_metrics(cfg, buses, total_revenue_trips=rev_total)
+            with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+                write_schedule(cfg, buses, f.name)
+                out = Path(f.name).read_bytes()
+            return n, cfg, buses, metrics, trips, out, compliance
+        # keep last attempt as fallback
+        last_result = (n, cfg, buses, rev_total, compliance)
+
+    # Fallback: return best attempt with max fleet
+    n, cfg, buses, rev_total, compliance = last_result
+    metrics = compute_metrics(cfg, buses, total_revenue_trips=rev_total)
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+        write_schedule(cfg, buses, f.name)
+        out = Path(f.name).read_bytes()
+    return n, cfg, buses, metrics, [], out, compliance
+
+
 def run_pipeline(uploaded_file, optimize, config_overrides=None, headway_overrides=None):
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
         tmp.write(uploaded_file.getvalue()); tmp_path = tmp.name
@@ -210,6 +476,17 @@ def run_pipeline(uploaded_file, optimize, config_overrides=None, headway_overrid
     st.session_state["raw_travel_time_df"] = travel_time_df.copy()
     if config_overrides: config = _apply_config_overrides(config, config_overrides)
     if headway_overrides is not None: headway_df = headway_overrides
+
+    # Auto fleet-size detection when fleet_size == 0 in the Excel
+    if config.fleet_size == 0:
+        st.session_state["auto_fleet_mode"] = True
+        detected_n, cfg, buses, metrics, trips, out, compliance = auto_detect_fleet(
+            config, headway_df, travel_time_df)
+        st.session_state["detected_fleet_size"] = detected_n
+        return cfg, buses, metrics, trips, out, compliance
+
+    st.session_state["auto_fleet_mode"] = False
+    st.session_state.pop("detected_fleet_size", None)
     return _run_core(config, headway_df, travel_time_df, optimize)
 
 def rerun_from_overrides(config_overrides, headway_overrides=None, optimize=False):
@@ -219,6 +496,15 @@ def rerun_from_overrides(config_overrides, headway_overrides=None, optimize=Fals
     if raw_config is None: return None
     config = _apply_config_overrides(raw_config, config_overrides)
     headway_df = headway_overrides if headway_overrides is not None else raw_hw
+    # Honour auto-detect if user set fleet_size back to 0 in the Config tab
+    if config.fleet_size == 0:
+        st.session_state["auto_fleet_mode"] = True
+        detected_n, cfg, buses, metrics, trips, out, compliance = auto_detect_fleet(
+            config, headway_df, raw_tt)
+        st.session_state["detected_fleet_size"] = detected_n
+        return cfg, buses, metrics, trips, out, compliance
+    st.session_state["auto_fleet_mode"] = False
+    st.session_state.pop("detected_fleet_size", None)
     return _run_core(config, headway_df, raw_tt, optimize)
 
 
@@ -368,6 +654,17 @@ if st.session_state.get("has_results"):
     # TAB 1: Route Depiction
     # ════════════════════════════════════════════════════════════════════
     with tab_route:
+        # ── Static route topology diagram ────────────────────────────────
+        st.markdown('<div class="section-title">Route Topology</div>', unsafe_allow_html=True)
+        try:
+            route_fig = build_route_diagram(config, buses)
+            st.plotly_chart(route_fig, use_container_width=True, config={"displayModeBar": False})
+        except Exception as e:
+            st.warning(f"Could not render route diagram: {e}")
+        st.divider()
+
+        # ── Per-bus trip tables ──────────────────────────────────────────
+        st.markdown('<div class="section-title">Per-Bus Trip Detail</div>', unsafe_allow_html=True)
         route_df = build_route_depiction(config, buses)
         for bus in buses:
             bus_data = route_df[route_df["Bus"] == bus.bus_id].reset_index(drop=True)
@@ -505,17 +802,35 @@ if st.session_state.get("has_results"):
     # TAB 5: Config
     # ════════════════════════════════════════════════════════════════════
     with tab_config:
+        # Auto-fleet detection banner
+        if st.session_state.get("auto_fleet_mode"):
+            detected_n = st.session_state.get("detected_fleet_size", "?")
+            st.success(
+                f"🚌 **Auto Fleet Detection:** Your Excel had fleet_size = 0. "
+                f"The scheduler found that **{detected_n} buses** are the minimum required "
+                f"to serve all trips while satisfying P1–P6. "
+                f"You can lock this value below and regenerate."
+            )
+
         st.caption("Edit any value and click **Apply & Regenerate** — no re-upload needed.")
         with st.form("config_edit_form"):
             col_a, col_b = st.columns(2)
 
             with col_a:
                 st.markdown("#### 🚍 Fleet & Battery")
-                new_fleet   = st.number_input("Fleet Size", value=config.fleet_size, min_value=1, max_value=50, step=1)
+                new_fleet = st.number_input(
+                    "Fleet Size (0 = auto-detect minimum)",
+                    value=config.fleet_size, min_value=0, max_value=50, step=1,
+                    help="Set to 0 to let the scheduler find the minimum fleet that satisfies all P1-P6 rules.")
                 new_battery = st.number_input("Battery (kWh)", value=float(config.battery_kwh), min_value=10.0, step=10.0)
                 new_cons    = st.number_input("Consumption (kWh/km)", value=float(config.consumption_rate), min_value=0.1, step=0.1, format="%.2f")
                 new_init_soc= st.number_input("Initial SOC (%)", value=float(config.initial_soc_percent), min_value=20.0, max_value=100.0, step=5.0)
                 new_min_km  = st.number_input("Min KM per Bus (0=none)", value=float(config.min_km_per_bus), min_value=0.0, step=10.0)
+                new_avg_spd = st.number_input(
+                    "Average Speed (km/hr) — fallback when segment time is missing",
+                    value=float(getattr(config, "avg_speed_kmph", 30.0)),
+                    min_value=5.0, max_value=120.0, step=5.0,
+                    help="Used by the distance engine to estimate travel time when a segment's time is not in the Excel.")
 
                 st.markdown("#### ⏰ Operating Hours")
                 new_op_start = st.text_input("Start (HH:MM)", value=config.operating_start.strftime("%H:%M"))
@@ -526,20 +841,38 @@ if st.session_state.get("has_results"):
                 st.markdown("#### 🔋 Charging")
                 new_depot_kw    = st.number_input("Depot Charger (kW)", value=float(config.depot_charger_kw), min_value=0.0, step=10.0)
                 new_depot_eff   = st.number_input("Depot Efficiency (0–1)", value=float(config.depot_charger_efficiency), min_value=0.0, max_value=1.0, step=0.05, format="%.2f")
-                new_trigger_soc = st.number_input("Charge Trigger SOC (%)", value=float(config.trigger_soc_percent), min_value=20.0, max_value=100.0, step=5.0)
+                new_trigger_soc = st.number_input(
+                    "Charge Trigger SOC (%)",
+                    value=float(config.trigger_soc_percent), min_value=20.0, max_value=100.0, step=5.0,
+                    help="SOC level below which the scheduler sends a bus for a reactive charge stop.")
                 new_target_soc  = st.number_input("Charge Target SOC (%)", value=float(config.target_soc_percent), min_value=20.0, max_value=100.0, step=5.0)
+                new_midday_soc  = st.number_input(
+                    "Midday Charge Trigger SOC (%) — P5",
+                    value=float(getattr(config, "midday_charge_soc_percent", 65.0)),
+                    min_value=20.0, max_value=100.0, step=5.0,
+                    help="Bus must be below this SOC to be sent for midday charging (P5 window 12:00-15:00). Fleet > 10 waives this rule.")
 
                 st.markdown("#### 🔁 Break & Layover")
-                new_pref_layover= st.number_input(
-                    "Driver Break (min) — P4 minimum break between revenue trips",
+                new_pref_layover = st.number_input(
+                    "Min Driver Break (min) — P4",
                     value=int(config.preferred_layover_min), min_value=1, step=1,
-                    help="This is the min break enforced between every pair of revenue trips (P4). Comes from Excel C42.")
-                new_min_layover = st.number_input("Min Terminus Layover (min)", value=int(config.min_layover_min), min_value=0, step=1)
-                new_dead_buf    = st.number_input("Dead Run Buffer (min)", value=int(config.dead_run_buffer_min), min_value=0, step=1)
-                new_adj_buf     = st.number_input(
+                    help="Minimum break enforced between every pair of revenue trips (P4).")
+                new_max_layover  = st.number_input(
+                    "Max Layover (min) — P4 upper bound",
+                    value=int(getattr(config, "max_layover_min", 20)),
+                    min_value=1, max_value=120, step=1,
+                    help="Maximum allowed gap between revenue trips. Replaces the hardcoded 20-minute ceiling.")
+                new_off_peak_extra = st.number_input(
+                    "Off-Peak Extra Break (min) — 11:00–16:00",
+                    value=int(getattr(config, "off_peak_layover_extra_min", 10)),
+                    min_value=0, max_value=60, step=1,
+                    help="Added on top of Min Driver Break during off-peak hours to widen headways. Capped at Max Layover.")
+                new_min_layover  = st.number_input("Min Terminus Layover (min)", value=int(config.min_layover_min), min_value=0, step=1)
+                new_dead_buf     = st.number_input("Dead Run Buffer (min)", value=int(config.dead_run_buffer_min), min_value=0, step=1)
+                new_adj_buf      = st.number_input(
                     "Break Adjustment Buffer (min)",
                     value=int(config.max_headway_deviation_min), min_value=0, step=1,
-                    help="Max minutes the safety-net pass can shift a trip to enforce the driver break. Formerly 'Max Headway Deviation'.")
+                    help="Max minutes the safety-net pass can shift a trip to enforce the driver break.")
 
             # Segment distances (read-only)
             with st.expander("📍 Segment Distances & Times (read-only)"):
@@ -558,11 +891,14 @@ if st.session_state.get("has_results"):
             overrides = {
                 "fleet_size": new_fleet, "battery_kwh": new_battery,
                 "consumption_rate": new_cons, "initial_soc_percent": new_init_soc,
-                "min_km_per_bus": new_min_km, "depot_charger_kw": new_depot_kw,
-                "depot_charger_efficiency": new_depot_eff,
+                "min_km_per_bus": new_min_km, "avg_speed_kmph": new_avg_spd,
+                "depot_charger_kw": new_depot_kw, "depot_charger_efficiency": new_depot_eff,
                 "trigger_soc_percent": new_trigger_soc, "target_soc_percent": new_target_soc,
-                "preferred_layover_min": new_pref_layover, "min_layover_min": new_min_layover,
-                "dead_run_buffer_min": new_dead_buf, "max_headway_deviation_min": new_adj_buf,
+                "midday_charge_soc_percent": new_midday_soc,
+                "preferred_layover_min": new_pref_layover, "max_layover_min": new_max_layover,
+                "off_peak_layover_extra_min": new_off_peak_extra,
+                "min_layover_min": new_min_layover, "dead_run_buffer_min": new_dead_buf,
+                "max_headway_deviation_min": new_adj_buf,
             }
             for key, val in [("operating_start", new_op_start),
                               ("operating_end", new_op_end), ("shift_split", new_shift)]:
