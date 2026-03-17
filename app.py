@@ -178,11 +178,33 @@ def build_route_diagram(config, buses, selected_bus=None):
     # ── Palette ──────────────────────────────────────────────────────────────
     BUS_COLORS = ["#4338CA", "#059669", "#D97706", "#DC2626",
                   "#7C3AED", "#0284C7", "#BE185D"]  # up to 7 buses
-    TYPE_COLOR = {"UP": "#4338CA", "DN": "#16a34a",
-                  "Dead": "#9CA3AF", "Charging": "#F59E0B"}
     DIM_OPACITY = 0.12
 
     nearest_name, _, _ = _nearest_node_from_depot(config)
+
+    # ── Robust segment lookup ─────────────────────────────────────────────────
+    # config_loader may store keys with any separator (|, ->, :, space).
+    # Build a normalised lookup once to avoid repeated miss-and-fallback chains.
+    def _seg_dist(a, b):
+        """Return distance between a and b regardless of key separator."""
+        for sep in ("|", "->", "→", " → ", ":"," to "):
+            v = config.segment_distances.get(f"{a}{sep}{b}")
+            if v: return float(v)
+            v = config.segment_distances.get(f"{b}{sep}{a}")
+            if v: return float(v)
+        # Last resort: call config method if available
+        try:   return float(config.get_distance(a, b))
+        except Exception: return 0.0
+
+    def _seg_time(a, b):
+        """Return travel time between a and b regardless of key separator."""
+        for sep in ("|", "->", "→", " → ", ":"," to "):
+            v = config.segment_times.get(f"{a}{sep}{b}")
+            if v: return float(v)
+            v = config.segment_times.get(f"{b}{sep}{a}")
+            if v: return float(v)
+        try:   return float(config.get_travel_time(a, b))
+        except Exception: return 0.0
 
     # ── Ordered route nodes & cumulative x-positions ─────────────────────────
     route_nodes = [config.start_point]
@@ -194,17 +216,14 @@ def build_route_diagram(config, buses, selected_bus=None):
     x_pos = {route_nodes[0]: 0.0}
     for i in range(1, len(route_nodes)):
         fr, to = route_nodes[i-1], route_nodes[i]
-        seg = (config.segment_distances.get(f"{fr}|{to}") or
-               config.segment_distances.get(f"{to}|{fr}") or 0)
-        x_pos[to] = x_pos[fr] + seg
+        x_pos[to] = x_pos[fr] + _seg_dist(fr, to)
 
     total_km  = max(x_pos.values()) or 1.0
     depot_x   = x_pos.get(nearest_name, 0.0)
     depot_dist = x_pos.get(nearest_name, 0.0)   # for Marey y-axis
 
     # Assign y-position in Marey panel: indexed by cumulative distance
-    node_dist = dict(x_pos)   # reuse same values; y in panel B = node_dist[loc]
-    # Depot sits at the nearest node's distance (off-route)
+    node_dist = dict(x_pos)
     node_dist[config.depot] = depot_dist
 
     op_h_start = config.operating_start.hour + config.operating_start.minute / 60
@@ -274,24 +293,20 @@ def build_route_diagram(config, buses, selected_bus=None):
     # Segment distance+time annotations
     for i in range(len(route_nodes) - 1):
         fr, to = route_nodes[i], route_nodes[i+1]
-        dist = (config.segment_distances.get(f"{fr}|{to}") or
-                config.segment_distances.get(f"{to}|{fr}"))
-        tt   = (config.segment_times.get(f"{fr}|{to}") or
-                config.segment_times.get(f"{to}|{fr}"))
-        if dist is None: continue
+        dist = _seg_dist(fr, to)
+        tt   = _seg_time(fr, to)
+        if not dist: continue
         mid_x = (x_pos[fr] + x_pos[to]) / 2
-        lbl = f"<b>{dist:.1f} km</b>" + (f"<br>{tt} min" if tt else "")
+        lbl = f"<b>{dist:.1f} km</b>" + (f"<br>{tt:.0f} min" if tt else "")
         fig.add_annotation(x=mid_x, y=1.22, text=lbl, showarrow=False, row=1, col=1,
             font=dict(size=10, color="#374151"),
             bgcolor="rgba(255,255,255,0.9)", borderpad=2)
 
     # Depot dead-km annotation
-    d2n = (config.segment_distances.get(f"{config.depot}|{nearest_name}") or
-           config.segment_distances.get(f"{nearest_name}|{config.depot}"))
-    d2n_t = (config.segment_times.get(f"{config.depot}|{nearest_name}") or
-             config.segment_times.get(f"{nearest_name}|{config.depot}"))
+    d2n   = _seg_dist(config.depot, nearest_name)
+    d2n_t = _seg_time(config.depot, nearest_name)
     if d2n:
-        dlbl = f"<b>{d2n:.1f} km</b>" + (f"<br>{d2n_t} min" if d2n_t else "")
+        dlbl = f"<b>{d2n:.1f} km</b>" + (f"<br>{d2n_t:.0f} min" if d2n_t else "")
         fig.add_annotation(x=depot_x + total_km*0.025, y=-0.05, text=dlbl,
             showarrow=False, row=1, col=1,
             font=dict(size=9, color="#D97706"),
@@ -621,7 +636,7 @@ def _apply_config_overrides(config, overrides):
         midday_charge_soc_percent=overrides.get("midday_charge_soc_percent",
                                                  getattr(config, "midday_charge_soc_percent", 65.0)),
         off_peak_layover_extra_min=overrides.get("off_peak_layover_extra_min",
-                                                  getattr(config, "off_peak_layover_extra_min", 10)),
+                                                  getattr(config, "off_peak_layover_extra_min", 0)),
         avg_speed_kmph=overrides.get("avg_speed_kmph",
                                      getattr(config, "avg_speed_kmph", 30.0)),
     )
@@ -1096,7 +1111,7 @@ if st.session_state.get("has_results"):
                     help="Maximum allowed gap between revenue trips. Replaces the hardcoded 20-minute ceiling.")
                 new_off_peak_extra = st.number_input(
                     "Off-Peak Extra Break (min) — 11:00–16:00",
-                    value=int(getattr(config, "off_peak_layover_extra_min", 10)),
+                    value=int(getattr(config, "off_peak_layover_extra_min", 0)),
                     min_value=0, max_value=60, step=1,
                     help="Added on top of Min Driver Break during off-peak hours to widen headways. Capped at Max Layover.")
                 new_min_layover  = st.number_input("Min Terminus Layover (min)", value=int(config.min_layover_min), min_value=0, step=1)
