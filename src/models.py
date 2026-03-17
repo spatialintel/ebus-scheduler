@@ -185,6 +185,18 @@ class RouteConfig:
     # S6: Minimum km each bus must run (0 = no minimum)
     min_km_per_bus: float = 0.0
 
+    # v5: configurable break ceiling (replaces hardcoded MAX_BREAK = 20)
+    max_layover_min: int = 20
+
+    # v5: SOC threshold for P5 midday charging window (replaces hardcoded 65.0)
+    midday_charge_soc_percent: float = 65.0
+
+    # v5: extra break added during off-peak 11:00–16:00 (0 = disabled)
+    off_peak_layover_extra_min: int = 0
+
+    # v5: fallback speed for estimating travel time when segment time is missing
+    avg_speed_kmph: float = 30.0
+
     @property
     def depot_flow_rate_kw(self) -> float:
         return self.depot_charger_kw * self.depot_charger_efficiency

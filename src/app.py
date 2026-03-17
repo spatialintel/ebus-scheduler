@@ -636,7 +636,7 @@ def _apply_config_overrides(config, overrides):
         midday_charge_soc_percent=overrides.get("midday_charge_soc_percent",
                                                  getattr(config, "midday_charge_soc_percent", 65.0)),
         off_peak_layover_extra_min=overrides.get("off_peak_layover_extra_min",
-                                                  getattr(config, "off_peak_layover_extra_min", 10)),
+                                                  getattr(config, "off_peak_layover_extra_min", 0)),
         avg_speed_kmph=overrides.get("avg_speed_kmph",
                                      getattr(config, "avg_speed_kmph", 30.0)),
     )
@@ -1111,7 +1111,7 @@ if st.session_state.get("has_results"):
                     help="Maximum allowed gap between revenue trips. Replaces the hardcoded 20-minute ceiling.")
                 new_off_peak_extra = st.number_input(
                     "Off-Peak Extra Break (min) — 11:00–16:00",
-                    value=int(getattr(config, "off_peak_layover_extra_min", 10)),
+                    value=int(getattr(config, "off_peak_layover_extra_min", 0)),
                     min_value=0, max_value=60, step=1,
                     help="Added on top of Min Driver Break during off-peak hours to widen headways. Capped at Max Layover.")
                 new_min_layover  = st.number_input("Min Terminus Layover (min)", value=int(config.min_layover_min), min_value=0, step=1)
