@@ -8,7 +8,12 @@ from datetime import datetime, timedelta, time as dtime
 
 import streamlit as st
 import pandas as pd
-import plotly.graph_objects as go
+
+try:
+    import plotly.graph_objects as go
+    _PLOTLY_OK = True
+except ModuleNotFoundError:
+    _PLOTLY_OK = False
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -656,11 +661,14 @@ if st.session_state.get("has_results"):
     with tab_route:
         # ── Static route topology diagram ────────────────────────────────
         st.markdown('<div class="section-title">Route Topology</div>', unsafe_allow_html=True)
-        try:
-            route_fig = build_route_diagram(config, buses)
-            st.plotly_chart(route_fig, use_container_width=True, config={"displayModeBar": False})
-        except Exception as e:
-            st.warning(f"Could not render route diagram: {e}")
+        if not _PLOTLY_OK:
+            st.warning("Install **plotly** to enable the route diagram (`pip install plotly` or add to requirements.txt).")
+        else:
+            try:
+                route_fig = build_route_diagram(config, buses)
+                st.plotly_chart(route_fig, use_container_width=True, config={"displayModeBar": False})
+            except Exception as e:
+                st.warning(f"Could not render route diagram: {e}")
         st.divider()
 
         # ── Per-bus trip tables ──────────────────────────────────────────
