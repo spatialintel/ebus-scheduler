@@ -88,21 +88,24 @@ def _build_field_map(ws) -> dict[str, tuple]:
     """
     Scan the Route_Config sheet and build {field_name: (row, value)}.
 
-    Supports two layouts:
-      Legacy (v4 and earlier): col B = parameter name, col C = value
-      v5 template:             col A = parameter name, col B = value
+    Supports two column layouts:
+      v5 template : col A = parameter name, col B = value
+      Legacy v4   : col B = parameter name, col C = value
 
-    Detection: if any cell in column A looks like a parameter name (contains
-    underscore or is a known key), use A/B layout; otherwise fall back to B/C.
+    Detection: search the first 60 rows for 'route_code' — whichever column
+    contains it defines the label column.  This is reliable because 'route_code'
+    is a required field that only appears in the parameter column, unlike section
+    headers or legend notes that may incidentally contain underscores.
     """
-    # Detect layout by sampling column A — if it has snake_case keys, use A/B
-    col_a_vals = [ws.cell(r, 1).value for r in range(1, min(ws.max_row + 1, 60))]
-    has_snake_in_a = any(
-        isinstance(v, str) and "_" in v
-        for v in col_a_vals if v is not None
-    )
-    label_col = 1 if has_snake_in_a else 2   # 1=A, 2=B
-    value_col = label_col + 1                 # B or C
+    label_col = 2   # default: legacy B/C layout
+    for row in range(1, min(ws.max_row + 1, 60)):
+        if str(ws.cell(row, 1).value or "").strip() == "route_code":
+            label_col = 1   # v5 A/B layout
+            break
+        if str(ws.cell(row, 2).value or "").strip() == "route_code":
+            label_col = 2   # legacy B/C layout
+            break
+    value_col = label_col + 1
 
     field_map: dict[str, tuple] = {}
     for row in range(1, ws.max_row + 1):
@@ -223,7 +226,7 @@ def _parse_locations(ws, wb, field_map: dict):
 
 # ── Segment parser ───────────────────────────────────────────────────
 
-def _parse_segments(ws, wb, avg_speed_kmph: float = 30.0):
+def _parse_segments(ws, wb, avg_speed_kmph: float = 30.0, field_map: dict = None):
     """
     Read segment distances and travel times.
 
@@ -231,8 +234,9 @@ def _parse_segments(ws, wb, avg_speed_kmph: float = 30.0):
       1. Standalone "Distances" sheet (v5 layout):
             A=from_location, B=to_location, C=distance_km, D=time_min
          time_min may be blank → estimated from distance / avg_speed_kmph.
-      2. Embedded "Sr." table in Route_Config (legacy layout):
-            resolved names in cols G/H, distance col E, time col F.
+      2. Embedded "Sr." table in Route_Config:
+            Generic labels in cols C/D resolved via field_map or cols G/H.
+            distance col E, time col F.
 
     Returns: segment_distances dict, segment_times dict
     """
@@ -242,12 +246,12 @@ def _parse_segments(ws, wb, avg_speed_kmph: float = 30.0):
     # ── Strategy 1: standalone Distances sheet ────────────────────────────────
     dist_ws = _find_sheet(wb, "Distances", "Segment_Distances", "Segments")
     if dist_ws is not None:
-        # Skip header row(s): scan until we find a row where A looks like a location
         data_start = None
         for r in range(1, dist_ws.max_row + 1):
             v = dist_ws.cell(r, 1).value
             if v and str(v).lower() not in (
-                "from_location", "from", "origin", "segment", "sr", "sr."
+                "from_location", "from", "origin", "segment", "sr", "sr.",
+                "segment distances & times", "segment distances and travel times",
             ):
                 data_start = r
                 break
@@ -271,7 +275,6 @@ def _parse_segments(ws, wb, avg_speed_kmph: float = 30.0):
                 if dist <= 0:
                     continue
 
-                # Fallback: estimate time from avg_speed if not provided
                 if tt is None or str(tt).strip() == "":
                     tt = round(dist / max(avg_speed_kmph, 1) * 60)
                 else:
@@ -286,9 +289,29 @@ def _parse_segments(ws, wb, avg_speed_kmph: float = 30.0):
 
         if distances:
             return distances, times
-        # Fall through to legacy if Distances sheet was empty
+        # Fall through to legacy table if Distances sheet was empty
 
-    # ── Strategy 2: legacy embedded "Sr." table ──────────────────────────────
+    # ── Strategy 2: legacy embedded "Sr." table in Route_Config ──────────────
+    # Generic label → actual name resolver using field_map
+    # e.g. "Depot" → field_map["depot"][1], "Start point" → field_map["start_point"][1]
+    generic_to_field = {
+        "Depot":                "depot",
+        "Start point":          "start_point",
+        "End point":            "end_point",
+        "Intermediate point 1": "intermediate_1",
+        "Intermediate point 2": "intermediate_2",
+    }
+
+    def _resolve(label: str) -> str | None:
+        """Resolve a generic label to an actual location name."""
+        label = str(label).strip()
+        fkey  = generic_to_field.get(label)
+        if fkey and field_map:
+            val = _get_opt(field_map, fkey)
+            if val:
+                return str(val).strip()
+        return label   # fall back to label as-is (handles absolute names)
+
     header_row = None
     for row in range(1, ws.max_row + 1):
         if ws.cell(row, 2).value == "Sr.":
@@ -310,15 +333,22 @@ def _parse_segments(ws, wb, avg_speed_kmph: float = 30.0):
         except (ValueError, TypeError):
             break
 
-        res_from = ws.cell(r, 7).value
-        res_to   = ws.cell(r, 8).value
+        # Try resolved names from cols G/H first (older legacy format),
+        # then fall back to resolving generic labels from cols C/D via field_map.
+        res_from_raw = ws.cell(r, 7).value
+        res_to_raw   = ws.cell(r, 8).value
+        generic_from = ws.cell(r, 3).value
+        generic_to   = ws.cell(r, 4).value
 
-        if not res_from or not res_to:
+        if res_from_raw and res_to_raw:
+            res_from = str(res_from_raw).strip()
+            res_to   = str(res_to_raw).strip()
+        elif generic_from and generic_to:
+            res_from = _resolve(generic_from)
+            res_to   = _resolve(generic_to)
+        else:
             r += 1
             continue
-
-        res_from = str(res_from).strip()
-        res_to   = str(res_to).strip()
 
         dist = ws.cell(r, 5).value
         tt   = ws.cell(r, 6).value
@@ -327,13 +357,25 @@ def _parse_segments(ws, wb, avg_speed_kmph: float = 30.0):
             r += 1
             continue
 
-        dist = float(dist)
+        try:
+            dist = float(dist)
+        except (ValueError, TypeError):
+            r += 1
+            continue
+
+        if dist <= 0:
+            r += 1
+            continue
+
         if tt is None:
             tt = round(dist / max(avg_speed_kmph, 1) * 60)
         else:
-            tt = int(float(tt))
+            try:
+                tt = int(float(tt))
+            except (ValueError, TypeError):
+                tt = round(dist / max(avg_speed_kmph, 1) * 60)
 
-        if dist > 0:
+        if res_from and res_to:
             key = RouteConfig.segment_key(res_from, res_to)
             distances[key] = dist
             times[key]     = tt
@@ -492,7 +534,9 @@ def load_config(excel_path: str | Path) -> tuple[RouteConfig, pd.DataFrame, pd.D
             intermediates.append(name)
 
     # ── Parse segment distances and times ─────────────────────────────────────
-    seg_distances, seg_times = _parse_segments(ws, wb, avg_speed_kmph=avg_speed)
+    seg_distances, seg_times = _parse_segments(ws, wb,
+                                               avg_speed_kmph=avg_speed,
+                                               field_map=fm)
 
     if not seg_distances:
         raise ConfigError("No valid segment distances found")
