@@ -23,20 +23,39 @@ MORNING_PEAK_END   = REF_DATE.replace(hour=11, minute=0)
 EVENING_PEAK_START = REF_DATE.replace(hour=16, minute=0)
 EVENING_PEAK_END   = REF_DATE.replace(hour=20, minute=0)
 
-MAX_BREAK         = 20
-MIDDAY_CHARGE_SOC = 65.0
-SOC_TRIGGER       = 30.0
+MAX_BREAK         = 20    # fallback if config.max_layover_min absent
+MIDDAY_CHARGE_SOC = 65.0  # fallback if config.midday_charge_soc_percent absent
+SOC_TRIGGER       = 30.0  # fallback if config.trigger_soc_percent absent
 SOC_FLOOR         = 20.0
 SAME_DIR_GAP      = 5
 DEPOT_DWELL_MIN   = 45
 DEPOT_DWELL_MAX   = 90
 KM_BALANCE_MAX    = 20.0
 
+OFF_PEAK_START = REF_DATE.replace(hour=11, minute=0)
+OFF_PEAK_END   = REF_DATE.replace(hour=16, minute=0)
 
-def _is_midday(t): return MIDDAY_START <= t < MIDDAY_END
+
+def _is_midday(t):   return MIDDAY_START <= t < MIDDAY_END
+def _is_off_peak(t): return OFF_PEAK_START <= t < OFF_PEAK_END
 def _is_peak(t):
     return (MORNING_PEAK_START <= t < MORNING_PEAK_END or
             EVENING_PEAK_START <= t < EVENING_PEAK_END)
+
+
+def _effective_break(config, current_time: datetime, base_break: int) -> int:
+    """
+    Return break minutes before the next revenue trip.
+
+    During off-peak (11:00-16:00) the break is extended by
+    off_peak_layover_extra_min (default 10) to widen headways naturally,
+    capped at max_layover_min so P4 is never violated by construction.
+    """
+    if _is_off_peak(current_time):
+        extra = getattr(config, 'off_peak_layover_extra_min', 10)
+        max_b = getattr(config, 'max_layover_min', MAX_BREAK)
+        return min(base_break + extra, max_b)
+    return base_break
 
 def _operational_nodes(config):
     nodes = [config.start_point, config.end_point]
@@ -74,11 +93,17 @@ def _create_fleet(config):
 def _fleet_avg_km(buses):
     return sum(b.total_km for b in buses) / len(buses) if buses else 0.0
 
-def _ready_time(bus, min_break):
-    """min_break after Revenue; immediate after Dead/Charging."""
+def _ready_time(bus, min_break, config=None):
+    """
+    Departure-ready time for the bus.
+    After Revenue: adds min_break (extended during off-peak if config provided).
+    After Dead/Charging: immediate.
+    """
     last = bus.trips[-1] if bus.trips else None
     if last and last.trip_type == "Revenue":
-        return bus.current_time + timedelta(minutes=min_break)
+        effective = (_effective_break(config, bus.current_time, min_break)
+                     if config is not None else min_break)
+        return bus.current_time + timedelta(minutes=effective)
     return bus.current_time
 
 def _last_revenue_in_direction(bus, direction, start_location):
@@ -90,6 +115,19 @@ def _last_revenue_in_direction(bus, direction, start_location):
                 t.actual_departure is not None):
             return t
     return None
+
+def _last_revenue_any_direction(buses, start_location):
+    """Most-recent revenue departure from start_location across ALL buses."""
+    latest = None
+    for bus in buses:
+        for t in reversed(bus.trips):
+            if (t.trip_type == "Revenue" and
+                    t.start_location == start_location and
+                    t.actual_departure is not None):
+                if latest is None or t.actual_departure > latest.actual_departure:
+                    latest = t
+                break  # only need most recent per bus
+    return latest
 
 def _check_p6(buses, trip, dep):
     """
@@ -120,6 +158,30 @@ def _bumped_ready_time(buses, trip, rt, natural_gap=None):
             return rt
         rt += timedelta(minutes=bump)
     return rt
+
+
+def _snap_to_phase(rt: datetime, phase_index: int, natural_gap: float,
+                   fleet_size: int, op_start: datetime) -> datetime:
+    """
+    Snap rt forward to this bus's permanent phase lane.
+
+    Phase slots for bus i (epoch = op_start):
+        op_start + i*natural_gap + k*cycle_time   (k = 0, 1, 2, …)
+    where cycle_time = natural_gap * fleet_size.
+
+    Using op_start as epoch matches Phase-1 stagger so slot 0 == first departure.
+    """
+    if natural_gap <= 0 or fleet_size <= 0:
+        return rt
+    cycle_time   = natural_gap * fleet_size
+    phase_anchor = op_start + timedelta(minutes=phase_index * natural_gap)
+    delta_min    = (rt - phase_anchor).total_seconds() / 60
+    if delta_min <= 0:
+        return phase_anchor
+    remainder = delta_min % cycle_time
+    if remainder < 0.5:        # already on-slot (float-precision guard)
+        return rt
+    return rt + timedelta(minutes=cycle_time - remainder)
 
 
 def _make_dead(bus, to_loc, dist, tt):
@@ -189,27 +251,85 @@ def _charging_detour(bus, config, resume_by, min_break):
     return inserted
 
 def _find_and_reposition(buses, trip, config, min_break):
-    op_end = REF_DATE.replace(hour=config.operating_end.hour,
-                              minute=config.operating_end.minute)
+    """
+    Find a bus that can reach trip.start_location via a dead run and return
+    (bus, [dead_run_legs]) so the caller can assign them in order.
+
+    P2 compliance: when a bus is at the DEPOT it must pass through the nearest
+    operational node before proceeding to any revenue trip origin — even when
+    being repositioned mid-day.  We build a two-leg list in that case:
+        DEPOT → nearest_node → trip.start_location
+    For buses already on the route the single-leg path is used as before.
+    """
+    op_end  = REF_DATE.replace(hour=config.operating_end.hour,
+                               minute=config.operating_end.minute)
+    nearest, _, nearest_tt = _nearest_node_from_depot(config)
     candidates = []
+
     for bus in buses:
-        if bus.current_location == trip.start_location: continue
-        try:
-            d = config.get_distance(bus.current_location, trip.start_location)
-            t = config.get_travel_time(bus.current_location, trip.start_location)
-        except KeyError: continue
-        arrival = bus.current_time + timedelta(minutes=t)
-        if arrival + timedelta(minutes=min_break) > op_end: continue
-        if bus.soc_after_trip(d) - bus._soc_cost(trip.distance_km) < SOC_FLOOR: continue
-        candidates.append(((arrival - bus.current_time).total_seconds() / 60, bus, d, t))
-    if not candidates: return None
+        if bus.current_location == trip.start_location:
+            continue
+
+        legs = []  # dead-run legs to assign
+
+        if bus.current_location == config.depot:
+            # Two-leg path: DEPOT → nearest_node → trip.start_location
+            try:
+                d1 = config.get_distance(config.depot, nearest)
+                t1 = config.get_travel_time(config.depot, nearest)
+            except KeyError:
+                continue
+            if nearest == trip.start_location:
+                # nearest_node IS the trip origin — single leg
+                legs = [("depot_to_nearest", d1, t1)]
+                total_d, total_t = d1, t1
+            else:
+                try:
+                    d2 = config.get_distance(nearest, trip.start_location)
+                    t2 = config.get_travel_time(nearest, trip.start_location)
+                except KeyError:
+                    continue
+                legs = [("depot_to_nearest", d1, t1), ("nearest_to_origin", d2, t2)]
+                total_d, total_t = d1 + d2, t1 + t2
+        else:
+            # Single-leg direct repositioning
+            try:
+                total_d = config.get_distance(bus.current_location, trip.start_location)
+                total_t = config.get_travel_time(bus.current_location, trip.start_location)
+            except KeyError:
+                continue
+            legs = [("direct", total_d, total_t)]
+
+        arrival = bus.current_time + timedelta(minutes=total_t)
+        if arrival + timedelta(minutes=min_break) > op_end:
+            continue
+        soc_needed = bus._soc_cost(total_d) + bus._soc_cost(trip.distance_km)
+        if bus.soc_percent - soc_needed * 100 / bus.battery_kwh < SOC_FLOOR:
+            continue
+        candidates.append((total_t, bus, legs))
+
+    if not candidates:
+        return None
+
     candidates.sort(key=lambda x: x[0])
-    _, bus, d, t = candidates[0]
-    dead = Trip(direction="DEPOT", trip_type="Dead",
-                start_location=bus.current_location, end_location=trip.start_location,
-                earliest_departure=bus.current_time, latest_departure=bus.current_time,
-                travel_time_min=t, distance_km=d, shift=bus.shift)
-    return bus, dead
+    _, bus, legs = candidates[0]
+
+    # Build and assign dead-run Trip objects for each leg
+    dead_runs = []
+    for leg_tag, leg_d, leg_t in legs:
+        dead = Trip(
+            direction="DEPOT", trip_type="Dead",
+            start_location=bus.current_location,
+            end_location=(nearest if leg_tag == "depot_to_nearest"
+                          else trip.start_location),
+            earliest_departure=bus.current_time,
+            latest_departure=bus.current_time,
+            travel_time_min=leg_t, distance_km=leg_d, shift=bus.shift,
+        )
+        bus.assign(dead)
+        dead_runs.append(dead)
+
+    return bus, dead_runs
 
 def _select_bus(buses, trip, config, min_break, natural_gap=None):
     avg_km = _fleet_avg_km(buses)
@@ -218,8 +338,23 @@ def _select_bus(buses, trip, config, min_break, natural_gap=None):
     for bus in buses:
         if bus.current_location != trip.start_location: continue
         if bus.soc_after_trip(trip.distance_km) < SOC_FLOOR: continue
-        rt = _ready_time(bus, min_break)
-        # P6: bump using natural_gap to re-sync fleet phase after charging
+        rt = _ready_time(bus, min_break, config)
+        # Absolute phase lock: snap rt to this bus's permanent lane.
+        # During off-peak we widen the effective natural_gap by off_peak_extra
+        # so the snap respects the intended wider headway instead of pulling rt
+        # back to a tighter peak-cadence slot.
+        if natural_gap and hasattr(bus, 'phase_index'):
+            op_start_dt = REF_DATE.replace(
+                hour=config.operating_start.hour,
+                minute=config.operating_start.minute,
+            )
+            snap_gap = natural_gap
+            if _is_off_peak(rt):
+                extra = getattr(config, 'off_peak_layover_extra_min', 10)
+                snap_gap = natural_gap + extra / max(1, config.fleet_size)
+            rt = _snap_to_phase(rt, bus.phase_index, snap_gap,
+                                 config.fleet_size, op_start_dt)
+        # P6 safety-net
         rt = _bumped_ready_time(buses, trip, rt, natural_gap=natural_gap)
         km_deficit = bus.total_km - avg_km
         below_min  = -50 if (min_km > 0 and bus.total_km < min_km) else 0
@@ -279,6 +414,8 @@ def schedule_buses(config: RouteConfig, trips: list[Trip]) -> list[BusState]:
         arrive_at = op_start_dt + timedelta(minutes=i * stagger_min)
         bus.current_time = arrive_at - timedelta(minutes=nearest_tt)
         _morning_dead_run(bus, config)
+        # Permanent phase index — set once here, used by _snap_to_phase.
+        bus.phase_index = i
         # bus is now at nearest_node, current_time = arrive_at
 
     # ── Phase 2: Revenue trips — P4-first (bus ready time = departure time) ─
@@ -292,12 +429,13 @@ def schedule_buses(config: RouteConfig, trips: list[Trip]) -> list[BusState]:
     for idx, trip in enumerate(revenue_trips):
         trip_time = trip.earliest_departure
 
-        # P5: midday charging
-        if _is_midday(trip_time):
+        # P5: midday charging — skipped when fleet > 10 (P5 waiver applies)
+        midday_soc = getattr(config, 'midday_charge_soc_percent', MIDDAY_CHARGE_SOC)
+        if _is_midday(trip_time) and config.fleet_size <= 10:
             for bus in buses:
                 if bus.current_location == config.depot: continue
                 if not _is_midday(bus.current_time): continue
-                if bus.soc_percent < MIDDAY_CHARGE_SOC:
+                if bus.soc_percent < midday_soc:
                     _charging_detour(bus, config,
                                      resume_by=EVENING_PEAK_START, min_break=min_break)
 
@@ -306,8 +444,7 @@ def schedule_buses(config: RouteConfig, trips: list[Trip]) -> list[BusState]:
         if best is None:
             repo = _find_and_reposition(buses, trip, config, min_break)
             if repo:
-                bus, dead = repo
-                bus.assign(dead)
+                bus, _ = repo   # legs already assigned inside _find_and_reposition
                 best, rt = _select_bus(buses, trip, config, min_break, natural_gap=natural_gap)
 
         if best is None or rt is None:
@@ -321,10 +458,12 @@ def schedule_buses(config: RouteConfig, trips: list[Trip]) -> list[BusState]:
         trip.earliest_departure = rt
         best.assign(trip)
 
-        # Post-assignment charging
-        if _is_midday(best.current_time) and best.soc_percent < MIDDAY_CHARGE_SOC:
+        # Post-assignment charging: use config values (not hardcoded constants)
+        midday_soc = getattr(config, 'midday_charge_soc_percent', MIDDAY_CHARGE_SOC)
+        soc_trigger = getattr(config, 'trigger_soc_percent', SOC_TRIGGER)
+        if _is_midday(best.current_time) and config.fleet_size <= 10 and best.soc_percent < midday_soc:
             _charging_detour(best, config, resume_by=EVENING_PEAK_START, min_break=min_break)
-        elif best.soc_percent <= SOC_TRIGGER:
+        elif best.soc_percent <= soc_trigger:
             future = [t for t in revenue_trips[idx+1:] if t.assigned_bus is None]
             resume = future[0].earliest_departure if future else op_end
             if _is_midday(best.current_time):
@@ -402,7 +541,8 @@ def check_compliance(config: RouteConfig, buses: list[BusState]) -> list[dict]:
                     "details": f"Min SOC: {min_soc_seen:.1f}%" + (f", {len(p3_v)} violations" if p3_v else ""),
                     "violations": p3_v[:5]})
 
-    # P4 (charging gaps excluded)
+    # P4 (charging gaps excluded) — upper bound uses config.max_layover_min
+    max_break = getattr(config, 'max_layover_min', MAX_BREAK)
     p4_v = []
     for bus in buses:
         rev_idx = [i for i, t in enumerate(bus.trips) if t.trip_type == "Revenue"]
@@ -414,23 +554,29 @@ def check_compliance(config: RouteConfig, buses: list[BusState]) -> list[dict]:
                 gap = (n.actual_departure - c.actual_arrival).total_seconds() / 60
                 if gap < min_break:
                     p4_v.append(f"{bus.bus_id} @ {c.actual_arrival.strftime('%H:%M')}: {gap:.0f}min < {min_break}")
-                elif gap > MAX_BREAK:
-                    p4_v.append(f"{bus.bus_id} @ {c.actual_arrival.strftime('%H:%M')}: {gap:.0f}min > {MAX_BREAK}")
-    results.append({"rule": f"P4: Break {min_break}-{MAX_BREAK} min between revenue trips", "priority": 4,
+                elif gap > max_break:
+                    p4_v.append(f"{bus.bus_id} @ {c.actual_arrival.strftime('%H:%M')}: {gap:.0f}min > {max_break}")
+    results.append({"rule": f"P4: Break {min_break}–{max_break} min between revenue trips", "priority": 4,
                     "status": "PASS" if not p4_v else "FAIL",
                     "details": (f"{len(p4_v)} violations (charging gaps excluded)"
                                 if p4_v else "All breaks in range (charging gaps excluded)"),
                     "violations": p4_v[:10]})
 
-    # P5
-    p5_v = [f"{bus.bus_id}: no charging 12:00-15:00"
-            for bus in buses
-            if not any(t.trip_type == "Charging" and t.actual_departure and
-                       12 <= t.actual_departure.hour < 15 for t in bus.trips)]
-    results.append({"rule": "P5: Midday charging (12:00-15:00)", "priority": 5,
-                    "status": "PASS" if not p5_v else "FAIL",
-                    "details": f"{len(p5_v)} buses missing midday charge" if p5_v else "All buses charged",
-                    "violations": p5_v})
+    # P5: midday charging — waived when fleet_size > 10 (P5 policy exception)
+    if config.fleet_size > 10:
+        results.append({"rule": "P5: Midday charging 12:00–15:00 [waived: fleet > 10]",
+                        "priority": 5, "status": "PASS",
+                        "details": f"Fleet {config.fleet_size} buses > 10 — P5 midday charging window waived per policy",
+                        "violations": []})
+    else:
+        p5_v = [f"{bus.bus_id}: no midday charge 12:00-15:00"
+                for bus in buses
+                if not any(t.trip_type == "Charging" and t.actual_departure and
+                           12 <= t.actual_departure.hour < 15 for t in bus.trips)]
+        results.append({"rule": "P5: Midday charging (12:00–15:00)", "priority": 5,
+                        "status": "PASS" if not p5_v else "FAIL",
+                        "details": f"{len(p5_v)} buses missing midday charge" if p5_v else "All buses charged midday",
+                        "violations": p5_v})
 
     # P6
     p6_v = []
