@@ -148,15 +148,16 @@ def _check_p6(buses, trip, dep):
 
 def _bumped_ready_time(buses, trip, rt, natural_gap=None):
     """
-    Return rt bumped forward until P6 is satisfied.
-    If natural_gap is provided, bumps by natural_gap to re-sync with fleet phase.
-    Otherwise falls back to SAME_DIR_GAP increments.
+    Return rt bumped forward in SAME_DIR_GAP increments until P6 is satisfied.
+
+    Previously this bumped by natural_gap (17.5 min for 8-bus fleet) which caused
+    cascading large delays — a single P6 violation bumped the bus by a full fleet
+    gap instead of the minimum needed (5 min). Always use SAME_DIR_GAP now.
     """
-    bump = natural_gap if natural_gap and natural_gap > SAME_DIR_GAP else SAME_DIR_GAP
-    for _ in range(20):
+    for _ in range(40):
         if _check_p6(buses, trip, rt):
             return rt
-        rt += timedelta(minutes=bump)
+        rt += timedelta(minutes=SAME_DIR_GAP)
     return rt
 
 
@@ -339,32 +340,11 @@ def _select_bus(buses, trip, config, min_break, natural_gap=None):
         if bus.current_location != trip.start_location: continue
         if bus.soc_after_trip(trip.distance_km) < SOC_FLOOR: continue
         rt = _ready_time(bus, min_break, config)
-
-        # Phase re-sync: ONLY apply _snap_to_phase after a Dead or Charging trip.
-        #
-        # Why: cycle_time = DN_travel + break + UP_travel + break = 76 min.
-        # Snapping every trip to a 76-min phase slot turns a 10-min break into
-        # a 48-min break (break = next_slot - arrival = 76 - 28 = 48 min),
-        # violating P4 on every single trip.
-        #
-        # After a Dead or Charging detour buses genuinely drift out of phase —
-        # that is the only time re-sync is needed.
-        last_trip = bus.trips[-1] if bus.trips else None
-        disrupted = last_trip is not None and last_trip.trip_type in ("Dead", "Charging")
-
-        if disrupted and natural_gap and hasattr(bus, 'phase_index'):
-            op_start_dt = REF_DATE.replace(
-                hour=config.operating_start.hour,
-                minute=config.operating_start.minute,
-            )
-            snap_gap = natural_gap
-            if _is_off_peak(rt):
-                extra = getattr(config, 'off_peak_layover_extra_min', 0)
-                snap_gap = natural_gap + extra / max(1, config.fleet_size)
-            rt = _snap_to_phase(rt, bus.phase_index, snap_gap,
-                                 config.fleet_size, op_start_dt)
-
-        # P6 safety-net: bump by natural_gap if needed regardless of phase-snap.
+        # P6 safety-net: bump rt forward until the 5-min same-direction gap is satisfied.
+        # _snap_to_phase was removed: for large fleets buses naturally return staggered
+        # from charging (each charges at a different time), so phase-locking caused
+        # excessive delays (up to cycle_time = 140 min for 8 buses) that broke headways
+        # worse than the bunching it was meant to fix.
         rt = _bumped_ready_time(buses, trip, rt, natural_gap=natural_gap)
         km_deficit = bus.total_km - avg_km
         below_min  = -50 if (min_km > 0 and bus.total_km < min_km) else 0
@@ -440,11 +420,23 @@ def schedule_buses(config: RouteConfig, trips: list[Trip]) -> list[BusState]:
         trip_time = trip.earliest_departure
 
         # P5: midday charging — skipped when fleet > 10 (P5 waiver applies)
+        # Trigger condition: we are currently in the midday window (12:00-15:00)
+        # AND the bus has time to complete a charge cycle before evening peak.
+        # Key fix: use bus.current_time < MIDDAY_END (not _is_midday(bus.current_time)).
+        # A bus that finished its last trip at 11:45 has current_time=11:45 which is
+        # before MIDDAY_START; _is_midday(11:45) returns False and the bus is
+        # silently skipped throughout the entire 12:00-15:00 window. This causes
+        # charging to fire AFTER the next assigned revenue trip (wrong order), placing
+        # the Charging entry after the post-charge Revenue trip in bus.trips — so the
+        # P4 checker sees a 200+ min gap with no Charging between the two Revenue trips.
         midday_soc = getattr(config, 'midday_charge_soc_percent', MIDDAY_CHARGE_SOC)
         if _is_midday(trip_time) and config.fleet_size <= 10:
             for bus in buses:
                 if bus.current_location == config.depot: continue
-                if not _is_midday(bus.current_time): continue
+                # Accept buses that finished before midday but are idle and have time
+                # to complete a charge (dead→charge→dead) before evening peak.
+                bus_ready = bus.current_time < MIDDAY_END
+                if not bus_ready: continue
                 if bus.soc_percent < midday_soc:
                     _charging_detour(bus, config,
                                      resume_by=EVENING_PEAK_START, min_break=min_break)
@@ -461,32 +453,44 @@ def schedule_buses(config: RouteConfig, trips: list[Trip]) -> list[BusState]:
             unassigned.append(trip)
             continue
 
-        if rt > op_end + timedelta(minutes=45):
+        # Reject if bus would ARRIVE past op_end + 45 min.
+        # Previously only departure was checked, so trips departing at 21:00 with
+        # 60-min travel were assigned and arrived at 22:00 — well past the window.
+        projected_arrival = rt + timedelta(minutes=trip.travel_time_min)
+        if projected_arrival > op_end + timedelta(minutes=45):
             unassigned.append(trip)
             continue
 
         trip.earliest_departure = rt
         best.assign(trip)
 
-        # Post-assignment charging: use config values (not hardcoded constants)
-        midday_soc = getattr(config, 'midday_charge_soc_percent', MIDDAY_CHARGE_SOC)
+        # Post-assignment charging
+        # resume_by is always a fixed clock target, never a pool-slot time.
+        # Pool slots are EARLIEST desired departure and can be in the past by the
+        # time the bus does a dead run to the depot, making max_charge negative
+        # and silently skipping the charge entirely.
+        midday_soc  = getattr(config, 'midday_charge_soc_percent', MIDDAY_CHARGE_SOC)
         soc_trigger = getattr(config, 'trigger_soc_percent', SOC_TRIGGER)
         if _is_midday(best.current_time) and config.fleet_size <= 10 and best.soc_percent < midday_soc:
             _charging_detour(best, config, resume_by=EVENING_PEAK_START, min_break=min_break)
         elif best.soc_percent <= soc_trigger:
-            future = [t for t in revenue_trips[idx+1:] if t.assigned_bus is None]
-            resume = future[0].earliest_departure if future else op_end
             if _is_midday(best.current_time):
                 _charging_detour(best, config, resume_by=EVENING_PEAK_START, min_break=min_break)
             elif not _is_peak(best.current_time):
-                _charging_detour(best, config, resume_by=resume, min_break=min_break)
+                # Off-peak reactive charge — resume by evening peak start.
+                # Previously used future[0].earliest_departure which is a pool slot
+                # already in the past (bus hasn't done the dead run yet), yielding
+                # max_charge < 0 and silently skipping the charge.
+                _charging_detour(best, config, resume_by=EVENING_PEAK_START, min_break=min_break)
             elif best.soc_percent <= SOC_FLOOR + 5:
-                _charging_detour(best, config, resume_by=resume, min_break=min_break)
+                # Emergency during peak: charge and resume as soon as possible.
+                _charging_detour(best, config, resume_by=op_end, min_break=min_break)
 
-    # ── Phase 3: Evening return ─────────────────────────────────────────────
+    # ── Phase 3: Evening return — every bus must reach DEPOT ─────────────────
+    # Called unconditionally after revenue assignment. _route_to_depot is a no-op
+    # if the bus is already at the depot, so no double-counting occurs.
     for bus in buses:
-        if bus.current_location != config.depot:
-            _route_to_depot(bus, config)
+        _route_to_depot(bus, config)
 
     # ── Phase 4: Safety-net break enforcement ──────────────────────────────
     _balance_breaks(buses, config)
