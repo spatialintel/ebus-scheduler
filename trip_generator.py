@@ -84,31 +84,49 @@ def _generate_revenue_trips(config, headway_df, travel_time_df):
     op_start    = _time_to_dt(config.operating_start)
     op_end      = _time_to_dt(config.operating_end)
     shift_split = _time_to_dt(config.shift_split)
-    start_loc   = config.start_point   # GANGAJALIA BUS STAND
-    end_loc     = config.end_point     # ADHEWADA GAM
-    # Buses park at the node nearest to the depot after the morning dead run.
-    # In most configs this equals end_point, but it may differ — use actuals.
-    dn_start_loc = _nearest_node_for_buses(config)
-    try:
-        e2s_dist = config.get_distance(dn_start_loc, start_loc)
-    except KeyError:
-        e2s_dist = config.get_distance(end_loc, start_loc)
-    s2e_dist    = config.get_distance(start_loc, end_loc)
+    start_loc   = config.start_point
+    end_loc     = config.end_point
     min_break   = config.preferred_layover_min
-    off_peak_extra = getattr(config, 'off_peak_layover_extra_min', 10)
+    off_peak_extra = getattr(config, 'off_peak_layover_extra_min', 0)
+
+    # ── Determine near/far terminals ──────────────────────────────────────────
+    # Buses land at `dn_start_loc` (nearest terminal to depot) after morning dead run.
+    # `far_loc` is whichever terminal is NOT nearest — the other end of the route.
+    #
+    # Example A — R4-A (ADHEWADA nearest):
+    #   dn_start_loc = ADHEWADA GAM  (end_point)
+    #   far_loc      = GANGAJALIA     (start_point)
+    #   DN thread: ADHEWADA → GANGAJALIA   UP thread: GANGAJALIA → ADHEWADA
+    #
+    # Example B — R11 (GANGAJALIA nearest):
+    #   dn_start_loc = GANGAJALIA     (start_point)
+    #   far_loc      = SHIHOR          (end_point)
+    #   DN thread: GANGAJALIA → SHIHOR     UP thread: SHIHOR → GANGAJALIA
+    #
+    # Without this distinction both threads would use the same location on both
+    # ends whenever nearest_node == start_point, producing 0-km same-stop trips.
+    dn_start_loc = _nearest_node_for_buses(config)
+    far_loc      = end_loc if dn_start_loc == start_loc else start_loc
+
+    # Distances for each direction
+    try:
+        near_to_far_dist = config.get_distance(dn_start_loc, far_loc)
+    except KeyError:
+        near_to_far_dist = config.get_distance(start_loc, end_loc)   # fallback
+
+    try:
+        far_to_near_dist = config.get_distance(far_loc, dn_start_loc)
+    except KeyError:
+        far_to_near_dist = near_to_far_dist   # symmetric fallback
 
     trips = []
 
     # ── Natural slot interval ─────────────────────────────────────────────────
-    # One bus cycle = DN_travel + break + UP_travel + break.
-    # With fleet_size buses, consecutive departures in one direction are spaced
-    # cycle_time / fleet_size apart. We use max(user_headway, natural_interval)
-    # so the trip pool never asks buses to depart faster than physically possible.
     first_dn_travel = _get_travel_time(op_start, "DN", travel_time_df)
     first_up_travel = _get_travel_time(
         op_start + timedelta(minutes=first_dn_travel + min_break), "UP", travel_time_df)
     cycle_time  = first_dn_travel + min_break + first_up_travel + min_break
-    natural_gap = cycle_time / max(1, config.fleet_size)  # min between slots in same direction
+    natural_gap = cycle_time / max(1, config.fleet_size)
 
     def _slot_interval(dep):
         """
@@ -121,8 +139,10 @@ def _generate_revenue_trips(config, headway_df, travel_time_df):
             base += off_peak_extra
         return base
 
-    # ── DN thread: dn_start_loc → start_point, starts at op_start ────────────
-    # dn_start_loc = nearest node from depot (where buses land after dead run).
+    # ── DN thread: dn_start_loc → far_loc ────────────────────────────────────
+    # Buses arrive at dn_start_loc after the morning dead run and serve these
+    # trips immediately. Direction label is always "DN" regardless of which
+    # physical terminal is nearest — the scheduler uses locations, not labels.
     dn_time = op_start
     while dn_time < op_end:
         dn_travel  = _get_travel_time(dn_time, "DN", travel_time_df)
@@ -130,23 +150,19 @@ def _generate_revenue_trips(config, headway_df, travel_time_df):
         dn_shift   = 1 if dn_time < shift_split else 2
         trips.append(Trip(
             direction="DN", trip_type="Revenue",
-            start_location=dn_start_loc, end_location=start_loc,
+            start_location=dn_start_loc, end_location=far_loc,
             earliest_departure=dn_time,
             latest_departure=op_end,
-            travel_time_min=dn_travel, distance_km=e2s_dist,
+            travel_time_min=dn_travel, distance_km=near_to_far_dist,
             handover=(dn_time < shift_split <= dn_arrival),
             shift=dn_shift,
         ))
         dn_time += timedelta(minutes=_slot_interval(dn_time))
 
-    # ── UP thread: start_point → dn_start_loc ───────────────────────────────
-    # Buses complete a DN trip and arrive at start_point (GANGAJALIA).
-    # The UP trip returns them to dn_start_loc (nearest_node = where they began).
-    # This closes the cycle correctly regardless of whether nearest_node == end_point.
-    try:
-        s2n_dist = config.get_distance(start_loc, dn_start_loc)
-    except KeyError:
-        s2n_dist = s2e_dist   # fallback: use the standard end_point distance
+    # ── UP thread: far_loc → dn_start_loc ────────────────────────────────────
+    # After completing the first DN trip buses are at far_loc.
+    # UP trips return them to dn_start_loc, closing the cycle correctly
+    # regardless of which terminal is nearer to the depot.
     up_time = op_start + timedelta(minutes=first_dn_travel + min_break)
 
     while up_time < op_end:
@@ -155,10 +171,10 @@ def _generate_revenue_trips(config, headway_df, travel_time_df):
         up_shift   = 1 if up_time < shift_split else 2
         trips.append(Trip(
             direction="UP", trip_type="Revenue",
-            start_location=start_loc, end_location=dn_start_loc,
+            start_location=far_loc, end_location=dn_start_loc,
             earliest_departure=up_time,
             latest_departure=op_end,
-            travel_time_min=up_travel, distance_km=s2n_dist,
+            travel_time_min=up_travel, distance_km=far_to_near_dist,
             handover=(up_time < shift_split <= up_arrival),
             shift=up_shift,
         ))
