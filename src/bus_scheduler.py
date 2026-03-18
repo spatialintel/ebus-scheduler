@@ -420,26 +420,30 @@ def schedule_buses(config: RouteConfig, trips: list[Trip]) -> list[BusState]:
         trip_time = trip.earliest_departure
 
         # P5: midday charging — skipped when fleet > 10 (P5 waiver applies)
-        # Trigger condition: we are currently in the midday window (12:00-15:00)
-        # AND the bus has time to complete a charge cycle before evening peak.
-        # Key fix: use bus.current_time < MIDDAY_END (not _is_midday(bus.current_time)).
-        # A bus that finished its last trip at 11:45 has current_time=11:45 which is
-        # before MIDDAY_START; _is_midday(11:45) returns False and the bus is
-        # silently skipped throughout the entire 12:00-15:00 window. This causes
-        # charging to fire AFTER the next assigned revenue trip (wrong order), placing
-        # the Charging entry after the post-charge Revenue trip in bus.trips — so the
-        # P4 checker sees a 200+ min gap with no Charging between the two Revenue trips.
+        # Guard: only send a bus to charge if it will arrive at the depot
+        # at or after MIDDAY_START. Without this check, buses finishing their
+        # 3rd trip at 09:30 (SOC=79.7% < midday_soc=80%) get sent to charge
+        # immediately, completing the charge at 10:30 — before the 12:00 window —
+        # so P5 reports "no charge 12:00-15:00". The fix: defer charging until
+        # the bus is close enough to midday that it will arrive in-window.
         midday_soc = getattr(config, 'midday_charge_soc_percent', MIDDAY_CHARGE_SOC)
         if _is_midday(trip_time) and config.fleet_size <= 10:
             for bus in buses:
                 if bus.current_location == config.depot: continue
-                # Accept buses that finished before midday but are idle and have time
-                # to complete a charge (dead→charge→dead) before evening peak.
-                bus_ready = bus.current_time < MIDDAY_END
-                if not bus_ready: continue
-                if bus.soc_percent < midday_soc:
-                    _charging_detour(bus, config,
-                                     resume_by=EVENING_PEAK_START, min_break=min_break)
+                if bus.current_time >= MIDDAY_END: continue
+                if bus.soc_percent >= midday_soc: continue
+                # Estimate when this bus would arrive at the depot
+                try:
+                    dead_tt = config.get_travel_time(bus.current_location, config.depot)
+                except KeyError:
+                    dead_tt = 30  # safe fallback
+                expected_depot_arrival = bus.current_time + timedelta(minutes=dead_tt)
+                # Only charge if the bus will arrive at the depot within the midday window
+                # Allow a 30-min pre-window buffer (bus arrives at 11:30+ is fine)
+                if expected_depot_arrival < MIDDAY_START - timedelta(minutes=30):
+                    continue
+                _charging_detour(bus, config,
+                                 resume_by=EVENING_PEAK_START, min_break=min_break)
 
         best, rt = _select_bus(buses, trip, config, min_break, natural_gap=natural_gap)
 
