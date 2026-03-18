@@ -339,11 +339,20 @@ def _select_bus(buses, trip, config, min_break, natural_gap=None):
         if bus.current_location != trip.start_location: continue
         if bus.soc_after_trip(trip.distance_km) < SOC_FLOOR: continue
         rt = _ready_time(bus, min_break, config)
-        # Absolute phase lock: snap rt to this bus's permanent lane.
-        # During off-peak we widen the effective natural_gap by off_peak_extra
-        # so the snap respects the intended wider headway instead of pulling rt
-        # back to a tighter peak-cadence slot.
-        if natural_gap and hasattr(bus, 'phase_index'):
+
+        # Phase re-sync: ONLY apply _snap_to_phase after a Dead or Charging trip.
+        #
+        # Why: cycle_time = DN_travel + break + UP_travel + break = 76 min.
+        # Snapping every trip to a 76-min phase slot turns a 10-min break into
+        # a 48-min break (break = next_slot - arrival = 76 - 28 = 48 min),
+        # violating P4 on every single trip.
+        #
+        # After a Dead or Charging detour buses genuinely drift out of phase —
+        # that is the only time re-sync is needed.
+        last_trip = bus.trips[-1] if bus.trips else None
+        disrupted = last_trip is not None and last_trip.trip_type in ("Dead", "Charging")
+
+        if disrupted and natural_gap and hasattr(bus, 'phase_index'):
             op_start_dt = REF_DATE.replace(
                 hour=config.operating_start.hour,
                 minute=config.operating_start.minute,
@@ -354,7 +363,8 @@ def _select_bus(buses, trip, config, min_break, natural_gap=None):
                 snap_gap = natural_gap + extra / max(1, config.fleet_size)
             rt = _snap_to_phase(rt, bus.phase_index, snap_gap,
                                  config.fleet_size, op_start_dt)
-        # P6 safety-net
+
+        # P6 safety-net: bump by natural_gap if needed regardless of phase-snap.
         rt = _bumped_ready_time(buses, trip, rt, natural_gap=natural_gap)
         km_deficit = bus.total_km - avg_km
         below_min  = -50 if (min_km > 0 and bus.total_km < min_km) else 0
