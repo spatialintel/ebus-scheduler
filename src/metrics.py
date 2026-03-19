@@ -88,9 +88,12 @@ def compute_metrics(
     config: RouteConfig,
     buses: list[BusState],
     total_revenue_trips: int | None = None,
+    assigned_revenue_trips: int | None = None,
 ) -> ScheduleMetrics:
     """
     Compute all KPIs from a completed schedule.
+    assigned_revenue_trips: count of pool-originated revenue trips only (excludes
+    repositioning legs added by _route_to_depot which also carry Revenue type).
     """
     m = ScheduleMetrics()
 
@@ -102,7 +105,7 @@ def compute_metrics(
     dead = [t for t in all_trips if t.trip_type == "Dead"]
     chg = [t for t in all_trips if t.trip_type == "Charging"]
 
-    m.revenue_trips_assigned = len(rev)
+    m.revenue_trips_assigned = assigned_revenue_trips if assigned_revenue_trips is not None else len(rev)
     m.revenue_trips_total = total_revenue_trips or len(rev)
     m.revenue_km = sum(t.distance_km for t in rev)
     m.dead_km = sum(t.distance_km for t in dead)

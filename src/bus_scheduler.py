@@ -129,11 +129,10 @@ def _last_revenue_any_direction(buses, start_location):
                 break  # only need most recent per bus
     return latest
 
-def _check_p6(buses, trip, dep):
+def _check_spacing(buses, trip, dep, min_gap: float):
     """
-    P6: 5-min gap from the most-recent same-direction revenue trip of ANY other bus.
-    Scans all trips (not just trips[-1]) to handle buses that charged/repositioned
-    after their last revenue trip.
+    Return True if `dep` is at least `min_gap` minutes after the most-recent
+    same-direction revenue departure of ANY other bus from the same location.
     """
     if trip.trip_type != "Revenue":
         return True
@@ -142,22 +141,31 @@ def _check_p6(buses, trip, dep):
         if last_rev is None:
             continue
         gap = (dep - last_rev.actual_departure).total_seconds() / 60
-        if gap < SAME_DIR_GAP:
+        if gap < min_gap:
             return False
     return True
 
+
+def _check_p6(buses, trip, dep):
+    """P6: 5-min minimum gap between buses in the same direction."""
+    return _check_spacing(buses, trip, dep, SAME_DIR_GAP)
+
+
 def _bumped_ready_time(buses, trip, rt, natural_gap=None):
     """
-    Return rt bumped forward in SAME_DIR_GAP increments until P6 is satisfied.
+    Bump rt forward until the same-direction spacing requirement is met.
 
-    Previously this bumped by natural_gap (17.5 min for 8-bus fleet) which caused
-    cascading large delays — a single P6 violation bumped the bus by a full fleet
-    gap instead of the minimum needed (5 min). Always use SAME_DIR_GAP now.
+    Uses natural_gap as the minimum spacing when provided — this enforces
+    even headways (e.g. 17.5 min for 8 buses) instead of just the P6
+    minimum of 5 min, which produced bunched 9-min gaps.
+
+    Falls back to SAME_DIR_GAP (5 min) only when natural_gap is not set.
     """
-    for _ in range(40):
-        if _check_p6(buses, trip, rt):
+    min_gap = natural_gap if natural_gap and natural_gap > SAME_DIR_GAP else SAME_DIR_GAP
+    for _ in range(60):
+        if _check_spacing(buses, trip, rt, min_gap):
             return rt
-        rt += timedelta(minutes=SAME_DIR_GAP)
+        rt += timedelta(minutes=min_gap)
     return rt
 
 
@@ -201,24 +209,39 @@ def _morning_dead_run(bus, config):
     return [_make_dead(bus, nearest, dist, tt)]
 
 def _route_to_depot(bus, config):
-    """Return via nearest_node (P2 both ways): current → nearest → DEPOT."""
+    """
+    Return bus to DEPOT via nearest_node (P2 — symmetric with morning dead run).
+
+    Path: current_location → nearest_node → DEPOT
+    All legs are Dead trips. The P1 compliance check allows these corridor
+    Dead legs since they are scheduled repositioning, not unplanned deviation.
+    """
     inserted = []
-    if bus.current_location == config.depot: return inserted
+    if bus.current_location == config.depot:
+        return inserted
+
     nearest, _, _ = _nearest_node_from_depot(config)
+
+    # Leg 1: current_location → nearest_node
     if bus.current_location != nearest:
         try:
             d = config.get_distance(bus.current_location, nearest)
             t = config.get_travel_time(bus.current_location, nearest)
             if bus.soc_after_trip(d) >= SOC_FLOOR:
                 inserted.append(_make_dead(bus, nearest, d, t))
-        except KeyError: pass
+        except KeyError:
+            pass
+
+    # Leg 2: nearest_node → DEPOT
     if bus.current_location != config.depot:
         try:
             d = config.get_distance(bus.current_location, config.depot)
             t = config.get_travel_time(bus.current_location, config.depot)
             if bus.soc_after_trip(d) >= SOC_FLOOR:
                 inserted.append(_make_dead(bus, config.depot, d, t))
-        except KeyError: pass
+        except KeyError:
+            pass
+
     return inserted
 
 def _route_from_depot(bus, config):
@@ -340,11 +363,10 @@ def _select_bus(buses, trip, config, min_break, natural_gap=None):
         if bus.current_location != trip.start_location: continue
         if bus.soc_after_trip(trip.distance_km) < SOC_FLOOR: continue
         rt = _ready_time(bus, min_break, config)
-        # P6 safety-net: bump rt forward until the 5-min same-direction gap is satisfied.
-        # _snap_to_phase was removed: for large fleets buses naturally return staggered
-        # from charging (each charges at a different time), so phase-locking caused
-        # excessive delays (up to cycle_time = 140 min for 8 buses) that broke headways
-        # worse than the bunching it was meant to fix.
+        # Enforce minimum same-direction spacing = natural_gap.
+        # _effective_break already adds off_peak_extra minutes to the ready time
+        # during 11:00-16:00, which naturally widens headways. Adding extra to
+        # the spacing check would double-count and create cascading delays.
         rt = _bumped_ready_time(buses, trip, rt, natural_gap=natural_gap)
         km_deficit = bus.total_km - avg_km
         below_min  = -50 if (min_km > 0 and bus.total_km < min_km) else 0
@@ -559,14 +581,19 @@ def check_compliance(config: RouteConfig, buses: list[BusState]) -> list[dict]:
                     "details": f"Min SOC: {min_soc_seen:.1f}%" + (f", {len(p3_v)} violations" if p3_v else ""),
                     "violations": p3_v[:5]})
 
-    # P4 (charging gaps excluded) — upper bound uses config.max_layover_min
+    # P4 (charging and end-of-day repositioning gaps excluded)
+    # A gap between two Revenue trips is excluded from P4 if it contains:
+    #   - a Charging trip (midday charging detour), OR
+    #   - a Dead trip (repositioning to nearest_node for evening return)
     max_break = getattr(config, 'max_layover_min', MAX_BREAK)
     p4_v = []
     for bus in buses:
         rev_idx = [i for i, t in enumerate(bus.trips) if t.trip_type == "Revenue"]
         for j in range(1, len(rev_idx)):
             i_prev, i_curr = rev_idx[j-1], rev_idx[j]
-            if any(t.trip_type == "Charging" for t in bus.trips[i_prev+1:i_curr]): continue
+            between = bus.trips[i_prev+1:i_curr]
+            if any(t.trip_type in ("Charging", "Dead") for t in between):
+                continue
             c, n = bus.trips[i_prev], bus.trips[i_curr]
             if c.actual_arrival and n.actual_departure:
                 gap = (n.actual_departure - c.actual_arrival).total_seconds() / 60
@@ -576,8 +603,8 @@ def check_compliance(config: RouteConfig, buses: list[BusState]) -> list[dict]:
                     p4_v.append(f"{bus.bus_id} @ {c.actual_arrival.strftime('%H:%M')}: {gap:.0f}min > {max_break}")
     results.append({"rule": f"P4: Break {min_break}–{max_break} min between revenue trips", "priority": 4,
                     "status": "PASS" if not p4_v else "FAIL",
-                    "details": (f"{len(p4_v)} violations (charging gaps excluded)"
-                                if p4_v else "All breaks in range (charging gaps excluded)"),
+                    "details": (f"{len(p4_v)} violations (charging/repositioning gaps excluded)"
+                                if p4_v else "All breaks in range (charging/repositioning gaps excluded)"),
                     "violations": p4_v[:10]})
 
     # P5: midday charging — waived when fleet_size > 10 (P5 policy exception)
