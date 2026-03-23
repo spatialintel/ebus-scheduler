@@ -24,6 +24,8 @@ from src.bus_scheduler import schedule_buses, check_compliance
 from src.output_formatter import write_schedule
 from src.metrics import compute_metrics
 
+__version__ = "2026-03-23-b1"  # auto-stamped — confirms Streamlit deployment
+
 st.set_page_config(page_title="eBus Scheduler", page_icon="🚌", layout="wide",
                    initial_sidebar_state="expanded")
 
@@ -782,6 +784,19 @@ with st.sidebar:
     run_btn = st.button("▶ Generate Schedule", type="primary", disabled=uploaded is None)
     st.divider()
     st.caption("Rules enforced: P4 break from config, P2 via nearest node, P5 midday charge, P3 SOC ≥ 20%.")
+    st.divider()
+    # ── Version badge — update this to confirm deployment ─────────────────────
+    try:
+        from src.bus_scheduler import __version__ as _sched_v
+    except Exception:
+        _sched_v = "unknown"
+    st.markdown(
+        f"<div style='text-align:center;padding:6px 0 2px'>"
+        f"<span style='background:#1F3864;color:#fff;border-radius:6px;"
+        f"padding:3px 10px;font-size:11px;font-family:monospace;letter-spacing:.5px'>"
+        f"v {_sched_v}</span></div>",
+        unsafe_allow_html=True,
+    )
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

@@ -16,6 +16,8 @@ TWO-THREAD GENERATION:
 Headway controls service density. Actual departure times set by scheduler (P4-first).
 latest_departure = op_end so buses are never rejected on window grounds.
 """
+__version__ = "2026-03-23-b1"  # auto-stamped — confirms Streamlit deployment
+
 from __future__ import annotations
 from datetime import datetime, timedelta, time
 import pandas as pd

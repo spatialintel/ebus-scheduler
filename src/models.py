@@ -6,6 +6,8 @@ Three dataclasses:
 - BusState: mutable state tracker for each bus across the day
 - RouteConfig: parsed route configuration (from YAML + CSV)
 """
+__version__ = "2026-03-23-b1"  # auto-stamped — confirms Streamlit deployment
+
 
 from __future__ import annotations
 from dataclasses import dataclass, field

@@ -10,6 +10,8 @@ Usage:
     from src.output_formatter import write_schedule
     write_schedule(config, buses, "outputs/R1_schedule.xlsx")
 """
+__version__ = "2026-03-23-b1"  # auto-stamped — confirms Streamlit deployment
+
 
 from __future__ import annotations
 

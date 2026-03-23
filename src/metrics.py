@@ -7,6 +7,8 @@ Usage:
     print(m)
     print(f"Score: {m.weighted_score():.3f}")
 """
+__version__ = "2026-03-23-b1"  # auto-stamped — confirms Streamlit deployment
+
 
 from __future__ import annotations
 

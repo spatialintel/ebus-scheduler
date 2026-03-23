@@ -11,6 +11,8 @@ P2 (corrected): Morning dead run DEPOT → nearest_node only (1 leg).
 P6: _check_p6 scans all buses' most-recent same-direction revenue trip (not
     just trips[-1]), and re-checks after each bump until gap >= SAME_DIR_GAP.
 """
+__version__ = "2026-03-23-b1"  # auto-stamped — confirms Streamlit deployment
+
 from __future__ import annotations
 from datetime import datetime, timedelta
 from src.models import Trip, BusState, RouteConfig, ScheduleInfeasibleError

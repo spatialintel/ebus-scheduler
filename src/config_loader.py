@@ -30,6 +30,8 @@ New fields added in v5 (read with safe defaults so legacy files continue working
     midday_charge_soc_percent   default 65.0  — P5 trigger SOC
     off_peak_layover_extra_min  default 0     — extra break 11:00-16:00
 """
+__version__ = "2026-03-23-b1"  # auto-stamped — confirms Streamlit deployment
+
 
 from __future__ import annotations
 
