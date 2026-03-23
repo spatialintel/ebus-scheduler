@@ -24,6 +24,8 @@ from src.bus_scheduler import schedule_buses, check_compliance
 from src.output_formatter import write_schedule
 from src.metrics import compute_metrics
 
+__version__ = "2026-03-23-b1"  # auto-stamped — confirms Streamlit deployment
+
 st.set_page_config(page_title="eBus Scheduler", page_icon="🚌", layout="wide",
                    initial_sidebar_state="expanded")
 
@@ -86,7 +88,11 @@ def build_schedule_df(config, buses):
             brk = None
             if i + 1 < len(bus.trips):
                 nxt = bus.trips[i+1]
-                if trip.actual_arrival and nxt.actual_departure:
+                # Break is only meaningful between two Revenue trips.
+                # Revenue → Dead/Charging: driver doesn't "break" — they immediately
+                # drive to depot. Show blank so the 0 doesn't mislead.
+                if (trip.trip_type == "Revenue" and nxt.trip_type == "Revenue"
+                        and trip.actual_arrival and nxt.actual_departure):
                     brk = max(0, int((nxt.actual_departure - trip.actual_arrival).total_seconds() / 60))
             if trip.trip_type in ("Dead", "Charging"): direction = "DEPOT"
             elif trip.direction == "UP": direction = f"{config.route_code}UP"
@@ -131,7 +137,8 @@ def build_route_depiction(config, buses):
             brk = 0
             if i + 1 < len(bus.trips):
                 nxt = bus.trips[i+1]
-                if trip.actual_arrival and nxt.actual_departure:
+                if (trip.trip_type == "Revenue" and nxt.trip_type == "Revenue"
+                        and trip.actual_arrival and nxt.actual_departure):
                     brk = max(0, int((nxt.actual_departure - trip.actual_arrival).total_seconds() / 60))
             rows.append({
                 "Bus": bus.bus_id,
@@ -213,17 +220,37 @@ def build_route_diagram(config, buses, selected_bus=None):
     if config.end_point not in route_nodes:
         route_nodes.append(config.end_point)
 
+    # Build cumulative distances. When a segment distance is 0/missing in the
+    # config (blank Distances sheet), fall back to actual trip distances from
+    # the schedule so the diagram always has meaningful y-positions.
+    def _best_dist(a, b):
+        d = _seg_dist(a, b)
+        if d > 0:
+            return d
+        # Fall back: find a real Revenue trip between these two stops
+        for bus in buses:
+            for t in bus.trips:
+                if (t.trip_type == "Revenue" and t.distance_km > 0 and
+                        ((t.start_location == a and t.end_location == b) or
+                         (t.start_location == b and t.end_location == a))):
+                    return t.distance_km
+        # Last resort: estimate from travel time × assumed speed
+        tt = _seg_time(a, b)
+        spd = getattr(config, 'avg_speed_kmph', 30.0) or 30.0
+        return (tt / 60) * spd if tt > 0 else 1.0
+
     x_pos = {route_nodes[0]: 0.0}
     for i in range(1, len(route_nodes)):
         fr, to = route_nodes[i-1], route_nodes[i]
-        x_pos[to] = x_pos[fr] + _seg_dist(fr, to)
+        x_pos[to] = x_pos[fr] + _best_dist(fr, to)
 
     total_km  = max(x_pos.values()) or 1.0
     depot_x   = x_pos.get(nearest_name, 0.0)
-    depot_dist = x_pos.get(nearest_name, 0.0)   # for Marey y-axis
+    depot_dist = x_pos.get(nearest_name, 0.0)
 
-    # Assign y-position in Marey panel: indexed by cumulative distance
+    # Assign y-position in Marey panel — same as cumulative distance on route
     node_dist = dict(x_pos)
+    # Depot sits at nearest_node distance (off-route, shown below the line)
     node_dist[config.depot] = depot_dist
 
     op_h_start = config.operating_start.hour + config.operating_start.minute / 60
@@ -355,12 +382,15 @@ def build_route_diagram(config, buses, selected_bus=None):
     ), row=1, col=1)
 
     # Fleet summary box annotation
-    total_rev = sum(1 for b in buses for t in b.trips if t.trip_type=="Revenue")
+    # Count only pool-originated revenue trips for display (exclude repositioning legs)
+    trip_ids = set(id(t) for bus in buses for t in bus.trips)
+    total_rev_display = sum(1 for b in buses for t in b.trips
+                            if t.trip_type == "Revenue")
     total_chg = sum(1 for b in buses for t in b.trips if t.trip_type=="Charging")
     avg_soc   = sum(b.soc_percent for b in buses) / max(len(buses), 1)
     fig.add_annotation(
         x=total_km/2, y=1.55,
-        text=(f"<b>{config.fleet_size} buses</b>  ·  {total_rev} revenue trips  ·  "
+        text=(f"<b>{config.fleet_size} buses</b>  ·  {total_rev_display} revenue trips  ·  "
               f"{total_dead_km:.1f} km dead  ·  {total_chg} charge stops  ·  "
               f"Avg peak headway {avg_peak_hw:.0f} min  ·  Avg final SOC {avg_soc:.0f}%"),
         showarrow=False, row=1, col=1,
@@ -645,12 +675,18 @@ def _run_core(config, headway_df, travel_time_df, optimize):
     enrich_distances(config)
     trips = generate_trips(config, headway_df, travel_time_df)
     revenue_trips = [t for t in trips if t.trip_type == "Revenue"]
+    trip_pool_set = set(id(t) for t in trips)   # for counting assigned pool trips only
     if optimize:
         from src.optimizer import optimize_schedule
         buses, metrics, _ = optimize_schedule(config, headway_df, travel_time_df, verbose=False)
     else:
-        buses = schedule_buses(config, trips)
-        metrics = compute_metrics(config, buses, total_revenue_trips=len(revenue_trips))
+        buses = schedule_buses(config, trips, headway_df=headway_df, travel_time_df=travel_time_df)
+        # Count only trips that came from the pool (not repositioning legs added by _route_to_depot)
+        assigned_pool = sum(1 for b in buses for t in b.trips
+                            if t.trip_type == "Revenue" and id(t) in trip_pool_set)
+        metrics = compute_metrics(config, buses,
+                                  total_revenue_trips=len(revenue_trips),
+                                  assigned_revenue_trips=assigned_pool)
     compliance = check_compliance(config, buses)
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
         write_schedule(config, buses, f.name)
@@ -672,7 +708,7 @@ def auto_detect_fleet(raw_config, headway_df, travel_time_df, max_fleet=20):
     for n in range(1, max_fleet + 1):
         cfg = _apply_config_overrides(raw_config, {"fleet_size": n})
         trips = generate_trips(cfg, headway_df, travel_time_df)
-        buses = schedule_buses(cfg, trips)
+        buses = schedule_buses(cfg, trips, headway_df=headway_df, travel_time_df=travel_time_df)
         rev_total    = sum(1 for t in trips   if t.trip_type == "Revenue")
         rev_assigned = sum(1 for b in buses for t in b.trips if t.trip_type == "Revenue")
         compliance   = check_compliance(cfg, buses)
@@ -748,6 +784,19 @@ with st.sidebar:
     run_btn = st.button("▶ Generate Schedule", type="primary", disabled=uploaded is None)
     st.divider()
     st.caption("Rules enforced: P4 break from config, P2 via nearest node, P5 midday charge, P3 SOC ≥ 20%.")
+    st.divider()
+    # ── Version badge — update this to confirm deployment ─────────────────────
+    try:
+        from src.bus_scheduler import __version__ as _sched_v
+    except Exception:
+        _sched_v = "unknown"
+    st.markdown(
+        f"<div style='text-align:center;padding:6px 0 2px'>"
+        f"<span style='background:#1F3864;color:#fff;border-radius:6px;"
+        f"padding:3px 10px;font-size:11px;font-family:monospace;letter-spacing:.5px'>"
+        f"v {_sched_v}</span></div>",
+        unsafe_allow_html=True,
+    )
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
