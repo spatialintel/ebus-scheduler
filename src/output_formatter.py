@@ -78,11 +78,16 @@ def _build_rows(config: RouteConfig, buses: list[BusState]) -> list[dict]:
                 running_soc_kwh = min(config.battery_kwh, running_soc_kwh + kwh_added)
                 soc_pct = (running_soc_kwh / config.battery_kwh) * 100
 
-            # Break: gap to next trip
+            # Break: only meaningful between two Revenue trips.
+            # Revenue→Dead/Charging: driver goes straight to depot, no "break".
+            # Showing 0 for these pairs misleads operators into thinking a
+            # P4 violation occurred. Blank is correct.
             break_min = None
             if i + 1 < len(bus.trips):
                 next_trip = bus.trips[i + 1]
-                if trip.actual_arrival and next_trip.actual_departure:
+                if (trip.trip_type == "Revenue" and
+                        next_trip.trip_type == "Revenue" and
+                        trip.actual_arrival and next_trip.actual_departure):
                     gap = (next_trip.actual_departure - trip.actual_arrival).total_seconds() / 60
                     break_min = max(0, int(gap))
 

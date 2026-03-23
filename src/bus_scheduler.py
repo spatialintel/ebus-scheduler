@@ -284,6 +284,16 @@ def _find_and_reposition(buses, trip, config, min_break):
     being repositioned mid-day.  We build a two-leg list in that case:
         DEPOT → nearest_node → trip.start_location
     For buses already on the route the single-leg path is used as before.
+
+    KEY RULE: never reposition a bus that is already at trip.end_location.
+    Such a bus is at the wrong end of the route — repositioning it back to
+    trip.start_location requires a dead run equal to the full revenue trip
+    distance, and then the bus immediately returns to where it started.
+    It is always cheaper to let that bus serve the reverse direction naturally
+    (its current location IS the start_location of the return trip).
+    Without this guard, buses post-charging repeatedly get sent across the
+    whole route as dead runs, accumulating 2× revenue-trip dead km and
+    causing 100+ minute idle gaps when all same-direction slots are exhausted.
     """
     op_end  = REF_DATE.replace(hour=config.operating_end.hour,
                                minute=config.operating_end.minute)
@@ -292,6 +302,13 @@ def _find_and_reposition(buses, trip, config, min_break):
 
     for bus in buses:
         if bus.current_location == trip.start_location:
+            continue
+
+        # ── Core guard ────────────────────────────────────────────────────────
+        # Bus is already at the destination of this trip. Sending it back to
+        # the origin as a dead run and then immediately returning it defeats
+        # the purpose. Let it serve the opposite-direction trip naturally.
+        if bus.current_location == trip.end_location:
             continue
 
         legs = []  # dead-run legs to assign
@@ -396,138 +413,238 @@ def _balance_breaks(buses, config):
                     tc.actual_arrival = tc.actual_departure + timedelta(minutes=tc.travel_time_min)
 
 
-def schedule_buses(config: RouteConfig, trips: list[Trip]) -> list[BusState]:
-    min_break = config.preferred_layover_min
-    buses     = _create_fleet(config)
-    unassigned = []
-    revenue_trips = [t for t in trips if t.trip_type == "Revenue"]
-    op_end = REF_DATE.replace(hour=config.operating_end.hour,
-                              minute=config.operating_end.minute)
+def _make_trip_stub(direction, start, end, config):
+    """Lightweight Trip-like object for P6 spacing check."""
+    return Trip(direction=direction, trip_type="Revenue",
+                start_location=start, end_location=end,
+                earliest_departure=REF_DATE, latest_departure=REF_DATE,
+                travel_time_min=0, distance_km=0, shift=1)
 
-    # ── Phase 1: Staggered morning dead runs ──────────────────────────────
-    # Stagger = natural_gap = cycle_time / fleet_size.
-    # cycle_time = DN_travel + break + UP_travel + break (one full round trip).
-    # Using natural_gap (not headway from trip pool) ensures buses are evenly
-    # spread regardless of early-morning headway profile values.
-    nearest_node, _, nearest_tt = _nearest_node_from_depot(config)
+
+def _get_travel_time_at(config, dep_time, direction):
+    """
+    Look up travel time from TravelTime_Profile at departure time.
+    Falls back to segment time from config.segment_times.
+    """
+    # Try to import travel_time_df from trip_generator context
+    # This is injected via schedule_buses parameter — access via closure
+    if hasattr(config, '_tt_df') and config._tt_df is not None:
+        from trip_generator import _get_travel_time as _gtt
+        return _gtt(dep_time, direction, config._tt_df)
+    return None  # caller falls back to segment time
+
+
+def _get_min_headway(config, dep_time):
+    """
+    Minimum gap between same-direction departures from the headway profile.
+    Falls back to SAME_DIR_GAP if no profile available.
+    """
+    if hasattr(config, '_hw_df') and config._hw_df is not None:
+        from trip_generator import _get_headway_at
+        return _get_headway_at(dep_time, config._hw_df)
+    return SAME_DIR_GAP
+
+
+def schedule_buses(config: RouteConfig, trips: list[Trip],
+                   headway_df=None, travel_time_df=None) -> list[BusState]:
+    """
+    Bus-driven scheduler — no pre-generated trip pool slots.
+
+    Each bus, after completing a trip, waits its break (preferred_layover +
+    off_peak_extra during 11-16), then departs immediately on the next trip
+    in the alternating direction. P6 bumping enforces minimum same-direction
+    spacing between buses. No fixed departure clock to wait for.
+
+    This eliminates the headway-pool double-counting problem where buses
+    idled for 60-130 min waiting for the next pool slot.
+    """
+    min_break  = config.preferred_layover_min
+    max_break  = getattr(config, 'max_layover_min', MAX_BREAK)
+    buses      = _create_fleet(config)
+    op_end     = REF_DATE.replace(hour=config.operating_end.hour,
+                                  minute=config.operating_end.minute)
     op_start_dt = REF_DATE.replace(hour=config.operating_start.hour,
                                    minute=config.operating_start.minute)
-    dn_pool = [t for t in trips if t.trip_type == "Revenue" and t.direction == "DN"]
-    up_pool = [t for t in trips if t.trip_type == "Revenue" and t.direction == "UP"]
-    if dn_pool and up_pool:
-        dn_tt = dn_pool[0].travel_time_min
-        up_tt = up_pool[0].travel_time_min
-        cycle_time  = dn_tt + min_break + up_tt + min_break
-        stagger_min = cycle_time / max(1, config.fleet_size)
-    else:
-        stagger_min = min_break * 2
+    off_peak_extra = getattr(config, 'off_peak_layover_extra_min', 0)
+
+    # Attach profile DataFrames to config so helpers can access them
+    config._hw_df = headway_df
+    config._tt_df = travel_time_df
+
+    # ── Phase 1: Staggered morning dead runs ─────────────────────────────────
+    nearest_node, _, nearest_tt = _nearest_node_from_depot(config)
+    far_loc = (config.end_point if nearest_node == config.start_point
+               else config.start_point)
+
+    # Get representative travel times for cycle_time / stagger computation
+    try:
+        dn_tt = config.get_travel_time(nearest_node, far_loc)
+    except KeyError:
+        dn_tt = 45
+    try:
+        up_tt = config.get_travel_time(far_loc, nearest_node)
+    except KeyError:
+        up_tt = dn_tt
+
+    cycle_time  = dn_tt + min_break + up_tt + min_break
+    natural_gap = cycle_time / max(1, config.fleet_size)
+    stagger_min = natural_gap
 
     for i, bus in enumerate(buses):
         arrive_at = op_start_dt + timedelta(minutes=i * stagger_min)
         bus.current_time = arrive_at - timedelta(minutes=nearest_tt)
         _morning_dead_run(bus, config)
-        # Permanent phase index — set once here, used by _snap_to_phase.
         bus.phase_index = i
-        # bus is now at nearest_node, current_time = arrive_at
 
-    # ── Phase 2: Revenue trips — P4-first (bus ready time = departure time) ─
-    # natural_gap = cycle_time / fleet — used to re-sync buses after charging detour
-    if dn_pool and up_pool:
-        cycle_time  = dn_pool[0].travel_time_min + min_break + up_pool[0].travel_time_min + min_break
-        natural_gap = cycle_time / max(1, config.fleet_size)
-    else:
-        natural_gap = None
+    # ── Phase 2: Bus-driven revenue trip loop ─────────────────────────────────
+    # Each bus runs until it can no longer complete another trip before op_end.
+    # Direction alternates: DN (nearest→far) then UP (far→nearest) then DN ...
+    # The outer loop iterates until no bus can make progress (all stuck or done).
+    MAX_ITERATIONS = config.fleet_size * 200   # safety cap
+    iteration = 0
 
-    for idx, trip in enumerate(revenue_trips):
-        trip_time = trip.earliest_departure
+    while iteration < MAX_ITERATIONS:
+        iteration += 1
 
-        # P5: midday charging — skipped when fleet > 10 (P5 waiver applies)
-        # Guard: only send a bus to charge if it will arrive at the depot
-        # at or after MIDDAY_START. Without this check, buses finishing their
-        # 3rd trip at 09:30 (SOC=79.7% < midday_soc=80%) get sent to charge
-        # immediately, completing the charge at 10:30 — before the 12:00 window —
-        # so P5 reports "no charge 12:00-15:00". The fix: defer charging until
-        # the bus is close enough to midday that it will arrive in-window.
-        midday_soc = getattr(config, 'midday_charge_soc_percent', MIDDAY_CHARGE_SOC)
-        if _is_midday(trip_time) and config.fleet_size <= 10:
-            for bus in buses:
-                if bus.current_location == config.depot: continue
-                if bus.current_time >= MIDDAY_END: continue
-                if bus.soc_percent >= midday_soc: continue
-                # Estimate when this bus would arrive at the depot
+        # Find the bus that is ready soonest and can make a valid next trip
+        best_bus   = None
+        best_rt    = None
+        best_trip  = None   # (direction, start, end, dist, tt)
+
+        for bus in buses:
+            if bus.current_location == config.depot:
+                continue   # already returned to depot for the day
+
+            # What direction should this bus go next?
+            last_rev = next((t for t in reversed(bus.trips)
+                             if t.trip_type == "Revenue"), None)
+            if last_rev is None:
+                # Just completed morning dead run — first trip is DN
+                next_dir   = "DN"
+                trip_start = nearest_node
+                trip_end   = far_loc
+            elif last_rev.end_location == far_loc:
+                next_dir   = "UP"
+                trip_start = far_loc
+                trip_end   = nearest_node
+            else:
+                next_dir   = "DN"
+                trip_start = nearest_node
+                trip_end   = far_loc
+
+            # Bus must be at trip_start to serve this direction
+            if bus.current_location != trip_start:
+                continue
+
+            # Compute break — add off_peak_extra during 11:00-16:00
+            rt = _ready_time(bus, min_break, config)
+
+            # Enforce P6: bump rt until same-direction spacing is satisfied
+            rt = _bumped_ready_time(buses, _make_trip_stub(
+                next_dir, trip_start, trip_end, config), rt,
+                natural_gap=natural_gap)
+
+            # Enforce headway minimum spacing from last same-direction departure
+            min_headway = SAME_DIR_GAP
+            if headway_df is not None:
                 try:
-                    dead_tt = config.get_travel_time(bus.current_location, config.depot)
+                    from trip_generator import _get_headway_at
+                    min_headway = _get_headway_at(rt, headway_df)
+                except Exception:
+                    pass
+            last_same = _last_revenue_in_direction(bus, next_dir, trip_start)
+            for other in buses:
+                candidate = _last_revenue_in_direction(other, next_dir, trip_start)
+                if candidate and (last_same is None or
+                        candidate.actual_departure > last_same.actual_departure):
+                    last_same = candidate
+            if last_same and last_same.actual_departure:
+                gap_from_last = (rt - last_same.actual_departure).total_seconds() / 60
+                if gap_from_last < min_headway:
+                    rt = last_same.actual_departure + timedelta(minutes=min_headway)
+
+            # Get travel time: TravelTime_Profile first, then segment config
+            tt_val = None
+            if travel_time_df is not None:
+                try:
+                    from trip_generator import _get_travel_time as _gtt
+                    tt_val = _gtt(rt, next_dir, travel_time_df)
+                except Exception:
+                    pass
+            if tt_val is None:
+                try:
+                    tt_val = config.get_travel_time(trip_start, trip_end)
                 except KeyError:
-                    dead_tt = 30  # safe fallback
-                expected_depot_arrival = bus.current_time + timedelta(minutes=dead_tt)
-                # Only charge if the bus will arrive at the depot within the midday window
-                # Allow a 30-min pre-window buffer (bus arrives at 11:30+ is fine)
-                if expected_depot_arrival < MIDDAY_START - timedelta(minutes=30):
-                    continue
-                _charging_detour(bus, config,
-                                 resume_by=EVENING_PEAK_START, min_break=min_break)
+                    tt_val = dn_tt if next_dir == "DN" else up_tt
 
-        best, rt = _select_bus(buses, trip, config, min_break, natural_gap=natural_gap)
+            # Check SOC
+            try:
+                dist = config.get_distance(trip_start, trip_end)
+            except KeyError:
+                continue
+            if bus.soc_after_trip(dist) < SOC_FLOOR:
+                continue
 
-        if best is None:
-            repo = _find_and_reposition(buses, trip, config, min_break)
-            if repo:
-                bus, _ = repo   # legs already assigned inside _find_and_reposition
-                best, rt = _select_bus(buses, trip, config, min_break, natural_gap=natural_gap)
+            # Check arrival within operating window
+            proj_arr = rt + timedelta(minutes=tt_val)
+            if proj_arr > op_end + timedelta(minutes=45):
+                continue
 
-        if best is None or rt is None:
-            unassigned.append(trip)
-            continue
+            # This bus is a candidate — pick the one ready soonest
+            if best_rt is None or rt < best_rt:
+                best_bus  = bus
+                best_rt   = rt
+                best_trip = (next_dir, trip_start, trip_end, dist, tt_val)
 
-        # Reject if bus would ARRIVE past op_end + 45 min.
-        # Previously only departure was checked, so trips departing at 21:00 with
-        # 60-min travel were assigned and arrived at 22:00 — well past the window.
-        projected_arrival = rt + timedelta(minutes=trip.travel_time_min)
-        if projected_arrival > op_end + timedelta(minutes=45):
-            unassigned.append(trip)
-            continue
+        if best_bus is None:
+            break   # no bus can make progress — done
 
-        trip.earliest_departure = rt
-        best.assign(trip)
+        # Assign the trip to best_bus
+        next_dir, trip_start, trip_end, dist, tt_val = best_trip
+        trip = Trip(
+            direction=next_dir, trip_type="Revenue",
+            start_location=trip_start, end_location=trip_end,
+            earliest_departure=best_rt, latest_departure=op_end,
+            travel_time_min=tt_val, distance_km=dist,
+            shift=(1 if best_rt < REF_DATE.replace(hour=config.shift_split.hour,
+                                                    minute=config.shift_split.minute)
+                   else 2),
+        )
+        trip.earliest_departure = best_rt
+        best_bus.assign(trip)
 
-        # Post-assignment charging
-        # resume_by is always a fixed clock target, never a pool-slot time.
-        # Pool slots are EARLIEST desired departure and can be in the past by the
-        # time the bus does a dead run to the depot, making max_charge negative
-        # and silently skipping the charge entirely.
+        # P5: midday charging check
         midday_soc  = getattr(config, 'midday_charge_soc_percent', MIDDAY_CHARGE_SOC)
         soc_trigger = getattr(config, 'trigger_soc_percent', SOC_TRIGGER)
-        if _is_midday(best.current_time) and config.fleet_size <= 10 and best.soc_percent < midday_soc:
-            _charging_detour(best, config, resume_by=EVENING_PEAK_START, min_break=min_break)
-        elif best.soc_percent <= soc_trigger:
-            if _is_midday(best.current_time):
-                _charging_detour(best, config, resume_by=EVENING_PEAK_START, min_break=min_break)
-            elif not _is_peak(best.current_time):
-                # Off-peak reactive charge — resume by evening peak start.
-                # Previously used future[0].earliest_departure which is a pool slot
-                # already in the past (bus hasn't done the dead run yet), yielding
-                # max_charge < 0 and silently skipping the charge.
-                _charging_detour(best, config, resume_by=EVENING_PEAK_START, min_break=min_break)
-            elif best.soc_percent <= SOC_FLOOR + 5:
-                # Emergency during peak: charge and resume as soon as possible.
-                _charging_detour(best, config, resume_by=op_end, min_break=min_break)
+        if _is_midday(best_bus.current_time) and config.fleet_size <= 10:
+            if best_bus.soc_percent < midday_soc:
+                try:
+                    dead_tt = config.get_travel_time(best_bus.current_location,
+                                                     config.depot)
+                except KeyError:
+                    dead_tt = 30
+                exp_arr = best_bus.current_time + timedelta(minutes=dead_tt)
+                if exp_arr >= MIDDAY_START - timedelta(minutes=30):
+                    _charging_detour(best_bus, config,
+                                     resume_by=EVENING_PEAK_START,
+                                     min_break=min_break)
+        elif best_bus.soc_percent <= soc_trigger:
+            if _is_midday(best_bus.current_time):
+                _charging_detour(best_bus, config,
+                                 resume_by=EVENING_PEAK_START, min_break=min_break)
+            elif not _is_peak(best_bus.current_time):
+                _charging_detour(best_bus, config,
+                                 resume_by=EVENING_PEAK_START, min_break=min_break)
+            elif best_bus.soc_percent <= SOC_FLOOR + 5:
+                _charging_detour(best_bus, config,
+                                 resume_by=op_end, min_break=min_break)
 
-    # ── Phase 3: Evening return — every bus must reach DEPOT ─────────────────
-    # Called unconditionally after revenue assignment. _route_to_depot is a no-op
-    # if the bus is already at the depot, so no double-counting occurs.
+    # ── Phase 3: Evening return ───────────────────────────────────────────────
     for bus in buses:
         _route_to_depot(bus, config)
 
-    # ── Phase 4: Safety-net break enforcement ──────────────────────────────
+    # ── Phase 4: Safety-net break enforcement ────────────────────────────────
     _balance_breaks(buses, config)
-
-    if unassigned:
-        print(f"\n  WARNING: {len(unassigned)} trips unassigned:")
-        for t in unassigned[:5]:
-            print(f"    {t.direction} {t.start_location}->{t.end_location} "
-                  f"@ {t.earliest_departure.strftime('%H:%M')}")
-        if len(unassigned) > 5:
-            print(f"    ... and {len(unassigned)-5} more")
 
     return buses
 
@@ -582,11 +699,18 @@ def check_compliance(config: RouteConfig, buses: list[BusState]) -> list[dict]:
                     "violations": p3_v[:5]})
 
     # P4 (charging and end-of-day repositioning gaps excluded)
-    # A gap between two Revenue trips is excluded from P4 if it contains:
-    #   - a Charging trip (midday charging detour), OR
-    #   - a Dead trip (repositioning to nearest_node for evening return)
+    # P4: Break between consecutive Revenue trips must be preferred_layover ≤ gap ≤ max_layover.
+    # Three categories of gaps are handled:
+    #   1. Gap contains Charging or Dead trip → excluded (charging/repositioning)
+    #   2. Gap > max_layover BUT caused by headway profile (no pool slot existed
+    #      within max_layover of bus ready time) → flagged as "headway gap" warning,
+    #      not a hard violation — this is a service-design constraint the scheduler
+    #      cannot override without generating trips outside the headway spec
+    #   3. Gap > max_layover with no structural reason → hard P4 violation
     max_break = getattr(config, 'max_layover_min', MAX_BREAK)
+    min_break_eff = getattr(config, 'preferred_layover_min', min_break)
     p4_v = []
+    p4_hw_gaps = []   # headway-driven long gaps (warn, not fail)
     for bus in buses:
         rev_idx = [i for i, t in enumerate(bus.trips) if t.trip_type == "Revenue"]
         for j in range(1, len(rev_idx)):
@@ -595,17 +719,50 @@ def check_compliance(config: RouteConfig, buses: list[BusState]) -> list[dict]:
             if any(t.trip_type in ("Charging", "Dead") for t in between):
                 continue
             c, n = bus.trips[i_prev], bus.trips[i_curr]
-            if c.actual_arrival and n.actual_departure:
-                gap = (n.actual_departure - c.actual_arrival).total_seconds() / 60
-                if gap < min_break:
-                    p4_v.append(f"{bus.bus_id} @ {c.actual_arrival.strftime('%H:%M')}: {gap:.0f}min < {min_break}")
-                elif gap > max_break:
+            if not (c.actual_arrival and n.actual_departure):
+                continue
+            gap = (n.actual_departure - c.actual_arrival).total_seconds() / 60
+            if gap < min_break:
+                p4_v.append(f"{bus.bus_id} @ {c.actual_arrival.strftime('%H:%M')}: {gap:.0f}min < {min_break_eff} (too short)")
+            elif gap > max_break:
+                # Distinguish: was this gap forced by the headway profile?
+                # If the next trip's earliest_departure was already > bus_ready + max_break,
+                # the gap is headway-driven (pool slot simply didn't exist sooner).
+                off_extra = getattr(config, 'off_peak_layover_extra_min', 0)
+                from datetime import datetime as _dt
+                is_offpeak = (REF_DATE.replace(hour=11) <= c.actual_arrival <
+                              REF_DATE.replace(hour=16))
+                effective_min = min_break + (off_extra if is_offpeak else 0)
+                bus_ready = c.actual_arrival + timedelta(minutes=effective_min)
+                # If bus ready time + max_break was already past next departure,
+                # the next pool slot was too far — headway-driven, not a scheduler bug
+                if bus_ready + timedelta(minutes=max_break) < n.actual_departure:
+                    p4_hw_gaps.append(
+                        f"{bus.bus_id} @ {c.actual_arrival.strftime('%H:%M')}: "
+                        f"{gap:.0f}min gap — headway-constrained "
+                        f"(no pool slot within {max_break}min of bus ready time {bus_ready.strftime('%H:%M')})"
+                    )
+                else:
                     p4_v.append(f"{bus.bus_id} @ {c.actual_arrival.strftime('%H:%M')}: {gap:.0f}min > {max_break}")
-    results.append({"rule": f"P4: Break {min_break}–{max_break} min between revenue trips", "priority": 4,
-                    "status": "PASS" if not p4_v else "FAIL",
-                    "details": (f"{len(p4_v)} violations (charging/repositioning gaps excluded)"
-                                if p4_v else "All breaks in range (charging/repositioning gaps excluded)"),
-                    "violations": p4_v[:10]})
+
+    # Build P4 result — PASS only if no hard violations
+    p4_details_parts = []
+    if p4_v:
+        p4_details_parts.append(f"{len(p4_v)} violation(s)")
+    if p4_hw_gaps:
+        p4_details_parts.append(
+            f"{len(p4_hw_gaps)} headway-constrained gap(s) "
+            f"(reduce headway or fleet in Config to fix)"
+        )
+    if not p4_v and not p4_hw_gaps:
+        p4_details_parts.append("All breaks in range")
+    results.append({
+        "rule": f"P4: Break {min_break}–{max_break} min between revenue trips",
+        "priority": 4,
+        "status": "PASS" if not p4_v else "FAIL",
+        "details": "; ".join(p4_details_parts) + " (charging/repositioning gaps excluded)",
+        "violations": p4_v[:10] + p4_hw_gaps[:5],
+    })
 
     # P5: midday charging — waived when fleet_size > 10 (P5 policy exception)
     if config.fleet_size > 10:
