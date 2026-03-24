@@ -2,7 +2,7 @@
 app.py — eBus Scheduler Dashboard
 """
 from __future__ import annotations
-__version__ = "2026-03-24-b1"  # auto-stamped
+__version__ = "2026-03-24-b3"  # auto-stamped
 import sys, tempfile
 from pathlib import Path
 from datetime import datetime, timedelta, time as dtime
@@ -649,9 +649,19 @@ def _run_core(config, headway_df, travel_time_df, optimize):
     if optimize:
         from src.optimizer import optimize_schedule
         buses, metrics, _ = optimize_schedule(config, headway_df, travel_time_df, verbose=False)
+        assigned_rev = sum(1 for b in buses for t in b.trips if t.trip_type == 'Revenue')
+        metrics = compute_metrics(config, buses,
+                                  total_revenue_trips=len(revenue_trips),
+                                  assigned_revenue_trips=assigned_rev)
     else:
-        buses = schedule_buses(config, trips)
-        metrics = compute_metrics(config, buses, total_revenue_trips=len(revenue_trips))
+        buses = schedule_buses(config, trips,
+                               headway_df=headway_df, travel_time_df=travel_time_df)
+        # Bus-driven scheduler creates new Trip objects (not pool references).
+        # Count Revenue trips directly from bus schedules.
+        assigned_rev = sum(1 for b in buses for t in b.trips if t.trip_type == 'Revenue')
+        metrics = compute_metrics(config, buses,
+                                  total_revenue_trips=len(revenue_trips),
+                                  assigned_revenue_trips=assigned_rev)
     compliance = check_compliance(config, buses)
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
         write_schedule(config, buses, f.name)
@@ -810,7 +820,7 @@ if st.session_state.get("has_results"):
 
     st.markdown(
         '<div class="kpi-grid">' +
-        kpi("Revenue Trips", f"{metrics.revenue_trips_assigned}+{shuttle_count}S/{metrics.revenue_trips_total}",
+        kpi("Revenue Trips", f"{metrics.revenue_trips_assigned}/{metrics.revenue_trips_total}",
             "ok" if trip_ok else "bad") +
         kpi("Total KM", f"{metrics.total_km:.0f}") +
         kpi("Dead KM %", f"{metrics.dead_km_ratio:.1%}",
