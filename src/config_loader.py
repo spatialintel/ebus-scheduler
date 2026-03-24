@@ -230,19 +230,32 @@ def _parse_locations(ws, wb, field_map: dict):
 def _parse_segments(ws, wb, avg_speed_kmph: float = 30.0, field_map: dict = None):
     """
     Read segment distances and travel times.
-
-    Strategy (tries in order):
-      1. Standalone "Distances" sheet (v5 layout):
-            A=from_location, B=to_location, C=distance_km, D=time_min
-         time_min may be blank → estimated from distance / avg_speed_kmph.
-      2. Embedded "Sr." table in Route_Config:
-            Generic labels in cols C/D resolved via field_map or cols G/H.
-            distance col E, time col F.
-
-    Returns: segment_distances dict, segment_times dict
+    Generic labels (Start point, End point, Intermediate 1, Intermediate 2, Depot)
+    are resolved to actual location names via field_map in both strategies.
     """
     distances: dict[str, float] = {}
     times:     dict[str, int]   = {}
+
+    # ── Generic label resolver (used by both strategies) ─────────────────────
+    _label_map = {
+        "depot":                "depot",
+        "start point":          "start_point",
+        "end point":            "end_point",
+        "intermediate 1":       "intermediate_1",
+        "intermediate 2":       "intermediate_2",
+        "intermediate point 1": "intermediate_1",
+        "intermediate point 2": "intermediate_2",
+    }
+
+    def _resolve(label) -> str | None:
+        if not label: return None
+        s = str(label).strip()
+        key = _label_map.get(s.lower())
+        if key and field_map:
+            val = _get_opt(field_map, key)
+            if val and str(val).strip():
+                return str(val).strip()
+        return s  # actual name — pass through unchanged
 
     # ── Strategy 1: standalone Distances sheet ────────────────────────────────
     dist_ws = _find_sheet(wb, "Distances", "Segment_Distances", "Segments")
@@ -254,21 +267,27 @@ def _parse_segments(ws, wb, avg_speed_kmph: float = 30.0, field_map: dict = None
                 "from_location", "from", "origin", "segment", "sr", "sr.",
                 "segment distances & times", "segment distances and travel times",
             ):
+                if dist_ws.cell(r, 2).value is None:
+                    continue  # skip section-header rows (merged, no col B)
                 data_start = r
                 break
 
         if data_start is not None:
             for r in range(data_start, dist_ws.max_row + 1):
-                fr   = dist_ws.cell(r, 1).value
-                to   = dist_ws.cell(r, 2).value
-                dist = dist_ws.cell(r, 3).value
-                tt   = dist_ws.cell(r, 4).value
+                fr_raw = dist_ws.cell(r, 1).value
+                to_raw = dist_ws.cell(r, 2).value
+                dist   = dist_ws.cell(r, 3).value
+                tt     = dist_ws.cell(r, 4).value
 
-                if fr is None or to is None or dist is None:
+                if fr_raw is None or to_raw is None or dist is None:
                     continue
+
+                fr = _resolve(fr_raw)
+                to = _resolve(to_raw)
+                if not fr or not to:
+                    continue
+
                 try:
-                    fr   = str(fr).strip()
-                    to   = str(to).strip()
                     dist = float(dist)
                 except (ValueError, TypeError):
                     continue
@@ -290,7 +309,6 @@ def _parse_segments(ws, wb, avg_speed_kmph: float = 30.0, field_map: dict = None
 
         if distances:
             return distances, times
-        # Fall through to legacy table if Distances sheet was empty
 
     # ── Strategy 2: legacy embedded "Sr." table in Route_Config ──────────────
     # Generic label → actual name resolver using field_map
