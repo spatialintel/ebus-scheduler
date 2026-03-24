@@ -9,10 +9,9 @@ Usage:
     from src.optimizer import optimize_schedule
     best_buses, best_metrics, best_headway = optimize_schedule(config, headway_df, travel_time_df)
 """
-__version__ = "2026-03-23-b1"  # auto-stamped — confirms Streamlit deployment
-
 
 from __future__ import annotations
+__version__ = "2026-03-24-b1"  # auto-stamped
 
 from copy import deepcopy
 import pandas as pd

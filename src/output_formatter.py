@@ -10,10 +10,9 @@ Usage:
     from src.output_formatter import write_schedule
     write_schedule(config, buses, "outputs/R1_schedule.xlsx")
 """
-__version__ = "2026-03-23-b1"  # auto-stamped — confirms Streamlit deployment
-
 
 from __future__ import annotations
+__version__ = "2026-03-24-b1"  # auto-stamped
 
 from datetime import timedelta
 from pathlib import Path
@@ -80,16 +79,11 @@ def _build_rows(config: RouteConfig, buses: list[BusState]) -> list[dict]:
                 running_soc_kwh = min(config.battery_kwh, running_soc_kwh + kwh_added)
                 soc_pct = (running_soc_kwh / config.battery_kwh) * 100
 
-            # Break: only meaningful between two Revenue trips.
-            # Revenue→Dead/Charging: driver goes straight to depot, no "break".
-            # Showing 0 for these pairs misleads operators into thinking a
-            # P4 violation occurred. Blank is correct.
+            # Break: gap to next trip
             break_min = None
             if i + 1 < len(bus.trips):
                 next_trip = bus.trips[i + 1]
-                if (trip.trip_type == "Revenue" and
-                        next_trip.trip_type == "Revenue" and
-                        trip.actual_arrival and next_trip.actual_departure):
+                if trip.actual_arrival and next_trip.actual_departure:
                     gap = (next_trip.actual_departure - trip.actual_arrival).total_seconds() / 60
                     break_min = max(0, int(gap))
 

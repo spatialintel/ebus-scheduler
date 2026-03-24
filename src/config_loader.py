@@ -30,10 +30,9 @@ New fields added in v5 (read with safe defaults so legacy files continue working
     midday_charge_soc_percent   default 65.0  — P5 trigger SOC
     off_peak_layover_extra_min  default 0     — extra break 11:00-16:00
 """
-__version__ = "2026-03-23-b1"  # auto-stamped — confirms Streamlit deployment
-
 
 from __future__ import annotations
+__version__ = "2026-03-24-b1"  # auto-stamped
 
 from datetime import time
 from pathlib import Path
@@ -232,167 +231,68 @@ def _parse_segments(ws, wb, avg_speed_kmph: float = 30.0, field_map: dict = None
     """
     Read segment distances and travel times.
 
-    Supports three label styles in the Distances sheet:
-      - Actual names:  "GANGAJALIA BUS STAND", "SHIHOR", "DEPOT"
-      - Generic short: "Start point", "End point", "Depot",
-                       "Intermediate 1", "Intermediate 2"
-      - Generic long:  "Intermediate point 1", "Intermediate point 2"
+    Strategy (tries in order):
+      1. Standalone "Distances" sheet (v5 layout):
+            A=from_location, B=to_location, C=distance_km, D=time_min
+         time_min may be blank → estimated from distance / avg_speed_kmph.
+      2. Embedded "Sr." table in Route_Config:
+            Generic labels in cols C/D resolved via field_map or cols G/H.
+            distance col E, time col F.
 
-    Generic labels are resolved to actual names via field_map (Route_Config).
-    Section-header rows (merged cells, no col B value) are skipped automatically.
-    Rows where distance_km is blank or 0 are skipped.
-    time_min blank → estimated as distance / avg_speed_kmph × 60.
-
-    Strategy:
-      1. Standalone "Distances" sheet (universal template & v5 layout)
-      2. Embedded "Sr." table in Route_Config (legacy layout)
+    Returns: segment_distances dict, segment_times dict
     """
     distances: dict[str, float] = {}
     times:     dict[str, int]   = {}
 
-    # ── Generic label resolver (case-insensitive, short and long forms) ───────
-    generic_map = {
-        "depot":            "depot",
-        "start point":      "start_point",
-        "end point":        "end_point",
-        "intermediate 1":   "intermediate_1",
-        "intermediate 2":   "intermediate_2",
-        "intermediate point 1": "intermediate_1",
-        "intermediate point 2": "intermediate_2",
-    }
-
-    def _resolve(label) -> str | None:
-        if not label:
-            return None
-        s = str(label).strip()
-        key = generic_map.get(s.lower())
-        if key and field_map:
-            val = _get_opt(field_map, key)
-            if val and str(val).strip():
-                return str(val).strip()
-        return s  # actual name — return as-is
-
     # ── Strategy 1: standalone Distances sheet ────────────────────────────────
     dist_ws = _find_sheet(wb, "Distances", "Segment_Distances", "Segments")
     if dist_ws is not None:
+        data_start = None
         for r in range(1, dist_ws.max_row + 1):
-            fr_raw = dist_ws.cell(r, 1).value
-            to_raw = dist_ws.cell(r, 2).value
-            dist   = dist_ws.cell(r, 3).value
-            tt     = dist_ws.cell(r, 4).value
-
-            # Skip header, section-header, and empty rows
-            if fr_raw is None or to_raw is None:
-                continue
-            if str(fr_raw).strip().lower() in (
+            v = dist_ws.cell(r, 1).value
+            if v and str(v).lower() not in (
                 "from_location", "from", "origin", "segment", "sr", "sr.",
                 "segment distances & times", "segment distances and travel times",
             ):
-                continue
+                data_start = r
+                break
 
-            # Resolve generic labels → actual names
-            fr = _resolve(fr_raw)
-            to = _resolve(to_raw)
-            if not fr or not to:
-                continue
+        if data_start is not None:
+            for r in range(data_start, dist_ws.max_row + 1):
+                fr   = dist_ws.cell(r, 1).value
+                to   = dist_ws.cell(r, 2).value
+                dist = dist_ws.cell(r, 3).value
+                tt   = dist_ws.cell(r, 4).value
 
-            # Skip rows where distance is missing/zero (unused pairs)
-            if dist is None:
-                continue
-            try:
-                dist = float(dist)
-            except (ValueError, TypeError):
-                continue
-            if dist <= 0:
-                continue
-
-            # Estimate time if blank
-            if tt is None or str(tt).strip() == "":
-                tt = round(dist / max(avg_speed_kmph, 1) * 60)
-            else:
+                if fr is None or to is None or dist is None:
+                    continue
                 try:
-                    tt = int(float(tt))
+                    fr   = str(fr).strip()
+                    to   = str(to).strip()
+                    dist = float(dist)
                 except (ValueError, TypeError):
-                    tt = round(dist / max(avg_speed_kmph, 1) * 60)
+                    continue
 
-            key = RouteConfig.segment_key(fr, to)
-            distances[key] = dist
-            times[key]     = tt
+                if dist <= 0:
+                    continue
+
+                if tt is None or str(tt).strip() == "":
+                    tt = round(dist / max(avg_speed_kmph, 1) * 60)
+                else:
+                    try:
+                        tt = int(float(tt))
+                    except (ValueError, TypeError):
+                        tt = round(dist / max(avg_speed_kmph, 1) * 60)
+
+                key = RouteConfig.segment_key(fr, to)
+                distances[key] = dist
+                times[key]     = tt
 
         if distances:
             return distances, times
+        # Fall through to legacy table if Distances sheet was empty
 
     # ── Strategy 2: legacy embedded "Sr." table in Route_Config ──────────────
-    header_row = None
-    for row in range(1, ws.max_row + 1):
-        if ws.cell(row, 2).value == "Sr.":
-            header_row = row
-            break
-    if header_row is None:
-        raise ConfigError(
-            "No segment data found. Expected either a 'Distances' sheet "
-            "or an embedded 'Sr.' table in Route_Config."
-        )
-
-    r = header_row + 1
-    while r <= ws.max_row:
-        sr = ws.cell(r, 2).value
-        if sr is None:
-            break
-        try:
-            int(sr)
-        except (ValueError, TypeError):
-            break
-
-        res_from_raw = ws.cell(r, 7).value
-        res_to_raw   = ws.cell(r, 8).value
-        generic_from = ws.cell(r, 3).value
-        generic_to   = ws.cell(r, 4).value
-
-        if res_from_raw and res_to_raw:
-            res_from = str(res_from_raw).strip()
-            res_to   = str(res_to_raw).strip()
-        elif generic_from and generic_to:
-            res_from = _resolve(generic_from)
-            res_to   = _resolve(generic_to)
-        else:
-            r += 1
-            continue
-
-        dist = ws.cell(r, 5).value
-        tt   = ws.cell(r, 6).value
-
-        if dist is None:
-            r += 1
-            continue
-        try:
-            dist = float(dist)
-        except (ValueError, TypeError):
-            r += 1
-            continue
-        if dist <= 0:
-            r += 1
-            continue
-
-        if tt is None:
-            tt = round(dist / max(avg_speed_kmph, 1) * 60)
-        else:
-            try:
-                tt = int(float(tt))
-            except (ValueError, TypeError):
-                tt = round(dist / max(avg_speed_kmph, 1) * 60)
-
-        if res_from and res_to:
-            key = RouteConfig.segment_key(res_from, res_to)
-            distances[key] = dist
-            times[key]     = tt
-
-        r += 1
-
-    return distances, times
-
-
-# ── Headway parser ───────────────────────────────────────────────────
     # Generic label → actual name resolver using field_map
     # e.g. "Depot" → field_map["depot"][1], "Start point" → field_map["start_point"][1]
     generic_to_field = {

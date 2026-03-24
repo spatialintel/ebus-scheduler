@@ -9,10 +9,9 @@ Usage:
     from src.distance_engine import enrich_distances
     enrich_distances(config)  # modifies config in place
 """
-__version__ = "2026-03-23-b1"  # auto-stamped — confirms Streamlit deployment
-
 
 from __future__ import annotations
+__version__ = "2026-03-24-b1"  # auto-stamped
 
 import requests
 from src.models import RouteConfig
