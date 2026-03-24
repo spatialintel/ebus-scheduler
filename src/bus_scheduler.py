@@ -649,6 +649,12 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
         midday_soc  = getattr(config, 'midday_charge_soc_percent', MIDDAY_CHARGE_SOC)
         soc_trigger = getattr(config, 'trigger_soc_percent', SOC_TRIGGER)
 
+        # Prefer to charge from rev_start (near depot side) not far_loc (far terminal).
+        # If bus is at far_loc after a DN trip, let it serve one UP trip back to
+        # rev_start first — this saves the 40-min revenue-corridor dead run and
+        # reduces the headway gap during the charging window.
+        at_far_loc = (best_bus.current_location == far_loc)
+
         def _latest_charge_return_time(buses):
             """Return the latest time any bus is expected to return from a charge detour."""
             latest = None
@@ -667,33 +673,35 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                         break
             return latest
 
-        # Staggered P5: send bus to charge only if no other bus is currently
-        # mid-detour AND that bus will still be gone when the midday window closes.
-        # If the charging bus returns before MIDDAY_END, there's still time for
-        # this bus to charge too — don't block it.
-        def _any_bus_charging_now(buses, current_time):
+        # Staggered P5 charging: space charge starts by natural_gap minutes.
+        # This ensures at most 1 bus is absent per fleet-gap window, keeping
+        # headways even during the charging period. Blocking entirely (one-at-a-time)
+        # causes buses to pile up and creates large service gaps when they all
+        # return simultaneously.
+        def _last_charge_start(buses, current_bus):
+            """Return the most recent charge departure time of any OTHER bus."""
+            latest = None
             for b in buses:
-                if b is best_bus:
+                if b is current_bus:
                     continue
                 for t in reversed(b.trips):
-                    if t.trip_type == "Charging":
-                        if t.actual_arrival and t.actual_arrival > current_time:
-                            # Only block if the other bus returns AFTER midday window
-                            if t.actual_arrival >= MIDDAY_END:
-                                return True
+                    if t.trip_type == "Charging" and t.actual_departure:
+                        if latest is None or t.actual_departure > latest:
+                            latest = t.actual_departure
                         break
-                    if t.trip_type == "Dead" and t.end_location == config.depot:
-                        if t.actual_arrival and t.actual_arrival > current_time:
-                            if t.actual_arrival >= MIDDAY_END:
-                                return True
-                        break
-            return False
+            return latest
+
+        # No artificial charge stagger needed — buses are already naturally staggered
+        # by natural_gap (27.5min) from Phase 1. This ensures charging happens
+        # at different times automatically without extra blocking logic.
+        charge_stagger_ok = True
 
         if (_is_midday(best_bus.current_time) and
                 config.fleet_size <= 10 and
                 best_bus.bus_id not in charged_today and
                 best_bus.soc_percent < midday_soc and
-                not _any_bus_charging_now(buses, best_bus.current_time)):
+                charge_stagger_ok and
+                not at_far_loc):   # serve return trip first if at far terminal
             try:
                 dead_tt = config.get_travel_time(best_bus.current_location, config.depot)
             except KeyError:
@@ -706,7 +714,7 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
 
         elif best_bus.soc_percent <= soc_trigger:
             if _is_midday(best_bus.current_time) and best_bus.bus_id not in charged_today:
-                if not _any_bus_charging_now(buses, best_bus.current_time):
+                if charge_stagger_ok:
                     _charging_detour(best_bus, config,
                                      resume_by=EVENING_PEAK_START, min_break=min_break)
                     charged_today.add(best_bus.bus_id)
