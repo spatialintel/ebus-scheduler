@@ -107,7 +107,7 @@ def _ready_time(bus, min_break, config=None):
     """
     Departure-ready time for the bus.
     After Revenue: adds min_break (extended during off-peak if config provided).
-    After Dead/Charging: immediate.
+    After Dead/Charging/Shuttle: immediate.
     """
     last = bus.trips[-1] if bus.trips else None
     if last and last.trip_type == "Revenue":
@@ -194,8 +194,25 @@ def _snap_to_phase(rt: datetime, phase_index: int, natural_gap: float,
     return rt + timedelta(minutes=cycle_time - remainder)
 
 
-def _make_dead(bus, to_loc, dist, tt):
-    leg = Trip(direction="DEPOT", trip_type="Dead",
+def _is_shuttle_leg(from_loc, to_loc, config):
+    """
+    A leg is a Shuttle if it travels between any two stops on the revenue
+    corridor (terminals + intermediates), excluding any leg that starts or
+    ends at the depot.
+    Shuttles carry passengers even though they are outside the main revenue cycle.
+    """
+    if from_loc == config.depot or to_loc == config.depot:
+        return False
+    corridor = ({config.start_point, config.end_point} |
+                {n for n in getattr(config, 'intermediates', []) if n})
+    return from_loc in corridor and to_loc in corridor
+
+
+def _make_dead(bus, to_loc, dist, tt, config=None):
+    """Create a Dead or Shuttle trip leg and assign it to the bus."""
+    trip_type = "Shuttle" if (config and _is_shuttle_leg(
+        bus.current_location, to_loc, config)) else "Dead"
+    leg = Trip(direction="DEPOT", trip_type=trip_type,
                start_location=bus.current_location, end_location=to_loc,
                earliest_departure=bus.current_time, latest_departure=bus.current_time,
                travel_time_min=tt, distance_km=dist, shift=bus.shift)
@@ -207,7 +224,7 @@ def _morning_dead_run(bus, config):
     if bus.current_location != config.depot: return []
     nearest, dist, tt = _nearest_node_from_depot(config)
     if dist <= 0: return []
-    return [_make_dead(bus, nearest, dist, tt)]
+    return [_make_dead(bus, nearest, dist, tt, config=config)]
 
 def _route_to_depot(bus, config):
     """Return via nearest_node (P2 both ways): current → nearest → DEPOT."""
@@ -219,14 +236,14 @@ def _route_to_depot(bus, config):
             d = config.get_distance(bus.current_location, nearest)
             t = config.get_travel_time(bus.current_location, nearest)
             if bus.soc_after_trip(d) >= SOC_FLOOR:
-                inserted.append(_make_dead(bus, nearest, d, t))
+                inserted.append(_make_dead(bus, nearest, d, t, config=config))
         except KeyError: pass
     if bus.current_location != config.depot:
         try:
             d = config.get_distance(bus.current_location, config.depot)
             t = config.get_travel_time(bus.current_location, config.depot)
             if bus.soc_after_trip(d) >= SOC_FLOOR:
-                inserted.append(_make_dead(bus, config.depot, d, t))
+                inserted.append(_make_dead(bus, config.depot, d, t, config=config))
         except KeyError: pass
     return inserted
 
@@ -234,7 +251,7 @@ def _route_from_depot(bus, config):
     if bus.current_location != config.depot: return []
     nearest, dist, tt = _nearest_node_from_depot(config)
     if dist <= 0: return []
-    return [_make_dead(bus, nearest, dist, tt)]
+    return [_make_dead(bus, nearest, dist, tt, config=config)]
 
 def _charging_detour(bus, config, resume_by, min_break):
     if config.depot_flow_rate_kw <= 0: return []
@@ -460,7 +477,7 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
             try:
                 rd = config.get_distance(bus.current_location, reposition_to)
                 rt_tt = config.get_travel_time(bus.current_location, reposition_to)
-                _make_dead(bus, reposition_to, rd, rt_tt)
+                _make_dead(bus, reposition_to, rd, rt_tt, config=config)
             except KeyError:
                 pass
 
@@ -485,14 +502,29 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                 continue
 
             # Determine next direction and trip endpoints.
-            # Always use rev_start/far_loc (the route terminals) — not nearest_node.
-            # nearest_node may be an intermediate used only for depot dead runs.
+            # After a charging detour the bus may be repositioned to rev_start
+            # regardless of which direction it last served. Use physical location
+            # to determine direction — not last_rev direction — when the bus
+            # just returned from a charging detour.
             last_rev = next((t for t in reversed(bus.trips)
                              if t.trip_type == "Revenue"), None)
-            if last_rev is None:
-                next_dir   = "DN"
-                trip_start = rev_start
-                trip_end   = far_loc
+            recent_types = [t.trip_type for t in bus.trips[-4:]]
+            just_charged = "Charging" in recent_types
+
+            if last_rev is None or just_charged:
+                # No revenue history, or just returned from charge:
+                # depart from wherever the bus physically is
+                if bus.current_location == rev_start or (
+                        reposition_to and bus.current_location == nearest_node):
+                    next_dir   = "DN"
+                    trip_start = rev_start
+                    trip_end   = far_loc
+                elif bus.current_location == far_loc:
+                    next_dir   = "UP"
+                    trip_start = far_loc
+                    trip_end   = rev_start
+                else:
+                    continue  # not at a known terminal
             elif last_rev.end_location == far_loc:
                 next_dir   = "UP"
                 trip_start = far_loc
@@ -505,8 +537,6 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
             if bus.current_location != trip_start:
                 # Bus is at wrong location — only consider if it's at nearest_node
                 # and can reposition to rev_start via a dead run.
-                # Compute effective ready time including reposition travel time,
-                # but do NOT call _make_dead here (selection loop must be side-effect free).
                 if (reposition_to and
                         bus.current_location == nearest_node and
                         trip_start == rev_start):
@@ -514,16 +544,19 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                         repo_tt = config.get_travel_time(nearest_node, rev_start)
                     except KeyError:
                         continue
-                    # Effective rt = arrive at rev_start after reposition
-                    rt = bus.current_time + timedelta(minutes=repo_tt)
                     needs_reposition = True
                 else:
                     continue
             else:
                 needs_reposition = False
+                repo_tt = 0
 
-            # Break duration: add off_peak_extra during 11:00–16:00
+            # Break duration: after Revenue = preferred_layover; after Dead/Charging = 0
             rt = _ready_time(bus, min_break, config)
+
+            # If reposition needed, add travel time on top of ready time
+            if needs_reposition:
+                rt = rt + timedelta(minutes=repo_tt)
 
             # Headway floor: enforce minimum gap from last same-dir departure
             min_hw = SAME_DIR_GAP
@@ -534,15 +567,13 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                 except Exception:
                     pass
 
-            # Spacing floor: use natural_gap normally, but after a charging detour
-            # use only the headway minimum. A bus returning from a 90-min charge
-            # should not be blocked by the natural fleet gap — it has already
-            # missed its natural cycle slot and should re-enter as soon as
-            # the headway profile allows.
-            last_trip = next(
-                (t for t in reversed(bus.trips) if t.trip_type != "Revenue"), None)
-            just_charged = (last_trip is not None and
-                            last_trip.trip_type in ("Charging", "Dead"))
+            # Spacing floor: natural_gap normally.
+            # After THIS bus returned from a charging detour, use headway_min only
+            # so it can re-enter service without being blocked by its missed slot.
+            # Only True for the bus that JUST returned from charging
+            # (Charging trip exists and the last few trips include Dead/Charging).
+            recent_types = [t.trip_type for t in bus.trips[-4:]]
+            just_charged = "Charging" in recent_types
             min_spacing = min_hw if just_charged else max(min_hw, natural_gap)
             last_same = None
             for other in buses:
@@ -597,7 +628,7 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
             try:
                 rd  = config.get_distance(nearest_node, rev_start)
                 rtt = config.get_travel_time(nearest_node, rev_start)
-                _make_dead(best_bus, rev_start, rd, rtt)
+                _make_dead(best_bus, rev_start, rd, rtt, config=config)
             except KeyError:
                 pass
 
@@ -637,20 +668,24 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
             return latest
 
         # Staggered P5: send bus to charge only if no other bus is currently
-        # mid-detour (en route to/from depot for charging).
-        # This prevents all buses charging simultaneously and creates a 2-hour
-        # service gap. Uses the actual charge return time to decide.
+        # mid-detour AND that bus will still be gone when the midday window closes.
+        # If the charging bus returns before MIDDAY_END, there's still time for
+        # this bus to charge too — don't block it.
         def _any_bus_charging_now(buses, current_time):
             for b in buses:
+                if b is best_bus:
+                    continue
                 for t in reversed(b.trips):
                     if t.trip_type == "Charging":
-                        # This bus has a charge entry — check if it returned already
                         if t.actual_arrival and t.actual_arrival > current_time:
-                            return True
+                            # Only block if the other bus returns AFTER midday window
+                            if t.actual_arrival >= MIDDAY_END:
+                                return True
                         break
                     if t.trip_type == "Dead" and t.end_location == config.depot:
                         if t.actual_arrival and t.actual_arrival > current_time:
-                            return True
+                            if t.actual_arrival >= MIDDAY_END:
+                                return True
                         break
             return False
 
@@ -749,7 +784,7 @@ def check_compliance(config: RouteConfig, buses: list[BusState]) -> list[dict]:
         rev_idx = [i for i, t in enumerate(bus.trips) if t.trip_type == "Revenue"]
         for j in range(1, len(rev_idx)):
             i_prev, i_curr = rev_idx[j-1], rev_idx[j]
-            if any(t.trip_type == "Charging" for t in bus.trips[i_prev+1:i_curr]): continue
+            if any(t.trip_type in ("Charging", "Dead", "Shuttle") for t in bus.trips[i_prev+1:i_curr]): continue
             c, n = bus.trips[i_prev], bus.trips[i_curr]
             if c.actual_arrival and n.actual_departure:
                 gap = (n.actual_departure - c.actual_arrival).total_seconds() / 60

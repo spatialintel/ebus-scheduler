@@ -88,7 +88,7 @@ def _build_rows(config: RouteConfig, buses: list[BusState]) -> list[dict]:
                     break_min = max(0, int(gap))
 
             # Direction label
-            if trip.trip_type == "Dead" or trip.trip_type == "Charging":
+            if trip.trip_type in ("Dead", "Charging", "Shuttle"):
                 direction = "DEPOT"
             elif trip.direction == "UP":
                 direction = f"{config.route_code}UP"

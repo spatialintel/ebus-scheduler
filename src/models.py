@@ -8,7 +8,6 @@ Three dataclasses:
 """
 
 from __future__ import annotations
-__version__ = "2026-03-24-b1"  # auto-stamped
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 
@@ -18,7 +17,7 @@ class Trip:
     """A single trip (revenue, dead-run, or charging) in the schedule."""
 
     direction: str          # "UP" | "DN" | "DEPOT"
-    trip_type: str          # "Revenue" | "Dead" | "Charging"
+    trip_type: str          # "Revenue" | "Dead" | "Charging" | "Shuttle"
     start_location: str
     end_location: str
     earliest_departure: datetime
