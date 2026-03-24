@@ -2,7 +2,7 @@
 app.py — eBus Scheduler Dashboard
 """
 from __future__ import annotations
-__version__ = "2026-03-24-b3"  # auto-stamped
+__version__ = "2026-03-24-b4"  # auto-stamped
 import sys, tempfile
 from pathlib import Path
 from datetime import datetime, timedelta, time as dtime
@@ -156,435 +156,408 @@ def build_route_diagram(config, buses, selected_bus=None):
     """
     Two-panel interactive route diagram.
 
-    Panel A (top) — Route Topology
-        Straight-line schematic: stops on y=1 scaled by cumulative distance,
-        depot below at y=-0.4 connected by a dashed leader to nearest node.
-        Annotated with segment distances/times and fleet summary stats.
-
-    Panel B (bottom) — Time-Space (Marey) Diagram
-        x = departure time (decimal hours, 0-24)
-        y = cumulative route distance of the stop
-        Each trip = diagonal line from (dep_time, start_dist) → (arr_time, end_dist)
-        Color = bus identity; line style = trip type; opacity dimmed for non-selected bus.
-        Directly visualises headways, off-peak gaps, charging windows, phase regularity.
-
-    Parameters
-    ----------
-    selected_bus : str | None
-        Bus ID to highlight.  None = all buses full opacity.
+    Panel A — Route Topology: clean schematic, stops scaled by distance.
+    Panel B — Time-Space (Marey): Revenue lines prominent, dead/shuttle subtle,
+               charging shown as horizontal bars, bus labels on last trip end,
+               headway gap callouts for large gaps.
     """
     from src.bus_scheduler import _nearest_node_from_depot
     from plotly.subplots import make_subplots
 
-    # ── Palette ──────────────────────────────────────────────────────────────
-    BUS_COLORS = ["#4338CA", "#059669", "#D97706", "#DC2626",
-                  "#7C3AED", "#0284C7", "#BE185D"]  # up to 7 buses
-    DIM_OPACITY = 0.12
+    # ── Palette ───────────────────────────────────────────────────────────────
+    BUS_COLORS = ["#4338CA","#059669","#D97706","#DC2626",
+                  "#7C3AED","#0284C7","#BE185D","#0D9488","#92400E"]
+    DIM       = 0.10   # opacity for non-selected bus
+    GRID_CLR  = "rgba(0,0,0,0.05)"
+    PEAK_CLR  = "rgba(99,102,241,0.07)"
+    OFFPK_CLR = "rgba(16,185,129,0.05)"
 
     nearest_name, _, _ = _nearest_node_from_depot(config)
 
-    # ── Robust segment lookup ─────────────────────────────────────────────────
-    # config_loader may store keys with any separator (|, ->, :, space).
-    # Build a normalised lookup once to avoid repeated miss-and-fallback chains.
-    def _seg_dist(a, b):
-        """Return distance between a and b regardless of key separator."""
-        for sep in ("|", "->", "→", " → ", ":"," to "):
-            v = config.segment_distances.get(f"{a}{sep}{b}")
-            if v: return float(v)
-            v = config.segment_distances.get(f"{b}{sep}{a}")
-            if v: return float(v)
-        # Last resort: call config method if available
-        try:   return float(config.get_distance(a, b))
+    def _dist(a, b):
+        try: return float(config.get_distance(a, b))
+        except Exception: return 0.0
+    def _time(a, b):
+        try: return float(config.get_travel_time(a, b))
         except Exception: return 0.0
 
-    def _seg_time(a, b):
-        """Return travel time between a and b regardless of key separator."""
-        for sep in ("|", "->", "→", " → ", ":"," to "):
-            v = config.segment_times.get(f"{a}{sep}{b}")
-            if v: return float(v)
-            v = config.segment_times.get(f"{b}{sep}{a}")
-            if v: return float(v)
-        try:   return float(config.get_travel_time(a, b))
-        except Exception: return 0.0
-
-    # ── Ordered route nodes & cumulative x-positions ─────────────────────────
+    # ── Route nodes & cumulative positions ───────────────────────────────────
     route_nodes = [config.start_point]
     for n in getattr(config, "intermediates", []):
         if n and n.strip(): route_nodes.append(n.strip())
     if config.end_point not in route_nodes:
         route_nodes.append(config.end_point)
 
-    x_pos = {route_nodes[0]: 0.0}
+    cum = {route_nodes[0]: 0.0}
     for i in range(1, len(route_nodes)):
-        fr, to = route_nodes[i-1], route_nodes[i]
-        x_pos[to] = x_pos[fr] + _seg_dist(fr, to)
+        f, t = route_nodes[i-1], route_nodes[i]
+        cum[t] = cum[f] + _dist(f, t)
+    total_km = max(cum.values()) or 1.0
 
-    total_km  = max(x_pos.values()) or 1.0
-    depot_x   = x_pos.get(nearest_name, 0.0)
-    depot_dist = x_pos.get(nearest_name, 0.0)   # for Marey y-axis
+    depot_y   = cum.get(nearest_name, 0.0)
+    node_y    = dict(cum)
+    node_y[config.depot] = depot_y
 
-    # Assign y-position in Marey panel: indexed by cumulative distance
-    node_dist = dict(x_pos)
-    node_dist[config.depot] = depot_dist
+    op_s = config.operating_start.hour + config.operating_start.minute / 60
+    op_e = config.operating_end.hour   + config.operating_end.minute   / 60
 
-    op_h_start = config.operating_start.hour + config.operating_start.minute / 60
-    op_h_end   = config.operating_end.hour   + config.operating_end.minute / 60
-
-    # ── Compute running SOC per trip per bus ─────────────────────────────────
-    def _trip_socs(bus):
-        soc = config.initial_soc_percent
-        out = []
+    # ── SOC per trip ─────────────────────────────────────────────────────────
+    def _socs(bus):
+        soc, out = config.initial_soc_percent, []
         for t in bus.trips:
-            soc -= (t.distance_km * config.consumption_rate / config.battery_kwh) * 100
+            soc -= t.distance_km * config.consumption_rate / config.battery_kwh * 100
             if t.trip_type == "Charging":
                 soc = min(100.0, soc + config.depot_flow_rate_kw
-                          * (t.travel_time_min / 60) / config.battery_kwh * 100)
+                          * t.travel_time_min / 60 / config.battery_kwh * 100)
             out.append(round(max(0, soc), 1))
         return out
 
-    # ── Pre-compute stats ─────────────────────────────────────────────────────
-    total_dead_km  = sum(t.distance_km for b in buses
-                         for t in b.trips if t.trip_type == "Dead")
-    peak_gaps_up, peak_gaps_dn = [], []
-    for bus in buses:
-        rev = sorted([t for t in bus.trips if t.trip_type == "Revenue"],
-                     key=lambda t: t.actual_departure or t.earliest_departure)
-        for i in range(1, len(rev)):
-            t1, t2 = rev[i-1], rev[i]
-            if t1.actual_departure and t2.actual_departure:
-                g = (t2.actual_departure - t1.actual_departure).total_seconds() / 60
-                h = t1.actual_departure.hour
-                if 8 <= h < 11 or 16 <= h < 20:
-                    (peak_gaps_up if t1.direction == "UP" else peak_gaps_dn).append(g)
-    avg_peak_hw = (sum(peak_gaps_up + peak_gaps_dn) /
-                   max(1, len(peak_gaps_up + peak_gaps_dn)))
+    def _soc_clr(s):
+        return "#16a34a" if s >= 50 else "#F59E0B" if s >= 30 else "#DC2626"
 
-    # ── Figure with 2 rows ───────────────────────────────────────────────────
+    # ── Stats for topology summary ────────────────────────────────────────────
+    total_dead_km = sum(t.distance_km for b in buses
+                        for t in b.trips if t.trip_type == "Dead")
+    total_rev  = sum(1 for b in buses for t in b.trips if t.trip_type == "Revenue")
+    total_shut = sum(1 for b in buses for t in b.trips if t.trip_type == "Shuttle")
+    total_chg  = sum(1 for b in buses for t in b.trips if t.trip_type == "Charging")
+    avg_soc    = sum(b.soc_percent for b in buses) / max(len(buses), 1)
+
+    # Peak headway
+    peak_gaps = []
+    for bus in buses:
+        rev = sorted([t for t in bus.trips if t.trip_type=="Revenue"
+                      and t.actual_departure], key=lambda t: t.actual_departure)
+        for i in range(1, len(rev)):
+            if rev[i-1].direction == rev[i].direction:
+                g = (rev[i].actual_departure - rev[i-1].actual_departure).total_seconds()/60
+                h = rev[i-1].actual_departure.hour
+                if 8 <= h < 11 or 16 <= h < 20:
+                    peak_gaps.append(g)
+    avg_peak_hw = sum(peak_gaps)/max(len(peak_gaps),1)
+
+    # ── Figure ────────────────────────────────────────────────────────────────
     fig = make_subplots(
         rows=2, cols=1,
-        row_heights=[0.30, 0.70],
-        vertical_spacing=0.10,
+        row_heights=[0.22, 0.78],
+        vertical_spacing=0.08,
         subplot_titles=[
-            f"Route {config.route_code}  ·  {config.route_name}   "
-            f"<span style='font-size:11px;color:#6B7280'>— topology (scaled by distance)</span>",
-            "Time–Space diagram  "
-            "<span style='font-size:11px;color:#6B7280'>x = departure time · "
-            "y = route position · each line = one trip</span>",
+            f"<b>Route {config.route_code}</b>  "
+            f"<span style='color:#6B7280;font-weight:normal'>{config.route_name}</span>",
+            "<span style='font-size:13px;font-weight:600'>Time–Space Diagram</span>"
+            "<span style='font-size:10px;color:#9CA3AF'>  —  each line = one bus trip</span>",
         ],
     )
 
-    # ════════════════════════════════════════════════════════════════════
-    # PANEL A — Route topology
-    # ════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════════
+    # PANEL A — Topology
+    # ════════════════════════════════════════════════════════════════════════
 
     # Route backbone
     fig.add_trace(go.Scatter(
-        x=[x_pos[n] for n in route_nodes], y=[1]*len(route_nodes),
-        mode="lines", line=dict(color="#6366F1", width=5),
+        x=[cum[n] for n in route_nodes], y=[1]*len(route_nodes),
+        mode="lines", line=dict(color="#6366F1", width=6),
         hoverinfo="skip", showlegend=False,
     ), row=1, col=1)
 
-    # Depot connector
+    # Depot leader
     fig.add_trace(go.Scatter(
-        x=[depot_x, depot_x], y=[-0.4, 0.78],
+        x=[depot_y, depot_y], y=[-0.5, 0.75],
         mode="lines", line=dict(color="#D97706", width=2, dash="dot"),
         hoverinfo="skip", showlegend=False,
     ), row=1, col=1)
 
-    # Segment distance+time annotations
-    for i in range(len(route_nodes) - 1):
-        fr, to = route_nodes[i], route_nodes[i+1]
-        dist = _seg_dist(fr, to)
-        tt   = _seg_time(fr, to)
-        if not dist: continue
-        mid_x = (x_pos[fr] + x_pos[to]) / 2
-        lbl = f"<b>{dist:.1f} km</b>" + (f"<br>{tt:.0f} min" if tt else "")
-        fig.add_annotation(x=mid_x, y=1.22, text=lbl, showarrow=False, row=1, col=1,
+    # Segment labels (km + min) above line
+    for i in range(len(route_nodes)-1):
+        f, t = route_nodes[i], route_nodes[i+1]
+        d, tt = _dist(f,t), _time(f,t)
+        if not d: continue
+        mid = (cum[f]+cum[t])/2
+        fig.add_annotation(x=mid, y=1.38,
+            text=f"<b>{d:.1f} km</b>  ·  {tt:.0f} min",
+            showarrow=False, row=1, col=1,
             font=dict(size=10, color="#374151"),
-            bgcolor="rgba(255,255,255,0.9)", borderpad=2)
+            bgcolor="rgba(255,255,255,0.9)", borderpad=3)
 
-    # Depot dead-km annotation
-    d2n   = _seg_dist(config.depot, nearest_name)
-    d2n_t = _seg_time(config.depot, nearest_name)
+    # Depot-to-nearest label
+    d2n, t2n = _dist(config.depot, nearest_name), _time(config.depot, nearest_name)
     if d2n:
-        dlbl = f"<b>{d2n:.1f} km</b>" + (f"<br>{d2n_t:.0f} min" if d2n_t else "")
-        fig.add_annotation(x=depot_x + total_km*0.025, y=-0.05, text=dlbl,
+        fig.add_annotation(x=depot_y + total_km*0.03, y=0.15,
+            text=f"<b>{d2n:.1f} km</b>  ·  {t2n:.0f} min",
             showarrow=False, row=1, col=1,
             font=dict(size=9, color="#D97706"),
             bgcolor="rgba(255,255,255,0.85)", borderpad=2)
 
     # Stop markers + labels
     for node in route_nodes:
-        is_terminal = node in (config.start_point, config.end_point)
-        is_nearest  = node == nearest_name
-        color  = "#4338CA" if is_terminal else "#059669" if is_nearest else "#0369A1"
-        symbol = "circle" if is_terminal else "diamond" if is_nearest else "square"
-        size   = 20 if is_terminal else 15
-        short  = (node.replace("BUS STAND","BS").replace("GAM","")
-                  .replace("  "," ").strip())
-        up_ct  = sum(1 for b in buses for t in b.trips
-                     if t.trip_type=="Revenue" and t.direction=="UP"
-                     and t.start_location==node)
-        dn_ct  = sum(1 for b in buses for t in b.trips
-                     if t.trip_type=="Revenue" and t.direction=="DN"
-                     and t.start_location==node)
+        is_term   = node in (config.start_point, config.end_point)
+        is_near   = node == nearest_name
+        clr  = "#4338CA" if is_term else "#059669" if is_near else "#0369A1"
+        sym  = "circle" if is_term else "diamond" if is_near else "square"
+        sz   = 22 if is_term else 16
+        lbl  = node.replace("BUS STAND","BS").replace("  "," ").strip()
+        up_n = sum(1 for b in buses for t in b.trips
+                   if t.trip_type=="Revenue" and t.direction=="UP" and t.start_location==node)
+        dn_n = sum(1 for b in buses for t in b.trips
+                   if t.trip_type=="Revenue" and t.direction=="DN" and t.start_location==node)
         fig.add_trace(go.Scatter(
-            x=[x_pos[node]], y=[1],
-            mode="markers+text",
-            marker=dict(symbol=symbol, size=size, color=color,
+            x=[cum[node]], y=[1], mode="markers+text",
+            marker=dict(symbol=sym, size=sz, color=clr,
                         line=dict(color="white", width=2)),
-            text=[f"<b>{short}</b>"], textposition="bottom center",
-            textfont=dict(size=10, color=color),
-            hovertemplate=(f"<b>{node}</b><br>"
-                           f"UP departures: {up_ct}<br>DN departures: {dn_ct}"
-                           + ("<br><i>Nearest depot node</i>" if is_nearest else "")
+            text=[f"<b>{lbl}</b>"], textposition="bottom center",
+            textfont=dict(size=10, color=clr),
+            hovertemplate=(f"<b>{node}</b><br>↑ UP: {up_n} dep  ↓ DN: {dn_n} dep"
+                           + ("<br><i>Nearest depot node (P2)</i>" if is_near else "")
                            + "<extra></extra>"),
             showlegend=False,
         ), row=1, col=1)
 
     # Depot marker
     fig.add_trace(go.Scatter(
-        x=[depot_x], y=[-0.4], mode="markers+text",
+        x=[depot_y], y=[-0.5], mode="markers+text",
         marker=dict(symbol="square", size=22, color="#D97706",
                     line=dict(color="white", width=2)),
         text=["<b>DEPOT</b>"], textposition="bottom center",
         textfont=dict(size=10, color="#D97706"),
         hovertemplate=(f"<b>{config.depot}</b><br>"
-                       f"Total dead km (fleet): {total_dead_km:.1f} km<br>"
+                       f"Dead km (fleet total): {total_dead_km:.1f} km<br>"
                        f"Nearest node: {nearest_name}<extra></extra>"),
         showlegend=False,
     ), row=1, col=1)
 
-    # Fleet summary box annotation
-    total_rev = sum(1 for b in buses for t in b.trips if t.trip_type=="Revenue")
-    total_chg = sum(1 for b in buses for t in b.trips if t.trip_type=="Charging")
-    avg_soc   = sum(b.soc_percent for b in buses) / max(len(buses), 1)
+    # Summary stats banner
     fig.add_annotation(
-        x=total_km/2, y=1.55,
-        text=(f"<b>{config.fleet_size} buses</b>  ·  {total_rev} revenue trips  ·  "
-              f"{total_dead_km:.1f} km dead  ·  {total_chg} charge stops  ·  "
-              f"Avg peak headway {avg_peak_hw:.0f} min  ·  Avg final SOC {avg_soc:.0f}%"),
+        x=total_km/2, y=1.75,
+        text=(f"<b>{config.fleet_size} buses</b>  ·  "
+              f"<b>{total_rev}</b> revenue  +  <b>{total_shut}</b> shuttle trips  ·  "
+              f"Dead {total_dead_km:.1f} km  ·  "
+              f"{total_chg} charge stops  ·  "
+              f"Peak headway {avg_peak_hw:.0f} min  ·  "
+              f"Avg final SOC {avg_soc:.0f}%"),
         showarrow=False, row=1, col=1,
         font=dict(size=11, color="#1F2937"),
-        bgcolor="rgba(238,242,255,0.95)", borderpad=6,
-        bordercolor="#6366F1", borderwidth=1,
+        bgcolor="rgba(238,242,255,0.97)",
+        borderpad=7, bordercolor="#6366F1", borderwidth=1,
     )
 
-    # ════════════════════════════════════════════════════════════════════
-    # PANEL B — Time-space (Marey) diagram
-    # ════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════════
+    # PANEL B — Time-Space (Marey)
+    # ════════════════════════════════════════════════════════════════════════
 
-    # Horizontal reference lines per stop
-    for node in route_nodes:
-        fig.add_hline(y=node_dist[node], line_dash="dot",
-                      line_color="rgba(99,102,241,0.18)", line_width=1,
-                      row=2, col=1)
-
-    # Stop name labels on y-axis right side
-    for node in route_nodes:
-        short = (node.replace("BUS STAND","BS").replace("GAM","")
-                 .replace("  "," ").strip())
-        fig.add_annotation(
-            x=op_h_end + 0.12, y=node_dist[node],
-            text=f"<span style='color:#6366F1'>{short}</span>",
-            showarrow=False, xref="x2", yref="y2",
-            font=dict(size=9, color="#6366F1"), xanchor="left",
-        )
-
-    # Depot reference line
-    fig.add_hline(y=depot_dist, line_dash="dot",
-                  line_color="rgba(217,119,6,0.25)", line_width=1,
-                  row=2, col=1)
-    fig.add_annotation(
-        x=op_h_end + 0.12, y=depot_dist - total_km*0.03,
-        text="<span style='color:#D97706'>DEPOT</span>",
-        showarrow=False, xref="x2", yref="y2",
-        font=dict(size=9, color="#D97706"), xanchor="left",
-    )
-
-    # Peak hour shading bands
-    for ph_start, ph_end, label in [
-        (8, 11, "Peak AM"), (16, 20, "Peak PM")
+    # Peak / off-peak shading
+    for x0, x1, lbl, clr in [
+        (8, 11,  "Peak AM",  PEAK_CLR),
+        (11, 16, "Off-peak", OFFPK_CLR),
+        (16, 20, "Peak PM",  PEAK_CLR),
     ]:
-        fig.add_vrect(
-            x0=ph_start, x1=ph_end,
-            fillcolor="rgba(99,102,241,0.06)", line_width=0,
-            row=2, col=1,
-        )
+        fig.add_vrect(x0=x0, x1=x1, fillcolor=clr, line_width=0, row=2, col=1)
         fig.add_annotation(
-            x=(ph_start+ph_end)/2, y=total_km * 1.04,
-            text=f"<span style='color:#6366F1;font-size:9px'>{label}</span>",
-            showarrow=False, xref="x2", yref="y2",
-            font=dict(size=9), xanchor="center",
+            x=(x0+x1)/2, y=total_km*1.05,
+            text=f"<span style='font-size:9px;color:#9CA3AF'>{lbl}</span>",
+            showarrow=False, xref="x2", yref="y2", xanchor="center",
         )
 
-    # Off-peak shading
-    fig.add_vrect(
-        x0=11, x1=16,
-        fillcolor="rgba(16,185,129,0.04)", line_width=0,
-        row=2, col=1,
-    )
+    # Horizontal stop reference lines + right-side labels
+    for node in route_nodes:
+        fig.add_hline(y=node_y[node], line_dash="dot",
+                      line_color="rgba(99,102,241,0.15)", line_width=1, row=2, col=1)
+        short = node.replace("BUS STAND","BS").replace("  "," ").strip()
+        fig.add_annotation(
+            x=op_e+0.15, y=node_y[node], xref="x2", yref="y2",
+            text=f"<span style='color:#6366F1;font-size:9px'><b>{short}</b></span>",
+            showarrow=False, xanchor="left",
+        )
+
+    # Depot reference line + label
+    fig.add_hline(y=depot_y, line_dash="dot",
+                  line_color="rgba(217,119,6,0.2)", line_width=1, row=2, col=1)
     fig.add_annotation(
-        x=13.5, y=total_km * 1.04,
-        text="<span style='color:#059669;font-size:9px'>Off-peak</span>",
-        showarrow=False, xref="x2", yref="y2",
-        font=dict(size=9), xanchor="center",
+        x=op_e+0.15, y=depot_y - total_km*0.04, xref="x2", yref="y2",
+        text="<span style='color:#D97706;font-size:9px'>DEPOT</span>",
+        showarrow=False, xanchor="left",
     )
 
-    # Trip lines per bus
+    # ── Trip lines per bus ────────────────────────────────────────────────────
     legend_shown = set()
 
     for bus_idx, bus in enumerate(buses):
-        bus_color = BUS_COLORS[bus_idx % len(BUS_COLORS)]
-        is_selected = (selected_bus is None or bus.bus_id == selected_bus)
-        base_opacity = 1.0 if is_selected else DIM_OPACITY
-        socs = _trip_socs(bus)
+        bclr = BUS_COLORS[bus_idx % len(BUS_COLORS)]
+        is_sel  = selected_bus is None or bus.bus_id == selected_bus
+        opacity = 1.0 if is_sel else DIM
+        socs    = _socs(bus)
 
         for trip, soc_after in zip(bus.trips, socs):
             if trip.actual_departure is None: continue
 
-            dep_h = trip.actual_departure.hour + trip.actual_departure.minute / 60
-            arr_h = (trip.actual_arrival.hour + trip.actual_arrival.minute / 60
-                     if trip.actual_arrival else dep_h + trip.travel_time_min / 60)
+            dep_h = trip.actual_departure.hour + trip.actual_departure.minute/60
+            arr_h = (trip.actual_arrival.hour  + trip.actual_arrival.minute/60
+                     if trip.actual_arrival else dep_h + trip.travel_time_min/60)
+            sy = node_y.get(trip.start_location, depot_y)
+            ey = node_y.get(trip.end_location,   depot_y)
+            sc = _soc_clr(soc_after)
 
-            start_dist = node_dist.get(trip.start_location, depot_dist)
-            end_dist   = node_dist.get(trip.end_location,   depot_dist)
+            dep_s = trip.actual_departure.strftime("%H:%M")
+            arr_s = trip.actual_arrival.strftime("%H:%M") if trip.actual_arrival else "?"
+            hover = (f"<b>{bus.bus_id}</b> — {trip.trip_type}<br>"
+                     f"{dep_s} → {arr_s}<br>"
+                     f"{trip.start_location} → {trip.end_location}<br>"
+                     f"SOC: <b style='color:{sc}'>{soc_after}%</b>  ·  {trip.distance_km:.1f} km"
+                     "<extra></extra>")
 
-            soc_color = ("#16a34a" if soc_after >= 50 else
-                         "#D97706" if soc_after >= 30 else "#DC2626")
+            show_leg = bus.bus_id not in legend_shown and is_sel
 
             if trip.trip_type == "Revenue":
-                t_color   = bus_color
-                t_dash    = "solid"
-                t_width   = 2.5
-                direction = trip.direction
+                # Bold colored line for revenue
+                fig.add_trace(go.Scatter(
+                    x=[dep_h, arr_h], y=[sy, ey],
+                    mode="lines",
+                    line=dict(color=bclr, width=2.5),
+                    opacity=opacity,
+                    name=bus.bus_id, legendgroup=bus.bus_id,
+                    showlegend=show_leg,
+                    hovertemplate=hover,
+                ), row=2, col=1)
+                # Small SOC dot at departure only
+                fig.add_trace(go.Scatter(
+                    x=[dep_h], y=[sy], mode="markers",
+                    marker=dict(size=6, color=sc,
+                                line=dict(color=bclr, width=1.2)),
+                    opacity=opacity,
+                    name=bus.bus_id, legendgroup=bus.bus_id,
+                    showlegend=False,
+                    hovertemplate=hover,
+                ), row=2, col=1)
+                if show_leg: legend_shown.add(bus.bus_id)
+
             elif trip.trip_type == "Charging":
-                t_color = "#F59E0B"
-                t_dash  = "solid"
-                t_width = 4
-                direction = "Charging"
-            else:  # Dead
-                t_color = "#9CA3AF"
-                t_dash  = "dash"
-                t_width = 1.5
-                direction = "Dead"
+                # Horizontal bar at depot level — very visible
+                fig.add_trace(go.Scatter(
+                    x=[dep_h, arr_h], y=[depot_y, depot_y],
+                    mode="lines",
+                    line=dict(color="#F59E0B", width=6),
+                    opacity=opacity,
+                    name=bus.bus_id, legendgroup=bus.bus_id,
+                    showlegend=False,
+                    hovertemplate=hover,
+                ), row=2, col=1)
+                # Star marker at charge start
+                fig.add_trace(go.Scatter(
+                    x=[dep_h], y=[depot_y], mode="markers",
+                    marker=dict(symbol="star", size=11, color="#F59E0B",
+                                line=dict(color="#92400E", width=1)),
+                    opacity=opacity,
+                    name=bus.bus_id, legendgroup=bus.bus_id,
+                    showlegend=False,
+                    hovertemplate=hover,
+                ), row=2, col=1)
 
-            legend_key = f"{bus.bus_id}"
-            show_leg   = legend_key not in legend_shown and is_selected
-            if show_leg:
-                legend_shown.add(legend_key)
+            else:  # Dead or Shuttle — subtle thin dashed
+                t_color = "#9CA3AF" if trip.trip_type == "Dead" else "#6EE7B7"
+                fig.add_trace(go.Scatter(
+                    x=[dep_h, arr_h], y=[sy, ey],
+                    mode="lines",
+                    line=dict(color=t_color, width=1, dash="dot"),
+                    opacity=opacity * 0.6,
+                    name=bus.bus_id, legendgroup=bus.bus_id,
+                    showlegend=False,
+                    hovertemplate=hover,
+                ), row=2, col=1)
 
-            dep_str = trip.actual_departure.strftime("%H:%M")
-            arr_str = trip.actual_arrival.strftime("%H:%M") if trip.actual_arrival else "?"
-            hover   = (f"<b>{bus.bus_id}</b><br>"
-                       f"Type: {trip.trip_type} ({direction})<br>"
-                       f"Dep: {dep_str}  →  Arr: {arr_str}<br>"
-                       f"From: {trip.start_location}<br>"
-                       f"To: {trip.end_location}<br>"
-                       f"SOC after: <b style='color:{soc_color}'>{soc_after}%</b><br>"
-                       f"Dist: {trip.distance_km:.1f} km")
+        # Bus label at the end of the last trip
+        if is_sel and bus.trips:
+            last = next((t for t in reversed(bus.trips) if t.actual_arrival), None)
+            if last:
+                lx = last.actual_arrival.hour + last.actual_arrival.minute/60
+                ly = node_y.get(last.end_location, depot_y)
+                fig.add_annotation(
+                    x=lx + 0.05, y=ly, xref="x2", yref="y2",
+                    text=f"<b style='color:{bclr}'>{bus.bus_id}</b>",
+                    showarrow=False, xanchor="left",
+                    font=dict(size=9, color=bclr),
+                )
 
-            # Line trace
-            fig.add_trace(go.Scatter(
-                x=[dep_h, arr_h],
-                y=[start_dist, end_dist],
-                mode="lines",
-                line=dict(color=t_color, width=t_width, dash=t_dash),
-                opacity=base_opacity,
-                name=bus.bus_id,
-                legendgroup=bus.bus_id,
-                showlegend=show_leg,
-                hovertemplate=hover + "<extra></extra>",
-                hoverinfo="text",
-            ), row=2, col=1)
+    # Headway gap callouts: annotate gaps > 45min during 12-17h
+    all_rev = sorted(
+        [(t.actual_departure, t.direction, t.start_location,
+          node_y.get(t.start_location, depot_y))
+         for b in buses for t in b.trips
+         if t.trip_type == "Revenue" and t.actual_departure],
+        key=lambda x: x[0]
+    )
+    for direction in ("UP", "DN"):
+        dir_deps = [(h, y) for h, d, _, y in all_rev
+                    if d == direction and 12 <= h.hour < 17]
+        dir_deps.sort(key=lambda x: x[0])
+        for i in range(1, len(dir_deps)):
+            gap_min = (dir_deps[i][0] - dir_deps[i-1][0]).total_seconds()/60
+            if gap_min > 45:
+                mid_h = (dir_deps[i-1][0].hour + dir_deps[i-1][0].minute/60 +
+                         dir_deps[i][0].hour   + dir_deps[i][0].minute/60) / 2
+                mid_y = (dir_deps[i-1][1] + dir_deps[i][1]) / 2
+                fig.add_annotation(
+                    x=mid_h, y=mid_y, xref="x2", yref="y2",
+                    text=f"<b>{gap_min:.0f} min</b><br><span style='font-size:8px'>charging gap</span>",
+                    showarrow=True, arrowhead=0, arrowcolor="#DC2626",
+                    ax=0, ay=-28,
+                    font=dict(size=9, color="#DC2626"),
+                    bgcolor="rgba(254,242,242,0.9)",
+                    bordercolor="#DC2626", borderwidth=1, borderpad=3,
+                )
 
-            # Departure marker (coloured by SOC)
-            fig.add_trace(go.Scatter(
-                x=[dep_h], y=[start_dist],
-                mode="markers",
-                marker=dict(
-                    symbol=("star" if trip.trip_type == "Charging" else
-                            "triangle-up" if direction == "UP" else
-                            "triangle-down" if direction == "DN" else "x"),
-                    size=(10 if trip.trip_type == "Charging" else 7),
-                    color=soc_color,
-                    line=dict(color=bus_color, width=1.5),
-                    opacity=base_opacity,
-                ),
-                name=bus.bus_id,
-                legendgroup=bus.bus_id,
-                showlegend=False,
-                hovertemplate=hover + "<extra></extra>",
-            ), row=2, col=1)
-
-    # SOC legend items (shape key)
-    for sym, label, color in [
-        ("triangle-up",   "UP trip departure",      "#4338CA"),
-        ("triangle-down", "DN trip departure",       "#16a34a"),
-        ("x",             "Dead run",                "#9CA3AF"),
-        ("star",          "Charging stop",           "#F59E0B"),
+    # Legend entries for marker types (shape key)
+    for sym, lbl, clr in [
+        ("circle",     "SOC ≥ 50%",    "#16a34a"),
+        ("circle",     "SOC 30–49%",   "#F59E0B"),
+        ("circle",     "SOC < 30%",    "#DC2626"),
+        ("star",       "Charging",     "#F59E0B"),
+        ("line-ew",    "Dead run",     "#9CA3AF"),
+        ("line-ew",    "Shuttle",      "#6EE7B7"),
     ]:
         fig.add_trace(go.Scatter(
             x=[None], y=[None], mode="markers",
-            marker=dict(symbol=sym, size=9, color=color),
-            name=label, showlegend=True,
+            marker=dict(symbol=sym, size=8, color=clr),
+            name=lbl, showlegend=True,
+            legendgroup="types",
         ), row=2, col=1)
 
-    # SOC colour key as annotation
-    fig.add_annotation(
-        x=op_h_start, y=-total_km * 0.12,
-        text=("Marker fill: "
-              "<span style='color:#16a34a'>●</span> SOC ≥ 50%  "
-              "<span style='color:#D97706'>●</span> SOC 30–49%  "
-              "<span style='color:#DC2626'>●</span> SOC < 30%  "
-              "  |  Line colour = bus identity"),
-        showarrow=False, xref="x2", yref="y2",
-        font=dict(size=10, color="#6B7280"), xanchor="left",
-    )
-
-    # ── Layout ──────────────────────────────────────────────────────────────
-    x_pad = total_km * 0.08
+    # ── Layout ────────────────────────────────────────────────────────────────
+    xpad = total_km * 0.06
     fig.update_layout(
-        height=760,
-        margin=dict(l=20, r=120, t=60, b=40),
-        plot_bgcolor="rgba(0,0,0,0)",
+        height=820,
+        margin=dict(l=15, r=140, t=55, b=30),
+        plot_bgcolor="white",
         paper_bgcolor="rgba(0,0,0,0)",
         hovermode="closest",
         legend=dict(
-            orientation="v", x=1.01, y=1.0,
+            orientation="v", x=1.02, y=0.99,
             xanchor="left", yanchor="top",
-            font=dict(size=11), bgcolor="rgba(0,0,0,0)",
-            tracegroupgap=4,
+            font=dict(size=10),
+            bgcolor="rgba(255,255,255,0.95)",
+            bordercolor="#E5E7EB", borderwidth=1,
+            tracegroupgap=2,
         ),
     )
 
     # Panel A axes
-    fig.update_xaxes(
-        range=[-x_pad, total_km + x_pad],
-        showgrid=False, zeroline=False,
-        tickformat=".1f", ticksuffix=" km",
-        title_text="Cumulative distance (km)",
-        color="#6B7280", row=1, col=1,
-    )
-    fig.update_yaxes(
-        range=[-0.75, 1.65],
-        showgrid=False, zeroline=False,
-        showticklabels=False, showline=False,
-        row=1, col=1,
-    )
+    fig.update_xaxes(range=[-xpad, total_km+xpad], showgrid=False, zeroline=False,
+                     tickformat=".1f", ticksuffix=" km",
+                     title_text="Cumulative distance (km)",
+                     color="#9CA3AF", row=1, col=1)
+    fig.update_yaxes(range=[-1.0, 2.1], showgrid=False, zeroline=False,
+                     showticklabels=False, showline=False, row=1, col=1)
 
-    # Panel B axes
-    tick_vals = list(range(int(op_h_start), int(op_h_end) + 1))
+    # Panel B axes — hourly gridlines, clean
+    tick_vals = list(range(int(op_s), int(op_e)+1))
     tick_text = [f"{h:02d}:00" for h in tick_vals]
     fig.update_xaxes(
-        range=[op_h_start - 0.2, op_h_end + 0.5],
+        range=[op_s-0.15, op_e+0.45],
         tickvals=tick_vals, ticktext=tick_text,
-        showgrid=True, gridcolor="rgba(0,0,0,0.06)",
-        zeroline=False, title_text="Time",
+        showgrid=True, gridcolor=GRID_CLR, gridwidth=1,
+        zeroline=False, title_text="Time of day",
         color="#6B7280", row=2, col=1,
     )
     fig.update_yaxes(
-        range=[-total_km * 0.18, total_km * 1.12],
+        range=[-total_km*0.12, total_km*1.12],
         showgrid=False, zeroline=False,
         showticklabels=False,
         title_text="Route position →",
@@ -592,6 +565,7 @@ def build_route_diagram(config, buses, selected_bus=None):
     )
 
     return fig
+
 
 
 def build_headway_chart_data(config, buses):
