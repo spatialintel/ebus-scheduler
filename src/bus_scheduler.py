@@ -12,7 +12,7 @@ P6: _check_p6 scans all buses' most-recent same-direction revenue trip (not
     just trips[-1]), and re-checks after each bump until gap >= SAME_DIR_GAP.
 """
 from __future__ import annotations
-__version__ = "2026-03-24-b3"  # auto-stamped
+__version__ = "2026-03-25-b1"  # auto-stamped
 from datetime import datetime, timedelta
 from src.models import Trip, BusState, RouteConfig, ScheduleInfeasibleError
 
@@ -434,20 +434,25 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
     # ── Phase 1: Staggered morning dead runs ─────────────────────────────────
     nearest_node, _, nearest_tt = _nearest_node_from_depot(config)
 
-    # Determine which revenue terminal buses start from after the morning dead run.
-    # Revenue trips always run start_point ↔ end_point (full route).
-    # If nearest_node is one of the route terminals, buses start there directly.
-    # If nearest_node is an intermediate stop, buses reposition to whichever
-    # route terminal is closer (by distance) before beginning revenue service.
+    # Detect circular route: start_point == end_point.
+    # On circular routes all trips run in the same direction — there is no UP/DN
+    # alternation. natural_gap = cycle_time/fleet fills ALL slots perfectly,
+    # leaving no room for late-arriving buses. Use headway_min as the spacing
+    # floor for circular routes so buses re-enter service at the next available gap.
+    is_circular = config.start_point == config.end_point
+
     terminals = [config.start_point, config.end_point]
+    # De-duplicate for circular (start==end gives [X, X])
+    terminals = list(dict.fromkeys(terminals))
+
     if nearest_node in terminals:
         rev_start = nearest_node
-        far_loc   = config.end_point if nearest_node == config.start_point else config.start_point
+        far_loc   = (config.end_point if nearest_node == config.start_point
+                     else config.start_point)
         reposition_to = None
     else:
-        # nearest is intermediate — find closest terminal
         best_term, best_dist = None, float('inf')
-        for term in terminals:
+        for term in [config.start_point, config.end_point]:
             try:
                 d = config.get_distance(nearest_node, term)
                 if d < best_dist:
@@ -456,19 +461,37 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                 pass
         rev_start     = best_term or config.start_point
         far_loc       = config.end_point if rev_start == config.start_point else config.start_point
-        reposition_to = rev_start  # dead reposition leg needed after morning dead run
+        reposition_to = rev_start
 
+    # For circular routes: trip goes start→start (one full loop).
+    # dn_tt = one-way travel time; cycle = dn_tt + break (no reverse direction).
     try:
-        dn_tt = config.get_travel_time(rev_start, far_loc)
-        up_tt = config.get_travel_time(far_loc, rev_start)
+        dn_tt = config.get_travel_time(rev_start, far_loc if not is_circular
+                                       else rev_start)
+        if is_circular and dn_tt == 0:
+            # Fallback: use segment GANGAJALIA→GANGAJALIA if available
+            dn_tt = config.get_travel_time(config.start_point, config.start_point)
     except KeyError:
-        dn_tt = up_tt = 45
+        dn_tt = 45
+    try:
+        up_tt = (0 if is_circular else config.get_travel_time(far_loc, rev_start))
+    except KeyError:
+        up_tt = dn_tt if not is_circular else 0
 
-    cycle_time  = dn_tt + min_break + up_tt + min_break
+    if is_circular:
+        cycle_time  = dn_tt + min_break   # one direction only
+    else:
+        cycle_time  = dn_tt + min_break + up_tt + min_break
     natural_gap = cycle_time / max(1, config.fleet_size)
 
+    # Phase 1 stagger uses natural_gap for both linear and circular routes.
+    # This spaces buses evenly within one full cycle window so they all arrive
+    # at the revenue terminal close together. The loop's min_hw floor then
+    # enforces minimum headway between actual departures.
+    phase1_gap = natural_gap
+
     for i, bus in enumerate(buses):
-        arrive_at        = op_start_dt + timedelta(minutes=i * natural_gap)
+        arrive_at        = op_start_dt + timedelta(minutes=i * phase1_gap)
         bus.current_time = arrive_at - timedelta(minutes=nearest_tt)
         _morning_dead_run(bus, config)
         bus.phase_index  = i
@@ -511,7 +534,14 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
             recent_types = [t.trip_type for t in bus.trips[-4:]]
             just_charged = "Charging" in recent_types
 
-            if last_rev is None or just_charged:
+            if is_circular:
+                # Circular route: always same direction (DN), always start→start
+                next_dir   = "DN"
+                trip_start = rev_start
+                trip_end   = rev_start   # circular: end == start
+                if bus.current_location not in (rev_start, nearest_node):
+                    continue
+            elif last_rev is None or just_charged:
                 # No revenue history, or just returned from charge:
                 # depart from wherever the bus physically is
                 if bus.current_location == rev_start or (
@@ -574,7 +604,13 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
             # (Charging trip exists and the last few trips include Dead/Charging).
             recent_types = [t.trip_type for t in bus.trips[-4:]]
             just_charged = "Charging" in recent_types
-            min_spacing = min_hw if just_charged else max(min_hw, natural_gap)
+            just_repositioned = (not just_charged and
+                                 len(bus.trips) > 0 and
+                                 bus.trips[-1].trip_type == "Shuttle")
+            # Circular routes: all trips are same direction, natural_gap fills
+            # all slots exactly — use headway floor only so buses aren't blocked.
+            min_spacing = (min_hw if (just_charged or just_repositioned or is_circular)
+                           else max(min_hw, natural_gap))
             last_same = None
             for other in buses:
                 cand = _last_revenue_in_direction(other, next_dir, trip_start)
@@ -653,7 +689,9 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
         # If bus is at far_loc after a DN trip, let it serve one UP trip back to
         # rev_start first — this saves the 40-min revenue-corridor dead run and
         # reduces the headway gap during the charging window.
-        at_far_loc = (best_bus.current_location == far_loc)
+        # For circular routes far_loc == rev_start — there is no "far terminal"
+        # to defer charging from. Disable the gate.
+        at_far_loc = (not is_circular and best_bus.current_location == far_loc)
 
         def _latest_charge_return_time(buses):
             """Return the latest time any bus is expected to return from a charge detour."""
