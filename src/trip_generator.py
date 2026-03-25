@@ -17,14 +17,14 @@ Headway controls service density. Actual departure times set by scheduler (P4-fi
 latest_departure = op_end so buses are never rejected on window grounds.
 """
 from __future__ import annotations
-__version__ = "2026-03-24-b1"  # auto-stamped
+__version__ = "2026-03-25-b3"  # auto-stamped
 from datetime import datetime, timedelta, time
 import pandas as pd
 from src.models import Trip, RouteConfig
 
 _REF_DATE = datetime(2025, 1, 1)
 _OFF_PEAK_START = _REF_DATE.replace(hour=11, minute=0)
-_OFF_PEAK_END   = _REF_DATE.replace(hour=16, minute=0)
+_OFF_PEAK_END   = _REF_DATE.replace(hour=15, minute=0)
 
 
 def _nearest_node_for_buses(config):
@@ -114,7 +114,7 @@ def _generate_revenue_trips(config, headway_df, travel_time_df):
     def _slot_interval(dep):
         """
         Effective slot interval = max(user headway, natural fleet gap).
-        During off-peak (11:00-16:00) expand by off_peak_extra so trip density
+        During off-peak (11:00-15:00) expand by off_peak_extra so trip density
         drops and headways widen, matching the extended driver break.
         """
         base = max(_get_headway_at(dep, headway_df), natural_gap)

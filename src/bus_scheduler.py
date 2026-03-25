@@ -12,7 +12,7 @@ P6: _check_p6 scans all buses' most-recent same-direction revenue trip (not
     just trips[-1]), and re-checks after each bump until gap >= SAME_DIR_GAP.
 """
 from __future__ import annotations
-__version__ = "2026-03-25-b2"  # auto-stamped
+__version__ = "2026-03-25-b3"  # auto-stamped
 from datetime import datetime, timedelta
 from src.models import Trip, BusState, RouteConfig, ScheduleInfeasibleError
 
@@ -21,7 +21,7 @@ MIDDAY_START       = REF_DATE.replace(hour=12, minute=0)
 MIDDAY_END         = REF_DATE.replace(hour=15, minute=0)
 MORNING_PEAK_START = REF_DATE.replace(hour=8,  minute=0)
 MORNING_PEAK_END   = REF_DATE.replace(hour=11, minute=0)
-EVENING_PEAK_START = REF_DATE.replace(hour=16, minute=0)
+EVENING_PEAK_START = REF_DATE.replace(hour=15, minute=0)
 EVENING_PEAK_END   = REF_DATE.replace(hour=20, minute=0)
 
 MAX_BREAK         = 20    # fallback if config.max_layover_min absent
@@ -34,7 +34,7 @@ DEPOT_DWELL_MAX   = 90
 KM_BALANCE_MAX    = 20.0
 
 OFF_PEAK_START = REF_DATE.replace(hour=11, minute=0)
-OFF_PEAK_END   = REF_DATE.replace(hour=16, minute=0)
+OFF_PEAK_END   = REF_DATE.replace(hour=15, minute=0)
 
 
 def _is_midday(t):   return MIDDAY_START <= t < MIDDAY_END
@@ -48,7 +48,7 @@ def _effective_break(config, current_time: datetime, base_break: int) -> int:
     """
     Return break minutes before the next revenue trip.
 
-    During off-peak (11:00-16:00) the break is extended by
+    During off-peak (11:00-15:00) the break is extended by
     off_peak_layover_extra_min (default 10) to widen headways naturally,
     capped at max_layover_min so P4 is never violated by construction.
     """
@@ -420,7 +420,7 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
     Bus-driven scheduler — no pre-generated trip pool slots.
 
     Each bus departs as soon as its break is served (preferred_layover_min,
-    plus off_peak_layover_extra_min during 11:00–16:00). The headway profile
+    plus off_peak_layover_extra_min during 11:00–15:00). The headway profile
     acts as a minimum same-direction spacing floor. No fixed slot clock.
 
     Charging is staggered: buses are sent to charge one at a time so that

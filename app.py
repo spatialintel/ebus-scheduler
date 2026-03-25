@@ -321,7 +321,7 @@ def build_route_diagram(config, buses, selected_bus=None):
     # Peak shading
     for x0, x1, lbl, clr in [
         (8, 11,  "Peak AM",  "rgba(99,102,241,0.06)"),
-        (11, 16, "Off-peak", "rgba(16,185,129,0.04)"),
+        (11, 15, "Off-peak", "rgba(16,185,129,0.04)"),
         (16, 20, "Peak PM",  "rgba(99,102,241,0.06)"),
     ]:
         fig.add_vrect(x0=x0, x1=x1, fillcolor=clr, line_width=0, row=2, col=1)
@@ -754,16 +754,16 @@ if st.session_state.get("has_results"):
     trip_ok = metrics.revenue_trips_assigned >= metrics.revenue_trips_total
     unserved = max(0, metrics.revenue_trips_total - metrics.revenue_trips_assigned)
 
-    # Revenue Trips KPI: show Rev + Shuttle + unserved clearly
+    # Revenue Trips KPI: show R · S · D counts on one line
+    # R = full Revenue trips (pool), S = Shuttle trips (corridor legs), D = Dead runs
+    dead_count = sum(1 for b in buses for t in b.trips if t.trip_type == "Dead")
+    rev_parts  = [f"{metrics.revenue_trips_assigned}R"]
     if shuttle_count > 0:
-        rev_label = (f"{metrics.revenue_trips_assigned}R + {shuttle_count}S"
-                     + (f" ({unserved} unserved)" if unserved > 0 else ""))
-        rev_sub   = f"of {metrics.revenue_trips_total} planned"
-        rev_status = "ok" if unserved == 0 else "warn" if unserved <= 5 else "bad"
-    else:
-        rev_label  = f"{metrics.revenue_trips_assigned}/{metrics.revenue_trips_total}"
-        rev_sub    = "" if unserved == 0 else f"{unserved} unserved"
-        rev_status = "ok" if unserved == 0 else "bad"
+        rev_parts.append(f"{shuttle_count}S")
+    rev_parts.append(f"{dead_count}D")
+    rev_label  = " · ".join(rev_parts)
+    rev_sub    = f"of {metrics.revenue_trips_total} planned revenue trips"
+    rev_status = "ok" if unserved == 0 else "warn" if unserved <= 5 else "bad"
 
     st.markdown(
         '<div class="kpi-grid">' +
@@ -1068,7 +1068,7 @@ if st.session_state.get("has_results"):
                     min_value=1, max_value=120, step=1,
                     help="Maximum allowed gap between revenue trips. Replaces the hardcoded 20-minute ceiling.")
                 new_off_peak_extra = st.number_input(
-                    "Off-Peak Extra Break (min) — 11:00–16:00",
+                    "Off-Peak Extra Break (min) — 11:00–15:00",
                     value=int(getattr(config, "off_peak_layover_extra_min", 0)),
                     min_value=0, max_value=60, step=1,
                     help="Added on top of Min Driver Break during off-peak hours to widen headways. Capped at Max Layover.")
