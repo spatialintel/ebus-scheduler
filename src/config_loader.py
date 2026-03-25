@@ -631,6 +631,9 @@ def load_config(excel_path: str | Path) -> tuple[RouteConfig, pd.DataFrame, pd.D
         min_km_per_bus=float(
             _get_opt(fm, "min_km_per_bus", 0) or 0
         ),
+        max_km_per_bus=float(
+            _get_opt(fm, "max_km_per_bus", 0) or 0
+        ),
         max_layover_min=int(float(
             _get_opt(fm, "max_layover_min", 20) or 20
         )),

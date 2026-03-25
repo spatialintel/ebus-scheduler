@@ -17,7 +17,7 @@ class Trip:
     """A single trip (revenue, dead-run, or charging) in the schedule."""
 
     direction: str          # "UP" | "DN" | "DEPOT"
-    trip_type: str          # "Revenue" | "Dead" | "Charging" | "Shuttle"
+    trip_type: str          # "Revenue" | "Dead" | "Charging"
     start_location: str
     end_location: str
     earliest_departure: datetime
@@ -184,6 +184,7 @@ class RouteConfig:
 
     # S6: Minimum km each bus must run (0 = no minimum)
     min_km_per_bus: float = 0.0
+    max_km_per_bus: float = 0.0          # 0 = disabled; hard cap per bus per day
 
     # v5: configurable break ceiling (replaces hardcoded MAX_BREAK = 20)
     max_layover_min: int = 20

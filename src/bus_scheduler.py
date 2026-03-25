@@ -385,8 +385,11 @@ def _select_bus(buses, trip, config, min_break, natural_gap=None):
         rt = _bumped_ready_time(buses, trip, rt, natural_gap=natural_gap)
         km_deficit = bus.total_km - avg_km
         below_min  = -50 if (min_km > 0 and bus.total_km < min_km) else 0
+        max_km     = getattr(config, "max_km_per_bus", 0) or 0
+        above_max  = +100 if (max_km > 0 and bus.total_km + trip.distance_km > max_km
+                              and bus.soc_percent > SOC_FLOOR + 5) else 0
         km_penalty = max(0, km_deficit - KM_BALANCE_MAX) * 5.0
-        candidates.append((km_deficit + km_penalty + below_min, id(bus), bus, rt))
+        candidates.append((km_deficit + km_penalty + below_min + above_max, id(bus), bus, rt))
     if not candidates: return None, None
     candidates.sort(key=lambda x: x[0])
     _, _, bus, rt = candidates[0]
@@ -636,7 +639,7 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                 except KeyError:
                     tt_val = dn_tt
 
-            # SOC and arrival checks
+            # SOC, arrival, and max_km checks
             try:
                 dist_km = config.get_distance(trip_start, trip_end)
             except KeyError:
@@ -645,6 +648,13 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                 continue
             if rt + timedelta(minutes=tt_val) > op_end + timedelta(minutes=45):
                 continue
+            # Hard max_km cap: skip bus if this trip would exceed the daily limit.
+            # Emergency override: if SOC is critically low (P3 risk), allow exceeding
+            # max_km to reach the charger — P3 always outranks max_km.
+            max_km = getattr(config, 'max_km_per_bus', 0) or 0
+            if max_km > 0 and bus.total_km + dist_km > max_km:
+                if bus.soc_percent > SOC_FLOOR + 5:  # not an emergency
+                    continue
 
             if best_rt is None or rt < best_rt:
                 best_bus         = bus
@@ -923,5 +933,20 @@ def check_compliance(config: RouteConfig, buses: list[BusState]) -> list[dict]:
                     "status": "PASS" if km_range <= KM_BALANCE_MAX else "WARN",
                     "details": f"Range: {km_range:.1f} km ({', '.join(f'{k:.1f}' for k in kms)})",
                     "violations": o4_v})
+
+    # O4b: max_km_per_bus — hard daily km cap per bus (FAIL if any bus exceeds it)
+    max_km = getattr(config, 'max_km_per_bus', 0) or 0
+    if max_km > 0:
+        over_v = [f"{bus.bus_id}: {bus.total_km:.1f} km > {max_km:.0f} km cap"
+                  for bus in buses if bus.total_km > max_km]
+        unassigned_note = (" — increase fleet_size if trips are unassigned" if over_v else "")
+        results.append({
+            "rule":   f"O4b: Max km per bus ({max_km:.0f} km cap)",
+            "priority": 10,
+            "status": "PASS" if not over_v else "FAIL",
+            "details": (f"All buses within {max_km:.0f} km cap" if not over_v
+                        else f"{len(over_v)} bus(es) exceeded cap{unassigned_note}"),
+            "violations": over_v,
+        })
 
     return results

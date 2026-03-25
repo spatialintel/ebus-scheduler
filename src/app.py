@@ -556,6 +556,7 @@ def _apply_config_overrides(config, overrides):
         segment_distances=config.segment_distances, segment_times=config.segment_times,
         location_coords=config.location_coords,
         min_km_per_bus=overrides.get("min_km_per_bus", config.min_km_per_bus),
+        max_km_per_bus=overrides.get("max_km_per_bus", getattr(config, 'max_km_per_bus', 0)),
         max_layover_min=overrides.get("max_layover_min",
                                       getattr(config, "max_layover_min", 20)),
         midday_charge_soc_percent=overrides.get("midday_charge_soc_percent",
