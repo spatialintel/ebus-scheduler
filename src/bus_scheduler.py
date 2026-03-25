@@ -12,7 +12,7 @@ P6: _check_p6 scans all buses' most-recent same-direction revenue trip (not
     just trips[-1]), and re-checks after each bump until gap >= SAME_DIR_GAP.
 """
 from __future__ import annotations
-__version__ = "2026-03-25-b1"  # auto-stamped
+__version__ = "2026-03-25-b2"  # auto-stamped
 from datetime import datetime, timedelta
 from src.models import Trip, BusState, RouteConfig, ScheduleInfeasibleError
 
@@ -487,11 +487,20 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
         cycle_time  = dn_tt + min_break + up_tt + min_break
     natural_gap = cycle_time / max(1, config.fleet_size)
 
-    # Phase 1 stagger uses natural_gap for both linear and circular routes.
-    # This spaces buses evenly within one full cycle window so they all arrive
-    # at the revenue terminal close together. The loop's min_hw floor then
-    # enforces minimum headway between actual departures.
-    phase1_gap = natural_gap
+    # Phase 1 stagger:
+    # For circular routes with a long reposition shuttle, using natural_gap
+    # (cycle/fleet) causes all buses to arrive at the terminal within a narrow
+    # window, creating cascade headway bumping. Instead use the early-morning
+    # headway so buses arrive pre-spaced at the correct departure interval.
+    # For linear routes, natural_gap is correct.
+    if is_circular and reposition_to and headway_df is not None:
+        try:
+            from trip_generator import _get_headway_at
+            phase1_gap = _get_headway_at(op_start_dt, headway_df)
+        except Exception:
+            phase1_gap = natural_gap
+    else:
+        phase1_gap = natural_gap
 
     for i, bus in enumerate(buses):
         arrive_at        = op_start_dt + timedelta(minutes=i * phase1_gap)

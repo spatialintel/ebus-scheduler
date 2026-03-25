@@ -2,7 +2,7 @@
 app.py — eBus Scheduler Dashboard
 """
 from __future__ import annotations
-__version__ = "2026-03-24-b6"  # auto-stamped
+__version__ = "2026-03-25-b3"  # auto-stamped
 import sys, tempfile
 from pathlib import Path
 from datetime import datetime, timedelta, time as dtime
@@ -39,6 +39,7 @@ st.markdown("""
   .kpi { background: #fff; border: 1px solid #e8eaed; border-radius: 10px; padding: 14px 16px; }
   .kpi-val { font-size: 1.65rem; font-weight: 700; color: #1a1a2e; line-height: 1.1; font-family: 'DM Mono', monospace; }
   .kpi-label { font-size: 0.72rem; font-weight: 500; color: #888; text-transform: uppercase; letter-spacing: .05em; margin-top: 4px; }
+  .kpi-sub { font-size: 0.68rem; color: #aaa; margin-top: 2px; }
   .kpi-ok .kpi-val { color: #16a34a; }
   .kpi-warn .kpi-val { color: #d97706; }
   .kpi-bad .kpi-val { color: #dc2626; }
@@ -72,9 +73,10 @@ st.markdown("""
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def kpi(label, value, status=""):
+def kpi(label, value, status="", sub=""):
     cls = f"kpi {('kpi-ok' if status=='ok' else 'kpi-warn' if status=='warn' else 'kpi-bad' if status=='bad' else '')}"
-    return f'<div class="{cls}"><div class="kpi-val">{value}</div><div class="kpi-label">{label}</div></div>'
+    sub_html = f'<div class="kpi-sub">{sub}</div>' if sub else ""
+    return f'<div class="{cls}"><div class="kpi-val">{value}</div><div class="kpi-label">{label}</div>{sub_html}</div>'
 
 def build_schedule_df(config, buses):
     rows = []
@@ -105,14 +107,19 @@ def build_schedule_df(config, buses):
 def build_fleet_df(config, buses):
     rows = []
     for bus in buses:
-        rev = [t for t in bus.trips if t.trip_type == "Revenue"]
+        rev  = [t for t in bus.trips if t.trip_type == "Revenue"]
+        shut = [t for t in bus.trips if t.trip_type == "Shuttle"]
         dead = [t for t in bus.trips if t.trip_type == "Dead"]
-        chg = [t for t in bus.trips if t.trip_type == "Charging"]
+        chg  = [t for t in bus.trips if t.trip_type == "Charging"]
         first = next((t.actual_departure for t in bus.trips if t.actual_departure), None)
         last  = next((t.actual_arrival for t in reversed(bus.trips) if t.actual_arrival), None)
         rows.append({
-            "Bus": bus.bus_id, "Revenue Trips": len(rev), "Dead Runs": len(dead),
-            "Charging": len(chg), "Total KM": round(bus.total_km, 1),
+            "Bus": bus.bus_id,
+            "Revenue Trips": len(rev),
+            "Shuttle Trips": len(shut),
+            "Dead Runs": len(dead),
+            "Charging": len(chg),
+            "Total KM": round(bus.total_km, 1),
             "Revenue KM": round(sum(t.distance_km for t in rev), 1),
             "Dead KM": round(sum(t.distance_km for t in dead), 1),
             "Final SOC (%)": round(bus.soc_percent, 1),
@@ -738,15 +745,29 @@ if st.session_state.get("has_results"):
     # ── KPI bar ──────────────────────────────────────────────────────────
     all_pass = all(r["status"] in ("PASS",) for r in compliance if r.get("priority", 99) <= 6)
     fail_count = sum(1 for r in compliance if r["status"] == "FAIL")
-    trip_ok = metrics.revenue_trips_assigned == metrics.revenue_trips_total
     soc_ok = metrics.min_soc_seen >= 25
     km_ok = metrics.km_range <= 20
     shuttle_count = sum(1 for b in buses for t in b.trips if t.trip_type == "Shuttle")
+    # trip_ok: all pool trips are covered (revenue + shuttle together)
+    # Shuttle trips are passenger-carrying corridor legs added by the scheduler.
+    # They are not in the pool, so we only check revenue against pool target.
+    trip_ok = metrics.revenue_trips_assigned >= metrics.revenue_trips_total
+    unserved = max(0, metrics.revenue_trips_total - metrics.revenue_trips_assigned)
+
+    # Revenue Trips KPI: show Rev + Shuttle + unserved clearly
+    if shuttle_count > 0:
+        rev_label = (f"{metrics.revenue_trips_assigned}R + {shuttle_count}S"
+                     + (f" ({unserved} unserved)" if unserved > 0 else ""))
+        rev_sub   = f"of {metrics.revenue_trips_total} planned"
+        rev_status = "ok" if unserved == 0 else "warn" if unserved <= 5 else "bad"
+    else:
+        rev_label  = f"{metrics.revenue_trips_assigned}/{metrics.revenue_trips_total}"
+        rev_sub    = "" if unserved == 0 else f"{unserved} unserved"
+        rev_status = "ok" if unserved == 0 else "bad"
 
     st.markdown(
         '<div class="kpi-grid">' +
-        kpi("Revenue Trips", f"{metrics.revenue_trips_assigned}/{metrics.revenue_trips_total}",
-            "ok" if trip_ok else "bad") +
+        kpi("Revenue Trips", rev_label, rev_status, sub=rev_sub) +
         kpi("Total KM", f"{metrics.total_km:.0f}") +
         kpi("Dead KM %", f"{metrics.dead_km_ratio:.1%}",
             "ok" if metrics.dead_km_ratio < 0.15 else "warn") +
