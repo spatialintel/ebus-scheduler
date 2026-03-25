@@ -762,7 +762,8 @@ if st.session_state.get("has_results"):
         rev_parts.append(f"{shuttle_count}S")
     rev_parts.append(f"{dead_count}D")
     rev_label  = " · ".join(rev_parts)
-    rev_sub    = f"of {metrics.revenue_trips_total} planned revenue trips"
+    total_trips = metrics.revenue_trips_assigned + shuttle_count + dead_count
+    rev_sub     = f"{total_trips} total trips · of {metrics.revenue_trips_total} planned revenue"
     rev_status = "ok" if unserved == 0 else "warn" if unserved <= 5 else "bad"
 
     st.markdown(
