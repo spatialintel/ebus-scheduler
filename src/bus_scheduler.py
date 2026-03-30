@@ -12,7 +12,7 @@ P6: _check_p6 scans all buses' most-recent same-direction revenue trip (not
     just trips[-1]), and re-checks after each bump until gap >= SAME_DIR_GAP.
 """
 from __future__ import annotations
-__version__ = "2026-03-30-b3"  # auto-stamped
+__version__ = "2026-03-30-b4"  # auto-stamped
 from datetime import datetime, timedelta
 from src.models import Trip, BusState, RouteConfig, ScheduleInfeasibleError
 
@@ -835,25 +835,63 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                 dead_tt = 30
             exp_arr = best_bus.current_time + timedelta(minutes=dead_tt)
             if exp_arr >= MIDDAY_START - timedelta(minutes=30):
-                # Use op_end (not EVENING_PEAK_START) so a late-midday charge
-                # (e.g. 14:30) is not aborted by a 15-min max_charge window.
                 _charging_detour(best_bus, config,
                                  resume_by=op_end, min_break=min_break)
                 charged_today.add(best_bus.bus_id)
+                # Clear ALL headway holds for this bus after charging —
+                # it re-enters service as if new, should slot in at min_hw not
+                # a stale bumped time that was valid before the charge detour.
+                for k in list(headway_hold.keys()):
+                    if k[0] == best_bus.bus_id:
+                        del headway_hold[k]
 
         elif best_bus.soc_percent <= soc_trigger:
             if _is_midday(best_bus.current_time) and best_bus.bus_id not in charged_today:
                 if charge_stagger_ok:
                     _charging_detour(best_bus, config,
-                                     resume_by=EVENING_PEAK_START, min_break=min_break)
+                                     resume_by=op_end, min_break=min_break)
                     charged_today.add(best_bus.bus_id)
+                    for k in list(headway_hold.keys()):
+                        if k[0] == best_bus.bus_id: del headway_hold[k]
             elif not _is_peak(best_bus.current_time):
                 _charging_detour(best_bus, config,
-                                 resume_by=EVENING_PEAK_START, min_break=min_break)
-                charged_today.add(best_bus.bus_id)
-            elif best_bus.soc_percent <= SOC_FLOOR + 5:
-                _charging_detour(best_bus, config,
                                  resume_by=op_end, min_break=min_break)
+                charged_today.add(best_bus.bus_id)
+                for k in list(headway_hold.keys()):
+                    if k[0] == best_bus.bus_id: del headway_hold[k]
+            else:
+                typical_drain = (config.get_distance(config.start_point, config.end_point)
+                                 * config.consumption_rate / config.battery_kwh * 100)
+                if best_bus.soc_percent - typical_drain < SOC_FLOOR:
+                    _charging_detour(best_bus, config,
+                                     resume_by=op_end, min_break=min_break)
+                    charged_today.add(best_bus.bus_id)
+                    for k in list(headway_hold.keys()):
+                        if k[0] == best_bus.bus_id: del headway_hold[k]
+
+    # ── Phase 2.5: Pre-Phase-3 emergency charge ──────────────────────────────
+    # If a bus's SOC would drop below the floor during its dead run home,
+    # send it to charge first (even in peak hours, even if already charged today
+    # — P3 always wins over P5/schedule rules).
+    for bus in buses:
+        if bus.current_location == config.depot:
+            continue
+        # Estimate SOC cost of dead run home (via nearest node)
+        try:
+            nearest, _, _ = _nearest_node_from_depot(config)
+            cost = 0.0
+            loc = bus.current_location
+            if loc != nearest:
+                cost += config.get_distance(loc, nearest) * config.consumption_rate / config.battery_kwh * 100
+                loc = nearest
+            if loc != config.depot:
+                cost += config.get_distance(loc, config.depot) * config.consumption_rate / config.battery_kwh * 100
+        except Exception:
+            cost = 15.0  # safe default
+        if bus.soc_percent - cost < SOC_FLOOR:
+            _charging_detour(bus, config, resume_by=op_end, min_break=min_break)
+            # Note: we intentionally do NOT check/update charged_today here —
+            # P3 (never below 20%) overrides the once-per-day P5 rule.
 
     # ── Phase 3: Evening return ───────────────────────────────────────────────
     for bus in buses:
