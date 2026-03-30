@@ -12,7 +12,7 @@ P6: _check_p6 scans all buses' most-recent same-direction revenue trip (not
     just trips[-1]), and re-checks after each bump until gap >= SAME_DIR_GAP.
 """
 from __future__ import annotations
-__version__ = "2026-03-30-b1"  # auto-stamped
+__version__ = "2026-03-30-b2"  # auto-stamped
 from datetime import datetime, timedelta
 from src.models import Trip, BusState, RouteConfig, ScheduleInfeasibleError
 
@@ -752,7 +752,15 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
         # reduces the headway gap during the charging window.
         # For circular routes far_loc == rev_start — there is no "far terminal"
         # to defer charging from. Disable the gate.
-        at_far_loc = (not is_circular and best_bus.current_location == far_loc)
+        # Also disable the gate during the midday window when the bus has not yet
+        # charged and its SOC is already below the midday threshold — in that case
+        # forcing the bus to serve one more return trip before charging risks missing
+        # the midday window entirely, especially when the detour from far_loc is long.
+        _needs_midday_charge = (best_bus.bus_id not in charged_today and
+                                best_bus.soc_percent < midday_soc)
+        at_far_loc = (not is_circular and
+                      best_bus.current_location == far_loc and
+                      not (_is_midday(best_bus.current_time) and _needs_midday_charge))
 
         def _latest_charge_return_time(buses):
             """Return the latest time any bus is expected to return from a charge detour."""
