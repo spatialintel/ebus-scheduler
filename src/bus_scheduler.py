@@ -12,7 +12,7 @@ P6: _check_p6 scans all buses' most-recent same-direction revenue trip (not
     just trips[-1]), and re-checks after each bump until gap >= SAME_DIR_GAP.
 """
 from __future__ import annotations
-__version__ = "2026-03-25-b3"  # auto-stamped
+__version__ = "2026-03-30-b1"  # auto-stamped
 from datetime import datetime, timedelta
 from src.models import Trip, BusState, RouteConfig, ScheduleInfeasibleError
 
@@ -525,6 +525,14 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
     # Track which buses have already charged today (P5: once per day)
     charged_today = set()
 
+    # Per-bus headway hold: remembers the earliest allowed departure time after
+    # a headway bump. Persists across outer-loop iterations so the bus does not
+    # restart from its raw ready-time every evaluation, which caused cascade
+    # over-bumping for late-starting buses (e.g. B04 in a 4-bus fleet stuck at
+    # 09:30 when it should have started at 08:15).
+    # Key: (bus_id, direction, start_location) → datetime
+    headway_hold: dict = {}
+
     MAX_ITER = config.fleet_size * 300
     for _ in range(MAX_ITER):
 
@@ -600,14 +608,27 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
             if needs_reposition:
                 rt = rt + timedelta(minutes=repo_tt)
 
-            # Headway floor: enforce minimum gap from last same-dir departure
-            min_hw = SAME_DIR_GAP
-            if headway_df is not None:
+            # Headway floor: enforce minimum gap from last same-dir departure.
+            # Compute min_hw at the current rt. After any bump below we recompute
+            # so the correct headway band is applied (e.g. a bus arriving at 07:52
+            # bumped into the 08:00+ band should use that band's lower headway, not
+            # the tighter early-morning value — otherwise cascading over-bumping occurs).
+            def _min_hw_at(t):
+                if headway_df is None:
+                    return SAME_DIR_GAP
                 try:
                     from trip_generator import _get_headway_at
-                    min_hw = _get_headway_at(rt, headway_df)
+                    return _get_headway_at(t, headway_df)
                 except Exception:
-                    pass
+                    return SAME_DIR_GAP
+
+            # Apply any persistent headway hold for this bus+direction
+            hold_key = (bus.bus_id, next_dir, trip_start)
+            held = headway_hold.get(hold_key)
+            if held and held > rt:
+                rt = held
+
+            min_hw = _min_hw_at(rt)
 
             # Spacing floor: natural_gap normally.
             # After THIS bus returned from a charging detour, use headway_min only
@@ -616,9 +637,15 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
             # (Charging trip exists and the last few trips include Dead/Charging).
             recent_types = [t.trip_type for t in bus.trips[-4:]]
             just_charged = "Charging" in recent_types
+            # just_repositioned: bus re-entering service after a non-revenue leg.
+            # Applies to: (a) reposition via Shuttle, (b) morning arrival via Dead run
+            # (no Revenue trips yet). In both cases the bus has no established phase
+            # slot and should enter at the next available headway gap, not wait for
+            # its natural_gap slot — which causes cascade bumping for late starters.
             just_repositioned = (not just_charged and
                                  len(bus.trips) > 0 and
-                                 bus.trips[-1].trip_type == "Shuttle")
+                                 bus.trips[-1].trip_type in ("Shuttle", "Dead") and
+                                 not any(t.trip_type == "Revenue" for t in bus.trips))
             # Circular routes: all trips are same direction, natural_gap fills
             # all slots exactly — use headway floor only so buses aren't blocked.
             min_spacing = (min_hw if (just_charged or just_repositioned or is_circular)
@@ -633,6 +660,18 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                 gap = (rt - last_same.actual_departure).total_seconds() / 60
                 if gap < min_spacing:
                     rt = last_same.actual_departure + timedelta(minutes=min_spacing)
+                    # Recompute min_hw at the bumped rt — the bus may now be in a
+                    # different headway band with a different minimum.
+                    min_hw = _min_hw_at(rt)
+                    min_spacing = (min_hw if (just_charged or just_repositioned or is_circular)
+                                   else max(min_hw, natural_gap))
+                    # One more bump check with updated spacing
+                    gap2 = (rt - last_same.actual_departure).total_seconds() / 60
+                    if gap2 < min_spacing:
+                        rt = last_same.actual_departure + timedelta(minutes=min_spacing)
+                    # Persist the bumped rt so this bus is not reset on the next
+                    # outer-loop iteration — preventing cascade over-bumping.
+                    headway_hold[hold_key] = rt
 
             # Travel time from profile or segment config
             tt_val = None
@@ -699,6 +738,9 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
         )
         trip.earliest_departure = best_rt
         best_bus.assign(trip)
+        # Clear the headway hold for this bus+direction — it has now departed
+        # and will compute its next slot fresh from the updated schedule.
+        headway_hold.pop((best_bus.bus_id, best_dir, best_start), None)
 
         # Post-trip charging decisions
         midday_soc  = getattr(config, 'midday_charge_soc_percent', MIDDAY_CHARGE_SOC)
@@ -765,8 +807,10 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                 dead_tt = 30
             exp_arr = best_bus.current_time + timedelta(minutes=dead_tt)
             if exp_arr >= MIDDAY_START - timedelta(minutes=30):
+                # Use op_end (not EVENING_PEAK_START) so a late-midday charge
+                # (e.g. 14:30) is not aborted by a 15-min max_charge window.
                 _charging_detour(best_bus, config,
-                                 resume_by=EVENING_PEAK_START, min_break=min_break)
+                                 resume_by=op_end, min_break=min_break)
                 charged_today.add(best_bus.bus_id)
 
         elif best_bus.soc_percent <= soc_trigger:
