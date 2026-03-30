@@ -12,7 +12,7 @@ P6: _check_p6 scans all buses' most-recent same-direction revenue trip (not
     just trips[-1]), and re-checks after each bump until gap >= SAME_DIR_GAP.
 """
 from __future__ import annotations
-__version__ = "2026-03-30-b2"  # auto-stamped
+__version__ = "2026-03-30-b3"  # auto-stamped
 from datetime import datetime, timedelta
 from src.models import Trip, BusState, RouteConfig, ScheduleInfeasibleError
 
@@ -227,7 +227,10 @@ def _morning_dead_run(bus, config):
     return [_make_dead(bus, nearest, dist, tt, config=config)]
 
 def _route_to_depot(bus, config):
-    """Return via nearest_node (P2 both ways): current → nearest → DEPOT."""
+    """Return via nearest_node (P2 both ways): current → nearest → DEPOT.
+    SOC floor is NOT enforced here — a bus must always be able to return to
+    depot regardless of remaining battery. Stranding a bus off-route is worse
+    than a P3 SOC floor violation on a dead run."""
     inserted = []
     if bus.current_location == config.depot: return inserted
     nearest, _, _ = _nearest_node_from_depot(config)
@@ -235,15 +238,13 @@ def _route_to_depot(bus, config):
         try:
             d = config.get_distance(bus.current_location, nearest)
             t = config.get_travel_time(bus.current_location, nearest)
-            if bus.soc_after_trip(d) >= SOC_FLOOR:
-                inserted.append(_make_dead(bus, nearest, d, t, config=config))
+            inserted.append(_make_dead(bus, nearest, d, t, config=config))
         except KeyError: pass
     if bus.current_location != config.depot:
         try:
             d = config.get_distance(bus.current_location, config.depot)
             t = config.get_travel_time(bus.current_location, config.depot)
-            if bus.soc_after_trip(d) >= SOC_FLOOR:
-                inserted.append(_make_dead(bus, config.depot, d, t, config=config))
+            inserted.append(_make_dead(bus, config.depot, d, t, config=config))
         except KeyError: pass
     return inserted
 
@@ -535,6 +536,25 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
 
     MAX_ITER = config.fleet_size * 300
     for _ in range(MAX_ITER):
+
+        # ── Pre-check: emergency rescue for stuck buses ───────────────────────
+        # A bus stuck off-route with SOC near the floor cannot pass the SOC
+        # check for any revenue trip, so the post-trip reactive-charge branch
+        # is never reached. Sweep for these buses and charge them now so they
+        # can return to service (or at least reach the depot safely).
+        typical_drain = (config.get_distance(config.start_point, config.end_point)
+                         * config.consumption_rate / config.battery_kwh * 100)
+        for stuck_bus in buses:
+            if stuck_bus.current_location == config.depot:
+                continue
+            if stuck_bus.bus_id in charged_today:
+                continue
+            # Bus is stuck if its next revenue trip would drop it below the floor
+            if stuck_bus.soc_percent - typical_drain < SOC_FLOOR:
+                _charging_detour(stuck_bus, config,
+                                 resume_by=op_end, min_break=min_break)
+                charged_today.add(stuck_bus.bus_id)
+
 
         # Find the bus ready soonest that can make a valid trip
         best_bus = best_rt = best_dir = best_start = best_end = None
