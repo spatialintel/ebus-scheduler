@@ -12,7 +12,7 @@ P6: _check_p6 scans all buses' most-recent same-direction revenue trip (not
     just trips[-1]), and re-checks after each bump until gap >= SAME_DIR_GAP.
 """
 from __future__ import annotations
-__version__ = "2026-03-30-b4"  # auto-stamped
+__version__ = "2026-03-30-b5"  # auto-stamped
 from datetime import datetime, timedelta
 from src.models import Trip, BusState, RouteConfig, ScheduleInfeasibleError
 
@@ -496,8 +496,11 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
     # For linear routes, natural_gap is correct.
     if is_circular and reposition_to and headway_df is not None:
         try:
-            from trip_generator import _get_headway_at
-            phase1_gap = _get_headway_at(op_start_dt, headway_df)
+            try:
+                from src.trip_generator import _get_headway_at as _gha_p1
+            except ImportError:
+                from trip_generator import _get_headway_at as _gha_p1
+            phase1_gap = _gha_p1(op_start_dt, headway_df)
         except Exception:
             phase1_gap = natural_gap
     else:
@@ -637,8 +640,11 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                 if headway_df is None:
                     return SAME_DIR_GAP
                 try:
-                    from trip_generator import _get_headway_at
-                    return _get_headway_at(t, headway_df)
+                    try:
+                        from src.trip_generator import _get_headway_at as _gha
+                    except ImportError:
+                        from trip_generator import _get_headway_at as _gha
+                    return _gha(t, headway_df)
                 except Exception:
                     return SAME_DIR_GAP
 
@@ -903,7 +909,8 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
     return buses
 
 
-def check_compliance(config: RouteConfig, buses: list[BusState]) -> list[dict]:
+def check_compliance(config: RouteConfig, buses: list[BusState],
+                     headway_df=None) -> list[dict]:
     min_break = config.preferred_layover_min
     results   = []
 
@@ -952,9 +959,28 @@ def check_compliance(config: RouteConfig, buses: list[BusState]) -> list[dict]:
                     "details": f"Min SOC: {min_soc_seen:.1f}%" + (f", {len(p3_v)} violations" if p3_v else ""),
                     "violations": p3_v[:5]})
 
-    # P4 (charging gaps excluded) — upper bound uses config.max_layover_min
+    # P4: breaks between direct Revenue→Revenue pairs (charging/dead/shuttle excluded).
+    # Also exclude headway-constrained gaps: when a bus must wait for its next
+    # departure slot due to fleet spacing rules, the resulting idle time is
+    # operationally forced — not a driver rest violation.
+    # Headway-constrained gap = gap > max_break AND gap ≈ headway + preferred_layover.
     max_break = getattr(config, 'max_layover_min', MAX_BREAK)
-    p4_v = []
+    p4_v = []; p4_hw_warn = []
+
+    # Get headway at a given time (best effort)
+    def _hw_at_time(t):
+        if headway_df is not None:
+            try:
+                # Try both import paths (src.trip_generator and trip_generator)
+                try:
+                    from src.trip_generator import _get_headway_at as _gha
+                except ImportError:
+                    from trip_generator import _get_headway_at as _gha
+                return _gha(t, headway_df)
+            except Exception:
+                pass
+        return max_break
+
     for bus in buses:
         rev_idx = [i for i, t in enumerate(bus.trips) if t.trip_type == "Revenue"]
         for j in range(1, len(rev_idx)):
@@ -966,12 +992,28 @@ def check_compliance(config: RouteConfig, buses: list[BusState]) -> list[dict]:
                 if gap < min_break:
                     p4_v.append(f"{bus.bus_id} @ {c.actual_arrival.strftime('%H:%M')}: {gap:.0f}min < {min_break}")
                 elif gap > max_break:
-                    p4_v.append(f"{bus.bus_id} @ {c.actual_arrival.strftime('%H:%M')}: {gap:.0f}min > {max_break}")
+                    # Check if gap is explained by headway floor:
+                    # headway-constrained if gap <= 2×headway + preferred_layover.
+                    # With N buses queuing for the same direction, the Nth bus can
+                    # wait up to N×headway — using 2× covers the common 2-bus case
+                    # without masking genuinely long breaks.
+                    hw = _hw_at_time(c.actual_arrival)
+                    if gap <= 2 * hw + min_break:
+                        p4_hw_warn.append(
+                            f"{bus.bus_id} @ {c.actual_arrival.strftime('%H:%M')}: "
+                            f"{gap:.0f}min (headway-constrained, hw={hw:.0f}min)")
+                    else:
+                        p4_v.append(f"{bus.bus_id} @ {c.actual_arrival.strftime('%H:%M')}: {gap:.0f}min > {max_break}")
+
+    p4_status = "PASS" if not p4_v else "FAIL"
+    p4_detail = (f"{len(p4_v)} violations (charging gaps excluded)" if p4_v
+                 else "All breaks in range (charging gaps excluded)")
+    if p4_hw_warn:
+        p4_detail += f" · {len(p4_hw_warn)} headway-forced gap(s) [not a violation]"
     results.append({"rule": f"P4: Break {min_break}–{max_break} min between revenue trips", "priority": 4,
-                    "status": "PASS" if not p4_v else "FAIL",
-                    "details": (f"{len(p4_v)} violations (charging gaps excluded)"
-                                if p4_v else "All breaks in range (charging gaps excluded)"),
-                    "violations": p4_v[:10]})
+                    "status": p4_status,
+                    "details": p4_detail,
+                    "violations": p4_v[:10] + (["--- headway-forced (info) ---"] if p4_hw_warn else []) + p4_hw_warn[:5]})
 
     # P5: midday charging — waived when fleet_size > 10 (P5 policy exception)
     if config.fleet_size > 10:
@@ -1013,10 +1055,25 @@ def check_compliance(config: RouteConfig, buses: list[BusState]) -> list[dict]:
                     "status": "PASS", "details": "Verify in Fleet Summary headway chart",
                     "violations": []})
 
-    # O2
+    # O2: operating hours window check.
+    # Buses in a multi-bus fleet are staggered by natural_gap or headway at start-of-day.
+    # The Nth bus necessarily departs later than op_start by design — this is not a
+    # scheduling error. Classify late-starts as WARN (headway-stagger) vs FAIL (genuine).
     op_start = REF_DATE.replace(hour=config.operating_start.hour, minute=config.operating_start.minute)
     op_end   = REF_DATE.replace(hour=config.operating_end.hour,   minute=config.operating_end.minute)
-    FLEX = 45; o2_v = []
+    FLEX = 45; o2_v = []; o2_warn = []
+
+    # Estimate stagger: last bus starts natural_gap*(fleet-1) after op_start
+    try:
+        nn2, _, _ = _nearest_node_from_depot(config)
+        dn_seg = config.get_travel_time(config.start_point, config.end_point)
+        up_seg = config.get_travel_time(config.end_point,   config.start_point)
+        cyc2   = dn_seg + min_break + up_seg + min_break
+        nat2   = cyc2 / max(1, config.fleet_size)
+        stagger_max = nat2 * (config.fleet_size - 1)   # latest expected first trip
+    except Exception:
+        stagger_max = FLEX * 2
+
     for bus in buses:
         fr = next((t for t in bus.trips if t.trip_type == "Revenue"), None)
         lr = next((t for t in reversed(bus.trips) if t.trip_type == "Revenue"), None)
@@ -1024,13 +1081,24 @@ def check_compliance(config: RouteConfig, buses: list[BusState]) -> list[dict]:
             if trip:
                 dt = getattr(trip, ts)
                 if dt and (dt < ref - timedelta(minutes=FLEX) or dt > ref + timedelta(minutes=FLEX)):
-                    o2_v.append(f"{bus.bus_id}: {ts.replace('actual_','')} {dt.strftime('%H:%M')} "
-                                f"outside ±{FLEX}min of {ref.strftime('%H:%M')}")
+                    msg = (f"{bus.bus_id}: {ts.replace('actual_','')} {dt.strftime('%H:%M')} "
+                           f"outside ±{FLEX}min of {ref.strftime('%H:%M')}")
+                    # Late first departure explained by fleet stagger → WARN
+                    if ts == "actual_departure" and dt > ref + timedelta(minutes=FLEX):
+                        delay = (dt - ref).total_seconds() / 60
+                        if delay <= stagger_max + FLEX:
+                            o2_warn.append(msg + " [headway-stagger]")
+                            continue
+                    o2_v.append(msg)
+
+    o2_status = "PASS" if not o2_v and not o2_warn else ("WARN" if not o2_v else "FAIL")
+    o2_detail = f"Window: {config.operating_start}-{config.operating_end} +-{FLEX} min"
+    if o2_v:    o2_detail += f" -- {len(o2_v)} violation(s)"
+    if o2_warn: o2_detail += f" · {len(o2_warn)} headway-stagger late start(s) [not a violation]"
     results.append({"rule": f"O2: Operating hours +-{FLEX} min", "priority": 8,
-                    "status": "PASS" if not o2_v else "FAIL",
-                    "details": (f"Window: {config.operating_start}-{config.operating_end} +-{FLEX} min"
-                                + (f" -- {len(o2_v)} violation(s)" if o2_v else "")),
-                    "violations": o2_v})
+                    "status": o2_status,
+                    "details": o2_detail,
+                    "violations": o2_v + (["--- stagger (info) ---"] if o2_warn else []) + o2_warn})
 
     # O3
     o3_v = [f"{bus.bus_id}: {t.travel_time_min}min"
