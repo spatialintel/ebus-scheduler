@@ -594,7 +594,7 @@ def _run_core(config, headway_df, travel_time_df, optimize):
         metrics = compute_metrics(config, buses,
                                   total_revenue_trips=len(revenue_trips),
                                   assigned_revenue_trips=assigned_rev)
-    compliance = check_compliance(config, buses, headway_df=hw)
+    compliance = check_compliance(config, buses, headway_df=headway_df)
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
         write_schedule(config, buses, f.name)
         out = Path(f.name).read_bytes()
@@ -618,7 +618,7 @@ def auto_detect_fleet(raw_config, headway_df, travel_time_df, max_fleet=20):
         buses = schedule_buses(cfg, trips)
         rev_total    = sum(1 for t in trips   if t.trip_type == "Revenue")
         rev_assigned = sum(1 for b in buses for t in b.trips if t.trip_type == "Revenue")
-        compliance   = check_compliance(cfg, buses, headway_df=hw)
+        compliance   = check_compliance(cfg, buses, headway_df=headway_df)
         hard_pass    = all(r["status"] == "PASS"
                            for r in compliance if r.get("priority", 99) <= 6)
         if hard_pass and rev_assigned == rev_total:
