@@ -51,8 +51,35 @@ def _time_to_dt(t):
 
 
 def _hhmm_to_dt(hhmm):
-    p = hhmm.strip().split(":")
-    return _REF_DATE.replace(hour=int(p[0]), minute=int(p[1]), second=0, microsecond=0)
+    """
+    Convert any time representation to a REF_DATE-anchored datetime.
+
+    openpyxl can return time cells from Excel in four different types
+    depending on how the cell is formatted:
+      - str  "HH:MM" or "HH:MM:SS"     — standard text cell
+      - datetime.time                   — time-formatted cell (most common)
+      - datetime.datetime               — datetime-formatted cell
+      - float  (0.25 = 06:00 AM)        — number cell with custom h:mm format
+
+    All four are handled here so _get_headway_at / _get_travel_time never
+    silently fall back to SAME_DIR_GAP due to a parse error.
+    """
+    from datetime import time as _time, datetime as _datetime
+    if isinstance(hhmm, _datetime):          # datetime.datetime → extract h/m
+        return _REF_DATE.replace(hour=hhmm.hour, minute=hhmm.minute,
+                                 second=0, microsecond=0)
+    if isinstance(hhmm, _time):              # datetime.time → extract h/m
+        return _REF_DATE.replace(hour=hhmm.hour, minute=hhmm.minute,
+                                 second=0, microsecond=0)
+    if isinstance(hhmm, (int, float)):       # Excel fractional day (0.25 = 06:00)
+        total_min = round(float(hhmm) * 24 * 60)
+        return _REF_DATE.replace(hour=min(total_min // 60, 23),
+                                 minute=total_min % 60,
+                                 second=0, microsecond=0)
+    # String: "HH:MM" or "HH:MM:SS"
+    p = str(hhmm).strip().split(":")
+    return _REF_DATE.replace(hour=int(p[0]), minute=int(p[1]),
+                             second=0, microsecond=0)
 
 
 def _get_headway_at(departure, headway_df):

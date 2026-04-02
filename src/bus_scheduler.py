@@ -645,7 +645,17 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                     except ImportError:
                         from trip_generator import _get_headway_at as _gha
                     return _gha(t, headway_df)
-                except Exception:
+                except Exception as _hw_err:
+                    # Surface the error so it is visible in Streamlit logs rather
+                    # than silently falling back to 5-min SAME_DIR_GAP, which
+                    # causes the headway profile to be completely ignored.
+                    import warnings
+                    warnings.warn(
+                        f"headway lookup failed at {t} — check time format in "
+                        f"headway_df ({type(headway_df.iloc[0]['time_from']).__name__}): "
+                        f"{_hw_err}",
+                        RuntimeWarning, stacklevel=2,
+                    )
                     return SAME_DIR_GAP
 
             # Apply any persistent headway hold for this bus+direction
@@ -971,14 +981,17 @@ def check_compliance(config: RouteConfig, buses: list[BusState],
     def _hw_at_time(t):
         if headway_df is not None:
             try:
-                # Try both import paths (src.trip_generator and trip_generator)
                 try:
                     from src.trip_generator import _get_headway_at as _gha
                 except ImportError:
                     from trip_generator import _get_headway_at as _gha
                 return _gha(t, headway_df)
-            except Exception:
-                pass
+            except Exception as _hw_err:
+                import warnings
+                warnings.warn(
+                    f"P4 headway lookup failed ({type(headway_df.iloc[0]['time_from']).__name__}): "
+                    f"{_hw_err}", RuntimeWarning, stacklevel=2,
+                )
         return max_break
 
     for bus in buses:
