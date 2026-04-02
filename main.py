@@ -62,7 +62,7 @@ def main(excel_path: str, output_path: str | None = None, optimize: bool = False
     else:
         # ── Step 4b: Standard schedule ──
         print(f"\n  Scheduling {len(revenue)} revenue trips across {config.fleet_size} buses...")
-        buses = schedule_buses(config, trips)
+        buses = schedule_buses(config, trips, headway_df=headway_df, travel_time_df=travel_time_df)
         metrics = compute_metrics(config, buses, total_revenue_trips=len(revenue))
 
     # ── Step 5: Summary ──
