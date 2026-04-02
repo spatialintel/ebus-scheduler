@@ -37,6 +37,62 @@ OFF_PEAK_START = REF_DATE.replace(hour=11, minute=0)
 OFF_PEAK_END   = REF_DATE.replace(hour=15, minute=0)
 
 
+# ── Headway band helpers ─────────────────────────────────────────────────────
+# These are module-level so they are NEVER imported inside a nested closure.
+# The previous pattern (import _get_headway_at inside _min_hw_at) silently fell
+# back to SAME_DIR_GAP=5 whenever the import failed in Streamlit Cloud, causing
+# the headway profile to be completely ignored (natural_gap dominated instead).
+
+def _parse_hw_time(v) -> datetime:
+    """Convert any Excel time cell type to a REF_DATE-anchored datetime."""
+    if isinstance(v, datetime):                  # datetime.datetime
+        return REF_DATE.replace(hour=v.hour, minute=v.minute, second=0, microsecond=0)
+    from datetime import time as _time
+    if isinstance(v, _time):                     # datetime.time
+        return REF_DATE.replace(hour=v.hour, minute=v.minute, second=0, microsecond=0)
+    if isinstance(v, (int, float)):              # Excel fractional day (0.25 = 06:00)
+        tm = round(float(v) * 24 * 60)
+        return REF_DATE.replace(hour=min(tm // 60, 23), minute=tm % 60,
+                                second=0, microsecond=0)
+    p = str(v).strip().split(":")                # "HH:MM" or "HH:MM:SS"
+    return REF_DATE.replace(hour=int(p[0]), minute=int(p[1]), second=0, microsecond=0)
+
+
+def _build_hw_bands(headway_df) -> list:
+    """
+    Pre-parse headway_df into a plain list of (t_from, t_to, headway_min) tuples.
+    Built once at the start of schedule_buses / check_compliance so every lookup
+    is a simple list scan with zero imports and zero DataFrame access.
+    Returns [] if headway_df is None or empty.
+    """
+    if headway_df is None:
+        return []
+    try:
+        if headway_df.empty:
+            return []
+    except Exception:
+        return []
+    bands = []
+    for _, row in headway_df.iterrows():
+        try:
+            bands.append((
+                _parse_hw_time(row["time_from"]),
+                _parse_hw_time(row["time_to"]),
+                int(row["headway_min"]),
+            ))
+        except Exception:
+            pass
+    return bands
+
+
+def _lookup_hw(t: datetime, hw_bands: list, fallback: int = SAME_DIR_GAP) -> int:
+    """Return headway_min for the band that contains t, or fallback if none match."""
+    for t_from, t_to, hw in hw_bands:
+        if t_from <= t < t_to:
+            return hw
+    return hw_bands[-1][2] if hw_bands else fallback
+
+
 def _is_midday(t):   return MIDDAY_START <= t < MIDDAY_END
 def _is_off_peak(t): return OFF_PEAK_START <= t < OFF_PEAK_END
 def _is_peak(t):
@@ -435,6 +491,10 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
     op_start_dt    = REF_DATE.replace(hour=config.operating_start.hour,
                                       minute=config.operating_start.minute)
 
+    # Pre-build headway bands ONCE — avoids repeated imports inside the hot loop.
+    # _lookup_hw is a plain list scan: no imports, no DataFrame access, no closures.
+    _hw_bands = _build_hw_bands(headway_df)
+
     # ── Phase 1: Staggered morning dead runs ─────────────────────────────────
     nearest_node, _, nearest_tt = _nearest_node_from_depot(config)
 
@@ -637,26 +697,7 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
             # bumped into the 08:00+ band should use that band's lower headway, not
             # the tighter early-morning value — otherwise cascading over-bumping occurs).
             def _min_hw_at(t):
-                if headway_df is None:
-                    return SAME_DIR_GAP
-                try:
-                    try:
-                        from src.trip_generator import _get_headway_at as _gha
-                    except ImportError:
-                        from trip_generator import _get_headway_at as _gha
-                    return _gha(t, headway_df)
-                except Exception as _hw_err:
-                    # Surface the error so it is visible in Streamlit logs rather
-                    # than silently falling back to 5-min SAME_DIR_GAP, which
-                    # causes the headway profile to be completely ignored.
-                    import warnings
-                    warnings.warn(
-                        f"headway lookup failed at {t} — check time format in "
-                        f"headway_df ({type(headway_df.iloc[0]['time_from']).__name__}): "
-                        f"{_hw_err}",
-                        RuntimeWarning, stacklevel=2,
-                    )
-                    return SAME_DIR_GAP
+                return _lookup_hw(t, _hw_bands)
 
             # Apply any persistent headway hold for this bus+direction
             hold_key = (bus.bus_id, next_dir, trip_start)
@@ -977,22 +1018,11 @@ def check_compliance(config: RouteConfig, buses: list[BusState],
     max_break = getattr(config, 'max_layover_min', MAX_BREAK)
     p4_v = []; p4_hw_warn = []
 
-    # Get headway at a given time (best effort)
+    # Pre-build headway bands for P4 classification — same pattern as schedule_buses.
+    _hw_bands_p4 = _build_hw_bands(headway_df)
+
     def _hw_at_time(t):
-        if headway_df is not None:
-            try:
-                try:
-                    from src.trip_generator import _get_headway_at as _gha
-                except ImportError:
-                    from trip_generator import _get_headway_at as _gha
-                return _gha(t, headway_df)
-            except Exception as _hw_err:
-                import warnings
-                warnings.warn(
-                    f"P4 headway lookup failed ({type(headway_df.iloc[0]['time_from']).__name__}): "
-                    f"{_hw_err}", RuntimeWarning, stacklevel=2,
-                )
-        return max_break
+        return _lookup_hw(t, _hw_bands_p4, fallback=max_break)
 
     for bus in buses:
         rev_idx = [i for i, t in enumerate(bus.trips) if t.trip_type == "Revenue"]
