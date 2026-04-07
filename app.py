@@ -1105,6 +1105,38 @@ if st.session_state.get("has_results"):
                             for k, d in sorted(config.segment_distances.items())]
                 st.dataframe(pd.DataFrame(seg_rows), hide_index=True)
 
+            # Headway profile (editable) ─────────────────────────────────────
+            st.markdown("#### 🕐 Headway Profile")
+            st.caption(
+                "Edit **Headway (min)** per time band. "
+                "Time columns are read-only. "
+                "Changes take effect when you click Apply & Regenerate."
+            )
+            _hw_src = st.session_state.get("raw_headway_df", pd.DataFrame())
+            if not _hw_src.empty:
+                edited_hw_df = st.data_editor(
+                    _hw_src[["time_from", "time_to", "headway_min"]].copy(),
+                    column_config={
+                        "time_from": st.column_config.TextColumn("From", disabled=True),
+                        "time_to":   st.column_config.TextColumn("To",   disabled=True),
+                        "headway_min": st.column_config.NumberColumn(
+                            "Headway (min)", min_value=5, max_value=120, step=1,
+                            help=(
+                                "Minimum gap (minutes) between consecutive same-direction "
+                                "departures from the same terminal in this time band. "
+                                "Applies fleet-wide."
+                            ),
+                        ),
+                    },
+                    hide_index=True,
+                    use_container_width=True,
+                    num_rows="fixed",
+                    key="headway_editor",
+                )
+            else:
+                edited_hw_df = None
+                st.caption("Run a schedule first to enable headway editing.")
+
             apply_btn = st.form_submit_button("🔄 Apply & Regenerate", type="primary")
 
         if apply_btn:
@@ -1129,9 +1161,11 @@ if st.session_state.get("has_results"):
                 t = _pt(val)
                 if t: overrides[key] = t
 
+            hw_overrides = edited_hw_df.copy() if edited_hw_df is not None else None
+
             with st.spinner("Regenerating..."):
                 try:
-                    result = rerun_from_overrides(overrides)
+                    result = rerun_from_overrides(overrides, headway_overrides=hw_overrides)
                 except Exception as e:
                     st.error(f"Error: {e}"); result = None
 
