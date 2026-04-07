@@ -596,12 +596,13 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
         cycle_time  = dn_tt + min_break + up_tt + min_break
     natural_gap = cycle_time / max(1, config.fleet_size)
 
-    # Phase 1 stagger:
-    # For circular routes with a long reposition shuttle, using natural_gap
-    # (cycle/fleet) causes all buses to arrive at the terminal within a narrow
-    # window, creating cascade headway bumping. Instead use the early-morning
-    # headway so buses arrive pre-spaced at the correct departure interval.
-    # For linear routes, natural_gap is correct.
+    # Phase 1 stagger gap: space buses at the minimum headway so they arrive
+    # pre-spaced at the correct service interval.
+    # Use the MINIMUM headway across all bands (usually peak headway) so the
+    # stagger matches the tightest service requirement — not the early-morning
+    # relaxed headway which would space buses too far apart and cause late starts
+    # for the last bus in the fleet (e.g. 4 buses × 40min = 160min late start).
+    # For circular routes: use early-morning headway (existing behaviour preserved).
     if is_circular and reposition_to and headway_df is not None:
         try:
             try:
@@ -611,6 +612,11 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
             phase1_gap = _gha_p1(op_start_dt, headway_df)
         except Exception:
             phase1_gap = natural_gap
+    elif _hw_bands:
+        # Linear route: stagger by minimum configured headway across all bands,
+        # floored at natural_gap so buses are never closer than the fleet can support.
+        min_hw_all_bands = min(hw for _, _, hw in _hw_bands)
+        phase1_gap = max(natural_gap, min_hw_all_bands)
     else:
         phase1_gap = natural_gap
 
@@ -923,16 +929,25 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                         break
             return latest
 
-        # No artificial charge stagger needed — buses are already naturally staggered
-        # by natural_gap (27.5min) from Phase 1. This ensures charging happens
-        # at different times automatically without extra blocking logic.
-        charge_stagger_ok = True
+        # Charge stagger gate — space charge departures evenly across the charge window.
+        # Each bus gets its own slot: window_duration / fleet_size minutes apart.
+        # Example: 6 buses over 300-min window → 50-min slots (11:00, 11:50, 12:40, ...)
+        # This ensures buses are staggered so at most 1 is absent at any time
+        # (assuming detour ≤ slot width), eliminating service gaps during charging.
+        _last_chg = _last_charge_start(buses, best_bus)
+        _window_min = (CHARGE_WINDOW_END - CHARGE_WINDOW_START).total_seconds() / 60
+        _min_charge_gap = _window_min / max(1, config.fleet_size)
+        charge_stagger_ok = (
+            _last_chg is None or
+            (best_bus.current_time - _last_chg).total_seconds() / 60 >= _min_charge_gap
+        )
 
         if (_in_charge_window(best_bus, config) and
                 config.fleet_size <= 10 and
                 best_bus.bus_id not in charged_today and
                 best_bus.soc_percent < midday_soc and
-                not at_far_loc):   # serve return trip first if at far terminal
+                charge_stagger_ok and          # ← stagger gate: don't overlap charge detours
+                not at_far_loc):
             _charging_detour(best_bus, config,
                              resume_by=op_end, min_break=min_break)
             charged_today.add(best_bus.bus_id)
@@ -942,13 +957,13 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
 
         elif best_bus.soc_percent <= soc_trigger:
             _in_window = (CHARGE_WINDOW_START <= best_bus.current_time < CHARGE_WINDOW_END)
-            if _in_window and best_bus.bus_id not in charged_today:
+            if _in_window and best_bus.bus_id not in charged_today and charge_stagger_ok:
                 _charging_detour(best_bus, config,
                                  resume_by=op_end, min_break=min_break)
                 charged_today.add(best_bus.bus_id)
                 for k in list(headway_hold.keys()):
                     if k[0] == best_bus.bus_id: del headway_hold[k]
-            elif not _is_peak(best_bus.current_time):
+            elif not _is_peak(best_bus.current_time) and charge_stagger_ok:
                 _charging_detour(best_bus, config,
                                  resume_by=op_end, min_break=min_break)
                 charged_today.add(best_bus.bus_id)
