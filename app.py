@@ -78,6 +78,32 @@ def kpi(label, value, status="", sub=""):
     sub_html = f'<div class="kpi-sub">{sub}</div>' if sub else ""
     return f'<div class="{cls}"><div class="kpi-val">{value}</div><div class="kpi-label">{label}</div>{sub_html}</div>'
 
+def _true_driver_break(bus, i):
+    """
+    Return the idle break minutes after trip i, or None if not a true driver break.
+
+    A true driver break is the gap between two consecutive Revenue trips with
+    NO Charging, Dead, or Shuttle trips between them. Gaps that include a
+    charging detour (Revenue → Shuttle → Dead → Charging → Dead → Shuttle →
+    Revenue) are excluded — those minutes are spent at the depot, not idle.
+    """
+    if bus.trips[i].trip_type != "Revenue":
+        return None
+    # Find the next revenue trip
+    nxt_rev = next((t for t in bus.trips[i+1:] if t.trip_type == "Revenue"), None)
+    if nxt_rev is None:
+        return None
+    idx_curr = i
+    idx_next = bus.trips.index(nxt_rev)
+    # Check for any detour trips between the two revenue trips
+    between = bus.trips[idx_curr+1:idx_next]
+    if any(t.trip_type in ("Charging", "Dead", "Shuttle") for t in between):
+        return None
+    if bus.trips[i].actual_arrival and nxt_rev.actual_departure:
+        return max(0, int((nxt_rev.actual_departure - bus.trips[i].actual_arrival).total_seconds() / 60))
+    return None
+
+
 def build_schedule_df(config, buses):
     rows = []
     for bus in buses:
@@ -86,11 +112,7 @@ def build_schedule_df(config, buses):
             soc -= (trip.distance_km * config.consumption_rate / config.battery_kwh) * 100
             if trip.trip_type == "Charging":
                 soc = min(100.0, soc + config.depot_flow_rate_kw * (trip.travel_time_min/60) / config.battery_kwh * 100)
-            brk = None
-            if i + 1 < len(bus.trips):
-                nxt = bus.trips[i+1]
-                if trip.actual_arrival and nxt.actual_departure:
-                    brk = max(0, int((nxt.actual_departure - trip.actual_arrival).total_seconds() / 60))
+            brk = _true_driver_break(bus, i)
             if trip.trip_type in ("Dead", "Charging", "Shuttle"): direction = "DEPOT"
             elif trip.direction == "UP": direction = f"{config.route_code}UP"
             else: direction = f"{config.route_code}DN"
@@ -136,11 +158,7 @@ def build_route_depiction(config, buses):
             soc -= (trip.distance_km * config.consumption_rate / config.battery_kwh) * 100
             if trip.trip_type == "Charging":
                 soc = min(100, soc + (config.depot_flow_rate_kw * trip.travel_time_min / 60) / config.battery_kwh * 100)
-            brk = 0
-            if i + 1 < len(bus.trips):
-                nxt = bus.trips[i+1]
-                if trip.actual_arrival and nxt.actual_departure:
-                    brk = max(0, int((nxt.actual_departure - trip.actual_arrival).total_seconds() / 60))
+            brk = _true_driver_break(bus, i) or 0
             rows.append({
                 "Bus": bus.bus_id,
                 "Dep": trip.actual_departure.strftime("%H:%M") if trip.actual_departure else "",
@@ -615,7 +633,7 @@ def auto_detect_fleet(raw_config, headway_df, travel_time_df, max_fleet=20):
     for n in range(1, max_fleet + 1):
         cfg = _apply_config_overrides(raw_config, {"fleet_size": n})
         trips = generate_trips(cfg, headway_df, travel_time_df)
-        buses = schedule_buses(cfg, trips, headway_df=headway_df, travel_time_df=travel_time_df)
+        buses = schedule_buses(cfg, trips)
         rev_total    = sum(1 for t in trips   if t.trip_type == "Revenue")
         rev_assigned = sum(1 for b in buses for t in b.trips if t.trip_type == "Revenue")
         compliance   = check_compliance(cfg, buses, headway_df=headway_df)
@@ -1087,50 +1105,6 @@ if st.session_state.get("has_results"):
                             for k, d in sorted(config.segment_distances.items())]
                 st.dataframe(pd.DataFrame(seg_rows), hide_index=True)
 
-            # Headway profile (editable) ─────────────────────────────────────
-            # Only headway_min is editable; time bands are read-only so the
-            # lookup structure (_get_headway_at) is never broken.
-            # The edited table is passed to rerun_from_overrides on Apply.
-            st.markdown("#### 🕐 Headway Profile")
-            st.caption(
-                "Edit **Headway (min)** per time band. "
-                "Time columns are read-only. "
-                "Changes take effect when you click Apply & Regenerate."
-            )
-            _hw_src = st.session_state.get("raw_headway_df", pd.DataFrame())
-            if not _hw_src.empty:
-                edited_hw_df = st.data_editor(
-                    _hw_src[["time_from", "time_to", "headway_min"]].copy(),
-                    column_config={
-                        "time_from": st.column_config.TextColumn(
-                            "From", disabled=True
-                        ),
-                        "time_to": st.column_config.TextColumn(
-                            "To", disabled=True
-                        ),
-                        "headway_min": st.column_config.NumberColumn(
-                            "Headway (min)",
-                            min_value=5,
-                            max_value=120,
-                            step=1,
-                            help=(
-                                "Minimum gap (minutes) between consecutive "
-                                "same-direction departures from the same terminal "
-                                "in this time band. Applies fleet-wide — the "
-                                "scheduler checks the most recent departure of "
-                                "ANY bus before allowing the next one."
-                            ),
-                        ),
-                    },
-                    hide_index=True,
-                    use_container_width=True,
-                    num_rows="fixed",   # prevent row add/delete; only values change
-                    key="headway_editor",
-                )
-            else:
-                edited_hw_df = None
-                st.caption("Run a schedule first to enable headway editing.")
-
             apply_btn = st.form_submit_button("🔄 Apply & Regenerate", type="primary")
 
         if apply_btn:
@@ -1155,12 +1129,9 @@ if st.session_state.get("has_results"):
                 t = _pt(val)
                 if t: overrides[key] = t
 
-            # Use edited headway table if one was displayed, else keep raw Excel values
-            hw_overrides = edited_hw_df.copy() if edited_hw_df is not None else None
-
             with st.spinner("Regenerating..."):
                 try:
-                    result = rerun_from_overrides(overrides, headway_overrides=hw_overrides)
+                    result = rerun_from_overrides(overrides)
                 except Exception as e:
                     st.error(f"Error: {e}"); result = None
 
