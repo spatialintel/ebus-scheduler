@@ -37,8 +37,8 @@ MIDDAY_CHARGE_SOC = 65.0  # fallback if config.midday_charge_soc_percent absent
 SOC_TRIGGER       = 30.0  # fallback if config.trigger_soc_percent absent
 SOC_FLOOR         = 20.0
 SAME_DIR_GAP      = 5
-DEPOT_DWELL_MIN   = 45
-DEPOT_DWELL_MAX   = 90
+DEPOT_DWELL_MIN   = 35
+DEPOT_DWELL_MAX   = 50
 KM_BALANCE_MAX    = 20.0
 
 OFF_PEAK_START = REF_DATE.replace(hour=11, minute=0)
