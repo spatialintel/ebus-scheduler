@@ -40,6 +40,10 @@ SAME_DIR_GAP      = 5
 DEPOT_DWELL_MIN   = 35
 DEPOT_DWELL_MAX   = 50
 KM_BALANCE_MAX    = 20.0
+# Global Headway Balancer weight: each 1-min deviation from target headway
+# counts as HEADWAY_WEIGHT minutes of ready-time penalty in bus selection.
+# Higher = more uniform headways, lower = faster throughput. 2.0 is a good default.
+HEADWAY_WEIGHT    = 2.0
 
 OFF_PEAK_START = REF_DATE.replace(hour=11, minute=0)
 OFF_PEAK_END   = REF_DATE.replace(hour=15, minute=0)
@@ -620,19 +624,83 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
     else:
         phase1_gap = natural_gap
 
-    for i, bus in enumerate(buses):
-        arrive_at        = op_start_dt + timedelta(minutes=i * phase1_gap)
-        bus.current_time = arrive_at - timedelta(minutes=nearest_tt)
-        _morning_dead_run(bus, config)
-        bus.phase_index  = i
-        # If nearest_node is an intermediate, reposition to the closest terminal
-        if reposition_to and bus.current_location != reposition_to:
+    # ── Phase 1: Staggered morning dead runs ─────────────────────────────────
+    # Routes WITH intermediate points: first half of fleet dispatched to
+    # nearest terminal (existing behaviour), second half dispatched via
+    # intermediate to the FAR terminal — so both ends are pre-populated at
+    # service start without any additional dead runs.
+    # Routes WITHOUT intermediates: all buses go to nearest_node as before.
+    # This split only applies to morning startup; mid-day charging and
+    # end-of-day return are unaffected.
+    has_intermediates = bool([n for n in config.intermediates if n and n.strip()])
+    split_dispatch    = has_intermediates and not is_circular
+
+    # For the far-terminal half, find the intermediate closest to the depot
+    # (the natural stopping point on the way through the route).
+    intermediate_node = None
+    if split_dispatch:
+        clean_ints = [n.strip() for n in config.intermediates if n and n.strip()]
+        # Pick the intermediate with the shortest travel time from depot
+        best_int, best_int_tt = None, float('inf')
+        for n in clean_ints:
             try:
-                rd = config.get_distance(bus.current_location, reposition_to)
-                rt_tt = config.get_travel_time(bus.current_location, reposition_to)
-                _make_dead(bus, reposition_to, rd, rt_tt, config=config)
+                tt_n = config.get_travel_time(config.depot, n)
+                if tt_n < best_int_tt:
+                    best_int_tt, best_int = tt_n, n
             except KeyError:
                 pass
+        intermediate_node = best_int or clean_ints[0]
+
+    half = len(buses) // 2   # first half → near terminal, second half → far terminal
+
+    for i, bus in enumerate(buses):
+        if split_dispatch and i >= half:
+            # ── Far-terminal dispatch (second half of fleet) ──────────────────
+            # Route: DEPOT → intermediate_node → far_loc
+            # Staggered within this half: slot index = i - half
+            slot_idx  = i - half
+            arrive_at = op_start_dt + timedelta(minutes=slot_idx * phase1_gap)
+
+            # Leg 1: DEPOT → intermediate_node
+            try:
+                d_int = config.get_distance(config.depot, intermediate_node)
+                t_int = config.get_travel_time(config.depot, intermediate_node)
+            except KeyError:
+                # Fallback: treat like near-terminal dispatch
+                d_int, t_int = 0, 0
+
+            # Depart depot early enough to arrive at far_loc by arrive_at
+            # (approximate: use intermediate travel time as proxy)
+            try:
+                d_far = config.get_distance(intermediate_node, far_loc)
+                t_far = config.get_travel_time(intermediate_node, far_loc)
+            except KeyError:
+                d_far, t_far = 0, 0
+
+            total_travel = t_int + t_far
+            bus.current_time = arrive_at - timedelta(minutes=total_travel)
+
+            # Leg 1: DEPOT → intermediate
+            if d_int > 0:
+                _make_dead(bus, intermediate_node, d_int, t_int, config=config)
+            # Leg 2: intermediate → far_loc
+            if d_far > 0 and bus.current_location != far_loc:
+                _make_dead(bus, far_loc, d_far, t_far, config=config)
+        else:
+            # ── Near-terminal dispatch (first half, existing behaviour) ───────
+            arrive_at        = op_start_dt + timedelta(minutes=i * phase1_gap)
+            bus.current_time = arrive_at - timedelta(minutes=nearest_tt)
+            _morning_dead_run(bus, config)
+            # If nearest_node is an intermediate, reposition to the closest terminal
+            if reposition_to and bus.current_location != reposition_to:
+                try:
+                    rd    = config.get_distance(bus.current_location, reposition_to)
+                    rt_tt = config.get_travel_time(bus.current_location, reposition_to)
+                    _make_dead(bus, reposition_to, rd, rt_tt, config=config)
+                except KeyError:
+                    pass
+
+        bus.phase_index = i
 
     # ── Phase 2: Bus-driven revenue loop ─────────────────────────────────────
     # Each iteration picks the bus that can depart soonest, enforces headway
@@ -676,6 +744,7 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
         # Find the bus ready soonest that can make a valid trip
         best_bus = best_rt = best_dir = best_start = best_end = None
         best_dist_km = best_tt_val = best_needs_repo = None
+        best_score = None
 
         for bus in buses:
             if bus.current_location == config.depot:
@@ -835,9 +904,30 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                 if bus.soc_percent > SOC_FLOOR + 5:  # not an emergency
                     continue
 
-            if best_rt is None or rt < best_rt:
+            # ── Global Headway Balancer ───────────────────────────────────────
+            # Instead of pure greedy (earliest rt wins), score each candidate bus
+            # by how close its departure produces a gap to target_gap (= min_hw).
+            # A bus that departs slightly later but produces a more uniform headway
+            # scores better than one that departs earliest but causes bunching.
+            #
+            # score = |actual_gap - target_gap| * HEADWAY_WEIGHT + rt_minutes
+            #
+            # HEADWAY_WEIGHT=2.0 means a 1-min headway deviation costs 2 min of
+            # rt penalty. rt_minutes breaks ties when deviation is equal.
+            # If no prior departure exists (first trip of the day), score = rt only.
+            target_gap = _min_hw_at(rt)   # configured headway at this time
+            if last_same and last_same.actual_departure:
+                actual_gap = (rt - last_same.actual_departure).total_seconds() / 60
+                hw_deviation = abs(actual_gap - target_gap)
+            else:
+                hw_deviation = 0.0        # first trip — no deviation to measure
+            rt_minutes = (rt - op_start_dt).total_seconds() / 60
+            bus_score  = hw_deviation * HEADWAY_WEIGHT + rt_minutes
+
+            if best_rt is None or bus_score < best_score:
                 best_bus         = bus
                 best_rt          = rt
+                best_score       = bus_score
                 best_dir         = next_dir
                 best_start       = trip_start
                 best_end         = trip_end
