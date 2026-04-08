@@ -196,6 +196,54 @@ def _nearest_node_from_depot(config):
             continue
     return best or (config.start_point, 0, 0)
 
+
+def _soc_cost_to_depot(from_loc: str, config: "RouteConfig") -> float:
+    """
+    Estimate SOC% consumed travelling from from_loc back to the depot via
+    the nearest node (P2 compliance: always route via nearest_node).
+
+    Returns 0.0 if the bus is already at the depot.
+    Returns the direct path cost if from_loc == nearest_node.
+    Otherwise returns the two-leg cost: from_loc → nearest_node → DEPOT.
+
+    This is used as a lookahead feasibility check before assigning a revenue
+    trip — ensuring the bus can safely reach the depot after the trip without
+    dropping below SOC_FLOOR.
+    """
+    if from_loc == config.depot:
+        return 0.0
+
+    nearest, _, _ = _nearest_node_from_depot(config)
+
+    def _km_cost(km: float) -> float:
+        return (km * config.consumption_rate / config.battery_kwh) * 100
+
+    total_km = 0.0
+    loc = from_loc
+
+    # Leg 1: from_loc → nearest_node (if not already there)
+    if loc != nearest:
+        try:
+            total_km += config.get_distance(loc, nearest)
+            loc = nearest
+        except KeyError:
+            # No direct segment — try direct to depot as fallback
+            try:
+                total_km += config.get_distance(from_loc, config.depot)
+                return _km_cost(total_km)
+            except KeyError:
+                return _km_cost(config.get_distance(
+                    config.start_point, config.end_point))  # rough fallback
+
+    # Leg 2: nearest_node → DEPOT
+    if loc != config.depot:
+        try:
+            total_km += config.get_distance(loc, config.depot)
+        except KeyError:
+            pass
+
+    return _km_cost(total_km)
+
 def _create_fleet(config):
     t0 = REF_DATE.replace(hour=config.operating_start.hour,
                            minute=config.operating_start.minute)
@@ -723,19 +771,29 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
     for _ in range(MAX_ITER):
 
         # ── Pre-check: emergency rescue for stuck buses ───────────────────────
-        # A bus stuck off-route with SOC near the floor cannot pass the SOC
-        # check for any revenue trip, so the post-trip reactive-charge branch
-        # is never reached. Sweep for these buses and charge them now so they
-        # can return to service (or at least reach the depot safely).
-        typical_drain = (config.get_distance(config.start_point, config.end_point)
-                         * config.consumption_rate / config.battery_kwh * 100)
+        # Two scenarios requiring immediate charging (bypasses stagger gate):
+        # 1. Bus can't safely return to depot from its current location NOW
+        # 2. Bus can't safely take its next revenue trip AND return home after
+        #    (lookahead) — prevents getting stuck on the next iteration
+        one_trip_drain = (config.get_distance(config.start_point, config.end_point)
+                          * config.consumption_rate / config.battery_kwh * 100)
+        max_cost_home = _soc_cost_to_depot(far_loc, config)  # worst-case (far terminal)
+
         for stuck_bus in buses:
             if stuck_bus.current_location == config.depot:
                 continue
             if stuck_bus.bus_id in charged_today:
                 continue
-            # Bus is stuck if its next revenue trip would drop it below the floor
-            if stuck_bus.soc_percent - typical_drain < SOC_FLOOR:
+            actual_cost_home = _soc_cost_to_depot(stuck_bus.current_location, config)
+            # Scenario 1: already stranded — can't return to depot safely now
+            stranded_now = stuck_bus.soc_percent - actual_cost_home < SOC_FLOOR
+            # Scenario 2: lookahead — taking the next revenue trip would leave the
+            # bus unable to return home (worst-case: trip ends at far terminal).
+            # Use a small buffer (+2%) to trigger slightly early.
+            stuck_after_next = (stuck_bus.soc_percent
+                                 - one_trip_drain
+                                 - max_cost_home) < SOC_FLOOR + 2.0
+            if stranded_now or stuck_after_next:
                 _charging_detour(stuck_bus, config,
                                  resume_by=op_end, min_break=min_break)
                 charged_today.add(stuck_bus.bus_id)
@@ -894,6 +952,19 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                 continue
             if bus.soc_after_trip(dist_km) < SOC_FLOOR:
                 continue
+
+            # ── Pre-trip lookahead: can bus reach depot safely after this trip?
+            # After completing the trip the bus is at trip_end. It must travel
+            # trip_end → nearest_node → DEPOT before the next charge. If the
+            # SOC remaining after the trip is less than the path-home cost plus
+            # the floor, skip this trip — the bus needs to charge first.
+            # This prevents the scenario where the charging trigger fires too late
+            # (bus at far terminal with 23% SOC, costs 9.2% to reach depot → 13.8%).
+            soc_after = bus.soc_after_trip(dist_km)
+            cost_home = _soc_cost_to_depot(trip_end, config)
+            if soc_after - cost_home < SOC_FLOOR:
+                continue   # bus cannot safely return after this trip → skip
+
             if rt + timedelta(minutes=tt_val) > op_end + timedelta(minutes=45):
                 continue
             # Hard max_km cap: skip bus if this trip would exceed the daily limit.
