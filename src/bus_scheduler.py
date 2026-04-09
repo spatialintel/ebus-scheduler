@@ -111,25 +111,40 @@ def _is_peak(t):
     return (MORNING_PEAK_START <= t < MORNING_PEAK_END or
             EVENING_PEAK_START <= t < EVENING_PEAK_END)
 
+def _charge_window(config):
+    """Return (window_start, window_end) datetimes from config or hardcoded fallback."""
+    try:
+        cs = config.p5_charging_start
+        ce = config.p5_charging_end
+        ws = REF_DATE.replace(hour=cs.hour, minute=cs.minute)
+        we = REF_DATE.replace(hour=ce.hour, minute=ce.minute)
+        if we > ws:
+            return ws, we
+    except Exception:
+        pass
+    return CHARGE_WINDOW_START, CHARGE_WINDOW_END
+
+
 def _target_charge_time(bus, config) -> datetime:
     """
     Return the ideal charge-start time for this bus.
 
-    Distributes fleet evenly across CHARGE_WINDOW_START–CHARGE_WINDOW_END:
-      bus with phase_index 0   → CHARGE_WINDOW_START (11:00)
-      bus with phase_index N-1 → CHARGE_WINDOW_END   (16:00)
+    Distributes fleet evenly across the config P5 window:
+      bus with phase_index 0   → window_start
+      bus with phase_index N-1 → window_end
       buses in between         → linearly interpolated
 
     Uses phase_index set in Phase 1. Falls back to midpoint if not set.
     """
     n   = max(1, config.fleet_size)
     idx = getattr(bus, 'phase_index', 0)
-    window_min = (CHARGE_WINDOW_END - CHARGE_WINDOW_START).total_seconds() / 60  # 300
+    cws, cwe = _charge_window(config)
+    window_min = (cwe - cws).total_seconds() / 60
     if n == 1:
         offset = window_min / 2
     else:
         offset = idx * window_min / (n - 1)
-    return CHARGE_WINDOW_START + timedelta(minutes=offset)
+    return cws + timedelta(minutes=offset)
 
 def _in_charge_window(bus, config) -> bool:
     """
@@ -147,7 +162,8 @@ def _in_charge_window(bus, config) -> bool:
     if abs((t - target).total_seconds()) / 60 <= CHARGE_FLEX_MIN:
         return True
     # Catch-up: missed target slot but overall window not yet closed
-    if target < t < CHARGE_WINDOW_END:
+    _, cwe = _charge_window(config)
+    if target < t < cwe:
         return True
     return False
 
@@ -673,22 +689,47 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
         phase1_gap = natural_gap
 
     # ── Phase 1: Staggered morning dead runs ─────────────────────────────────
-    # Routes WITH intermediate points: first half of fleet dispatched to
-    # nearest terminal (existing behaviour), second half dispatched via
-    # intermediate to the FAR terminal — so both ends are pre-populated at
-    # service start without any additional dead runs.
-    # Routes WITHOUT intermediates: all buses go to nearest_node as before.
-    # This split only applies to morning startup; mid-day charging and
-    # end-of-day return are unaffected.
-    has_intermediates = bool([n for n in config.intermediates if n and n.strip()])
-    split_dispatch    = has_intermediates and not is_circular
+    #
+    # Three dispatch modes — applied in priority order:
+    #
+    # A) RURAL ROUTE (config.is_suburban_route = True, any number of intermediates):
+    #      ceil(n/2) buses → DEPOT → rural_node   (start or end, from config)
+    #      floor(n/2) buses → DEPOT → other terminal
+    #      Rationale: significant early-morning demand from village → city.
+    #      Dead-km increases intentionally; planner is aware.
+    #
+    # B) INTERMEDIATE ROUTE (has intermediate stops, not rural, not circular):
+    #      First half  → DEPOT → intermediate_node → nearest_terminal
+    #      Second half → DEPOT → far_terminal  (direct)
+    #      Ensures both terminals are served at service start.
+    #
+    # C) SIMPLE ROUTE (no intermediates, or circular):
+    #      All buses → DEPOT → nearest_node  (existing behaviour, unchanged)
+    #
+    # Rules B and C apply only to morning startup. Mid-day charging detours
+    # and end-of-day returns are NOT affected.
 
-    # For the far-terminal half, find the intermediate closest to the depot
-    # (the natural stopping point on the way through the route).
+    has_intermediates = bool([n for n in config.intermediates if n and n.strip()])
+    is_rural          = getattr(config, 'is_suburban_route', False) and not is_circular
+    rural_node_name   = (getattr(config, 'rural_node', '') or '').strip().lower()
+
+    # Resolve rural_node to actual location name
+    if is_rural:
+        if rural_node_name == 'start_point':
+            rural_loc = config.start_point
+            other_loc = config.end_point
+        elif rural_node_name == 'end_point':
+            rural_loc = config.end_point
+            other_loc = config.start_point
+        else:
+            # rural_node not set or unrecognised — fall back to far terminal
+            rural_loc = far_loc
+            other_loc = rev_start
+
+    # For intermediate dispatch: find intermediate closest to depot
     intermediate_node = None
-    if split_dispatch:
+    if has_intermediates and not is_rural and not is_circular:
         clean_ints = [n.strip() for n in config.intermediates if n and n.strip()]
-        # Pick the intermediate with the shortest travel time from depot
         best_int, best_int_tt = None, float('inf')
         for n in clean_ints:
             try:
@@ -699,47 +740,84 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                 pass
         intermediate_node = best_int or clean_ints[0]
 
-    half = len(buses) // 2   # first half → near terminal, second half → far terminal
+    # split_dispatch: intermediate route mode (B) — only when not rural
+    split_dispatch = (has_intermediates and not is_rural and not is_circular
+                      and intermediate_node is not None)
+
+    # ceil(n/2) = rural half (more buses go to rural end for early coverage)
+    n_buses     = len(buses)
+    rural_half  = (n_buses + 1) // 2   # ceil
+    # For intermediate split: first half → intermediate → near terminal
+    inter_half  = n_buses // 2          # floor
 
     for i, bus in enumerate(buses):
-        if split_dispatch and i >= half:
-            # ── Far-terminal dispatch (second half of fleet) ──────────────────
-            # Route: DEPOT → intermediate_node → far_loc
-            # Staggered within this half: slot index = i - half
-            slot_idx  = i - half
-            arrive_at = op_start_dt + timedelta(minutes=slot_idx * phase1_gap)
 
-            # Leg 1: DEPOT → intermediate_node
+        # ── Mode A: Rural route dispatch ─────────────────────────────────────
+        if is_rural:
+            if i < rural_half:
+                # Rural buses: DEPOT → rural terminal, arrive by op_start
+                try:
+                    d_rural = config.get_distance(config.depot, rural_loc)
+                    t_rural = config.get_travel_time(config.depot, rural_loc)
+                except KeyError:
+                    d_rural, t_rural = 0, nearest_tt
+                arrive_at        = op_start_dt + timedelta(minutes=i * phase1_gap)
+                bus.current_time = arrive_at - timedelta(minutes=t_rural)
+                if d_rural > 0:
+                    _make_dead(bus, rural_loc, d_rural, t_rural, config=config)
+            else:
+                # Non-rural buses: DEPOT → other terminal
+                slot_idx = i - rural_half
+                try:
+                    d_other = config.get_distance(config.depot, other_loc)
+                    t_other = config.get_travel_time(config.depot, other_loc)
+                except KeyError:
+                    d_other, t_other = 0, nearest_tt
+                arrive_at        = op_start_dt + timedelta(minutes=slot_idx * phase1_gap)
+                bus.current_time = arrive_at - timedelta(minutes=t_other)
+                if d_other > 0:
+                    _make_dead(bus, other_loc, d_other, t_other, config=config)
+
+        # ── Mode B: Intermediate route split dispatch ─────────────────────────
+        elif split_dispatch and i < inter_half:
+            # First half: DEPOT → intermediate → nearest terminal (rev_start)
+            slot_idx  = i
+            arrive_at = op_start_dt + timedelta(minutes=slot_idx * phase1_gap)
             try:
                 d_int = config.get_distance(config.depot, intermediate_node)
                 t_int = config.get_travel_time(config.depot, intermediate_node)
             except KeyError:
-                # Fallback: treat like near-terminal dispatch
                 d_int, t_int = 0, 0
-
-            # Depart depot early enough to arrive at far_loc by arrive_at
-            # (approximate: use intermediate travel time as proxy)
             try:
-                d_far = config.get_distance(intermediate_node, far_loc)
-                t_far = config.get_travel_time(intermediate_node, far_loc)
+                d_near = config.get_distance(intermediate_node, rev_start)
+                t_near = config.get_travel_time(intermediate_node, rev_start)
             except KeyError:
-                d_far, t_far = 0, 0
-
-            total_travel = t_int + t_far
+                d_near, t_near = 0, 0
+            total_travel     = t_int + t_near
             bus.current_time = arrive_at - timedelta(minutes=total_travel)
-
-            # Leg 1: DEPOT → intermediate
             if d_int > 0:
                 _make_dead(bus, intermediate_node, d_int, t_int, config=config)
-            # Leg 2: intermediate → far_loc
-            if d_far > 0 and bus.current_location != far_loc:
-                _make_dead(bus, far_loc, d_far, t_far, config=config)
+            if d_near > 0 and bus.current_location != rev_start:
+                _make_dead(bus, rev_start, d_near, t_near, config=config)
+
+        elif split_dispatch and i >= inter_half:
+            # Second half: DEPOT → far terminal (direct, no intermediate)
+            slot_idx  = i - inter_half
+            arrive_at = op_start_dt + timedelta(minutes=slot_idx * phase1_gap)
+            try:
+                d_far2 = config.get_distance(config.depot, far_loc)
+                t_far2 = config.get_travel_time(config.depot, far_loc)
+            except KeyError:
+                d_far2, t_far2 = 0, nearest_tt
+            bus.current_time = arrive_at - timedelta(minutes=t_far2)
+            if d_far2 > 0:
+                _make_dead(bus, far_loc, d_far2, t_far2, config=config)
+
+        # ── Mode C: Simple route — all buses to nearest terminal ─────────────
         else:
-            # ── Near-terminal dispatch (first half, existing behaviour) ───────
             arrive_at        = op_start_dt + timedelta(minutes=i * phase1_gap)
             bus.current_time = arrive_at - timedelta(minutes=nearest_tt)
             _morning_dead_run(bus, config)
-            # If nearest_node is an intermediate, reposition to the closest terminal
             if reposition_to and bus.current_location != reposition_to:
                 try:
                     rd    = config.get_distance(bus.current_location, reposition_to)
@@ -1096,7 +1174,8 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
         # This ensures buses are staggered so at most 1 is absent at any time
         # (assuming detour ≤ slot width), eliminating service gaps during charging.
         _last_chg = _last_charge_start(buses, best_bus)
-        _window_min = (CHARGE_WINDOW_END - CHARGE_WINDOW_START).total_seconds() / 60
+        _cws, _cwe = _charge_window(config)
+        _window_min = (_cwe - _cws).total_seconds() / 60
         _min_charge_gap = _window_min / max(1, config.fleet_size)
         charge_stagger_ok = (
             _last_chg is None or
@@ -1117,7 +1196,8 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                     del headway_hold[k]
 
         elif best_bus.soc_percent <= soc_trigger:
-            _in_window = (CHARGE_WINDOW_START <= best_bus.current_time < CHARGE_WINDOW_END)
+            _cws2, _cwe2 = _charge_window(config)
+            _in_window = (_cws2 <= best_bus.current_time < _cwe2)
             if _in_window and best_bus.bus_id not in charged_today and charge_stagger_ok:
                 _charging_detour(best_bus, config,
                                  resume_by=op_end, min_break=min_break)
@@ -1273,20 +1353,29 @@ def check_compliance(config: RouteConfig, buses: list[BusState],
                     "details": p4_detail,
                     "violations": p4_v[:10] + (["--- headway-forced (info) ---"] if p4_hw_warn else []) + p4_hw_warn[:5]})
 
-    # P5: midday charging — waived when fleet_size > 10 (P5 policy exception)
+    # P5: midday charging — window from config (default 12:00-15:00)
+    _p5_start = getattr(config, 'p5_charging_start', None)
+    _p5_end   = getattr(config, 'p5_charging_end',   None)
+    _p5_sh    = _p5_start.hour if _p5_start else 12
+    _p5_sm    = _p5_start.minute if _p5_start else 0
+    _p5_eh    = _p5_end.hour if _p5_end else 15
+    _p5_em    = _p5_end.minute if _p5_end else 0
+    _p5_label = f"{_p5_sh:02d}:{_p5_sm:02d}–{_p5_eh:02d}:{_p5_em:02d}"
+
     if config.fleet_size > 10:
-        results.append({"rule": "P5: Midday charging 12:00–15:00 [waived: fleet > 10]",
+        results.append({"rule": f"P5: Midday charging {_p5_label} [waived: fleet > 10]",
                         "priority": 5, "status": "PASS",
                         "details": f"Fleet {config.fleet_size} buses > 10 — P5 midday charging window waived per policy",
                         "violations": []})
     else:
-        p5_v = [f"{bus.bus_id}: no charge between 11:00-16:00"
+        p5_v = [f"{bus.bus_id}: no charge in {_p5_label}"
                 for bus in buses
                 if not any(t.trip_type == "Charging" and t.actual_departure and
-                           11 <= t.actual_departure.hour < 16 for t in bus.trips)]
-        results.append({"rule": "P5: Midday charging (11:00–16:00) [informational]", "priority": 5,
+                           (_p5_sh * 60 + _p5_sm) <= (t.actual_departure.hour * 60 + t.actual_departure.minute) < (_p5_eh * 60 + _p5_em)
+                           for t in bus.trips)]
+        results.append({"rule": f"P5: Midday charging ({_p5_label}) [informational]", "priority": 5,
                         "status": "PASS" if not p5_v else "WARN",
-                        "details": f"{len(p5_v)} buses missing charge 11:00-16:00 [informational]" if p5_v else "All buses charged in window",
+                        "details": f"{len(p5_v)} buses missing charge {_p5_label} [informational]" if p5_v else f"All buses charged in {_p5_label} window",
                         "violations": p5_v})
 
     # P6

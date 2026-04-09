@@ -201,6 +201,15 @@ class RouteConfig:
     # v5: fallback speed for estimating travel time when segment time is missing
     avg_speed_kmph: float = 30.0
 
+    # v6: configurable P5 midday charging window (replaces hardcoded 12:00-15:00)
+    p5_charging_start: time = field(default_factory=lambda: time(12, 0))
+    p5_charging_end:   time = field(default_factory=lambda: time(15, 0))
+
+    # v6: rural route — ceil(fleet/2) buses dispatched to rural_node at service start
+    # rural_node must be "start_point" or "end_point"
+    is_suburban_route: bool = False
+    rural_node: str = ""
+
     @property
     def depot_flow_rate_kw(self) -> float:
         return self.depot_charger_kw * self.depot_charger_efficiency

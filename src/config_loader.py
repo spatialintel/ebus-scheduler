@@ -644,6 +644,19 @@ def load_config(excel_path: str | Path) -> tuple[RouteConfig, pd.DataFrame, pd.D
             _get_opt(fm, "off_peak_layover_extra_min", 0) or 0
         )),
         avg_speed_kmph=avg_speed,
+        # v6: configurable P5 charging window
+        p5_charging_start=_parse_time(
+            _get_opt(fm, "p5_charging_start", "12:00") or "12:00"
+        ),
+        p5_charging_end=_parse_time(
+            _get_opt(fm, "p5_charging_end", "15:00") or "15:00"
+        ),
+        # v6: rural route dispatch
+        is_suburban_route=(
+            str(_get_opt(fm, "is_suburban_route", "No") or "No").strip().lower()
+            in ("yes", "true", "1", "y")
+        ),
+        rural_node=str(_get_opt(fm, "rural_node", "") or "").strip().lower(),
     )
 
     # ── Parse headway and travel time profiles ─────────────────────────────────
