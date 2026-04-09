@@ -31,6 +31,7 @@ class Trip:
     handover: bool = False  # True if trip straddles shift_split
     shift: int | None = None
     full_or_shuttle: str = "Full"
+    route_code: str = ""            # citywide: which route this trip belongs to
 
     def compute_arrival(self) -> datetime:
         """Return arrival based on actual_departure + travel_time."""
@@ -68,6 +69,8 @@ class BusState:
     battery_kwh: float
     consumption_rate: float     # kWh per km
     trips: list[Trip] = field(default_factory=list)
+    route_history: list[str] = field(default_factory=list)  # citywide: routes served [Phase 2 interlining]
+    current_route: str = ""                                  # citywide: currently assigned route
 
     def _soc_cost(self, km: float) -> float:
         """SOC percentage consumed for a given distance."""
