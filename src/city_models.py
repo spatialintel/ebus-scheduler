@@ -107,6 +107,81 @@ class CitySchedule:
     def min_soc_citywide(self) -> float:
         return min((r.metrics.min_soc_seen for r in self.results.values()), default=100.0)
 
+    @property
+    def avg_headway_deviation_min(self) -> float:
+        """
+        Mean absolute deviation between actual departure gaps and configured headway,
+        across all routes and directions.
+
+        For each consecutive revenue departure pair (same direction):
+            deviation = |actual_gap_min - configured_headway_min_at(departure_time)|
+
+        Returns the mean across all such pairs citywide, or 0.0 if no data.
+        """
+        from datetime import datetime as _dt
+        deviations = []
+        REF = _dt(2025, 1, 1)
+
+        for r in self.results.values():
+            # Build a simple headway lookup: sorted list of (start_min, hw_min)
+            hw_bands = []
+            try:
+                for _, row in r.headway_df.iterrows():
+                    t_from = row["time_from"]
+                    hw     = float(row["headway_min"])
+                    mins   = (t_from.hour * 60 + t_from.minute
+                              if hasattr(t_from, "hour")
+                              else int(str(t_from).split(":")[0]) * 60 + int(str(t_from).split(":")[1]))
+                    hw_bands.append((mins, hw))
+                hw_bands.sort()
+            except Exception:
+                hw_bands = [(0, 30.0)]
+
+            def _lookup_hw(dep_min: float) -> float:
+                hw = hw_bands[0][1]
+                for start, h in hw_bands:
+                    if dep_min >= start:
+                        hw = h
+                return hw
+
+            for direction in ("UP", "DN"):
+                deps = sorted([
+                    t.actual_departure
+                    for b in r.buses for t in b.trips
+                    if t.trip_type == "Revenue"
+                    and t.direction == direction
+                    and t.actual_departure is not None
+                ])
+                for i in range(1, len(deps)):
+                    gap     = (deps[i] - deps[i-1]).total_seconds() / 60.0
+                    dep_min = deps[i].hour * 60 + deps[i].minute
+                    target  = _lookup_hw(dep_min)
+                    deviations.append(abs(gap - target))
+
+        return round(sum(deviations) / len(deviations), 1) if deviations else 0.0
+
+    @property
+    def max_headway_gap_min(self) -> float:
+        """
+        Largest single departure gap observed across all routes and directions.
+        Useful for spotting service holes that the average would hide.
+        """
+        max_gap = 0.0
+        for r in self.results.values():
+            for direction in ("UP", "DN"):
+                deps = sorted([
+                    t.actual_departure
+                    for b in r.buses for t in b.trips
+                    if t.trip_type == "Revenue"
+                    and t.direction == direction
+                    and t.actual_departure is not None
+                ])
+                for i in range(1, len(deps)):
+                    gap = (deps[i] - deps[i-1]).total_seconds() / 60.0
+                    if gap > max_gap:
+                        max_gap = gap
+        return round(max_gap, 1)
+
     def route_summary_rows(self) -> list[dict]:
         """One row per route for the dashboard summary table."""
         rows = []

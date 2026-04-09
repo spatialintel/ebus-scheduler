@@ -1331,6 +1331,14 @@ elif app_mode == "🏙️ Citywide":
             "ok" if cs.citywide_utilization_pct >= 85 else "warn") +
         kpi("Transfers", str(len(cs.transfers)),
             "ok" if len(cs.transfers) == 0 else "warn") +
+        kpi("Avg HW Dev", f"{cs.avg_headway_deviation_min:.1f} min",
+            "ok" if cs.avg_headway_deviation_min < 5 else "warn"
+            if cs.avg_headway_deviation_min < 10 else "bad",
+            sub="vs configured") +
+        kpi("Max Gap", f"{cs.max_headway_gap_min:.0f} min",
+            "ok" if cs.max_headway_gap_min < 45 else "warn"
+            if cs.max_headway_gap_min < 60 else "bad",
+            sub="largest departure gap") +
         '</div>', unsafe_allow_html=True,
     )
 
