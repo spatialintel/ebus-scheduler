@@ -2,7 +2,7 @@
 app.py — eBus Scheduler Dashboard
 """
 from __future__ import annotations
-__version__ = "2026-03-25-b3"  # auto-stamped
+__version__ = "2026-04-09-p2"
 import sys, tempfile
 from pathlib import Path
 from datetime import datetime, timedelta, time as dtime
@@ -24,6 +24,19 @@ from src.trip_generator import generate_trips
 from src.bus_scheduler import schedule_buses, check_compliance
 from src.output_formatter import write_schedule
 from src.metrics import compute_metrics
+
+# Citywide imports — safe fallback if files not yet deployed
+try:
+    from src.city_config_loader import load_city_config_from_files
+    from src.city_scheduler import schedule_city
+    from src.city_models import CityConfig, CitySchedule, RouteResult
+    from src.fleet_analyzer import (
+        compute_pvr_all, compute_pvr_slices_all,
+        compute_fleet_balance,
+    )
+    _CITY_OK = True
+except Exception:
+    _CITY_OK = False
 
 st.set_page_config(page_title="eBus Scheduler", page_icon="🚌", layout="wide",
                    initial_sidebar_state="expanded")
@@ -78,6 +91,32 @@ def kpi(label, value, status="", sub=""):
     sub_html = f'<div class="kpi-sub">{sub}</div>' if sub else ""
     return f'<div class="{cls}"><div class="kpi-val">{value}</div><div class="kpi-label">{label}</div>{sub_html}</div>'
 
+def _true_driver_break(bus, i):
+    """
+    Return the idle break minutes after trip i, or None if not a true driver break.
+
+    A true driver break is the gap between two consecutive Revenue trips with
+    NO Charging, Dead, or Shuttle trips between them. Gaps that include a
+    charging detour (Revenue → Shuttle → Dead → Charging → Dead → Shuttle →
+    Revenue) are excluded — those minutes are spent at the depot, not idle.
+    """
+    if bus.trips[i].trip_type != "Revenue":
+        return None
+    # Find the next revenue trip
+    nxt_rev = next((t for t in bus.trips[i+1:] if t.trip_type == "Revenue"), None)
+    if nxt_rev is None:
+        return None
+    idx_curr = i
+    idx_next = bus.trips.index(nxt_rev)
+    # Check for any detour trips between the two revenue trips
+    between = bus.trips[idx_curr+1:idx_next]
+    if any(t.trip_type in ("Charging", "Dead", "Shuttle") for t in between):
+        return None
+    if bus.trips[i].actual_arrival and nxt_rev.actual_departure:
+        return max(0, int((nxt_rev.actual_departure - bus.trips[i].actual_arrival).total_seconds() / 60))
+    return None
+
+
 def build_schedule_df(config, buses):
     rows = []
     for bus in buses:
@@ -86,11 +125,7 @@ def build_schedule_df(config, buses):
             soc -= (trip.distance_km * config.consumption_rate / config.battery_kwh) * 100
             if trip.trip_type == "Charging":
                 soc = min(100.0, soc + config.depot_flow_rate_kw * (trip.travel_time_min/60) / config.battery_kwh * 100)
-            brk = None
-            if i + 1 < len(bus.trips):
-                nxt = bus.trips[i+1]
-                if trip.actual_arrival and nxt.actual_departure:
-                    brk = max(0, int((nxt.actual_departure - trip.actual_arrival).total_seconds() / 60))
+            brk = _true_driver_break(bus, i)
             if trip.trip_type in ("Dead", "Charging", "Shuttle"): direction = "DEPOT"
             elif trip.direction == "UP": direction = f"{config.route_code}UP"
             else: direction = f"{config.route_code}DN"
@@ -136,11 +171,7 @@ def build_route_depiction(config, buses):
             soc -= (trip.distance_km * config.consumption_rate / config.battery_kwh) * 100
             if trip.trip_type == "Charging":
                 soc = min(100, soc + (config.depot_flow_rate_kw * trip.travel_time_min / 60) / config.battery_kwh * 100)
-            brk = 0
-            if i + 1 < len(bus.trips):
-                nxt = bus.trips[i+1]
-                if trip.actual_arrival and nxt.actual_departure:
-                    brk = max(0, int((nxt.actual_departure - trip.actual_arrival).total_seconds() / 60))
+            brk = _true_driver_break(bus, i) or 0
             rows.append({
                 "Bus": bus.bus_id,
                 "Dep": trip.actual_departure.strftime("%H:%M") if trip.actual_departure else "",
@@ -321,7 +352,7 @@ def build_route_diagram(config, buses, selected_bus=None):
     # Peak shading
     for x0, x1, lbl, clr in [
         (8, 11,  "Peak AM",  "rgba(99,102,241,0.06)"),
-        (11, 16, "Off-peak", "rgba(16,185,129,0.04)"),
+        (11, 15, "Off-peak", "rgba(16,185,129,0.04)"),
         (16, 20, "Peak PM",  "rgba(99,102,241,0.06)"),
     ]:
         fig.add_vrect(x0=x0, x1=x1, fillcolor=clr, line_width=0, row=2, col=1)
@@ -594,7 +625,7 @@ def _run_core(config, headway_df, travel_time_df, optimize):
         metrics = compute_metrics(config, buses,
                                   total_revenue_trips=len(revenue_trips),
                                   assigned_revenue_trips=assigned_rev)
-    compliance = check_compliance(config, buses)
+    compliance = check_compliance(config, buses, headway_df=headway_df)
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
         write_schedule(config, buses, f.name)
         out = Path(f.name).read_bytes()
@@ -618,7 +649,7 @@ def auto_detect_fleet(raw_config, headway_df, travel_time_df, max_fleet=20):
         buses = schedule_buses(cfg, trips)
         rev_total    = sum(1 for t in trips   if t.trip_type == "Revenue")
         rev_assigned = sum(1 for b in buses for t in b.trips if t.trip_type == "Revenue")
-        compliance   = check_compliance(cfg, buses)
+        compliance   = check_compliance(cfg, buses, headway_df=headway_df)
         hard_pass    = all(r["status"] == "PASS"
                            for r in compliance if r.get("priority", 99) <= 6)
         if hard_pass and rev_assigned == rev_total:
@@ -683,445 +714,957 @@ def rerun_from_overrides(config_overrides, headway_overrides=None, optimize=Fals
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🚌 eBus Scheduler")
-    st.caption("Upload route config Excel to generate a schedule.")
+
+    if _CITY_OK:
+        app_mode = st.radio(
+            "Mode", ["🚌 Single Route", "🏙️ Citywide"], index=0,
+            help="Single Route: one config. Citywide: multiple configs with fleet rebalancing.",
+        )
+    else:
+        app_mode = "🚌 Single Route"
+
     st.divider()
-    uploaded = st.file_uploader("Config Excel", type=["xlsx"], label_visibility="collapsed")
-    optimize = st.toggle("Run Optimizer", value=False,
-                         help="Tunes headway bands to balance KM across fleet (10–20 sec).")
-    run_btn = st.button("▶ Generate Schedule", type="primary", disabled=uploaded is None)
-    st.divider()
-    st.caption("Rules enforced: P4 break from config, P2 via nearest node, P5 midday charge, P3 SOC ≥ 20%.")
+
+    if app_mode == "🚌 Single Route":
+        st.caption("Upload route config Excel to generate a schedule.")
+        uploaded = st.file_uploader("Config Excel", type=["xlsx"], label_visibility="collapsed")
+        optimize = st.toggle(
+            "Run Optimizer", value=False,
+            help="Efficiency-Maximising: finds minimum feasible fleet, ignores headway profile.\n"
+                 "Off = Planning-Compliant: follows headway profile strictly.",
+        )
+        if optimize:
+            st.info("⚡ **Efficiency-Maximising** — minimum fleet, KPI-driven.", icon="⚡")
+        else:
+            st.info("📋 **Planning-Compliant** — follows headway profile.", icon="📋")
+        run_btn = st.button("▶ Generate Schedule", type="primary", disabled=uploaded is None)
+        st.divider()
+        st.caption("Rules enforced: P4 break from config, P2 via nearest node, P5 midday charge, P3 SOC ≥ 20%.")
+    else:
+        st.caption("Upload config Excel files for all routes.")
+        uploaded_files = st.file_uploader(
+            "Route Config Files", type=["xlsx", "xlsm"],
+            accept_multiple_files=True, label_visibility="collapsed",
+        )
+        city_optimize = st.toggle(
+            "Efficiency-Maximising Mode", value=False,
+            help="Off = Planning-Compliant: follows headway profile, rebalances surplus.\n"
+                 "On  = Efficiency-Maximising: binary-searches minimum fleet per route.",
+        )
+        if city_optimize:
+            st.info("⚡ **Efficiency-Maximising** — minimum fleet per route, KPI-driven.", icon="⚡")
+        else:
+            st.info("📋 **Planning-Compliant** — headway profile respected, surplus rebalanced.", icon="📋")
+        total_fleet_override = st.number_input(
+            "Total Fleet Override", min_value=0, value=0, step=1,
+            help="0 = use sum from configs. >0 = cap total citywide fleet.",
+        )
+        city_run_btn = st.button(
+            "▶ Generate Citywide Schedule", type="primary",
+            disabled=not uploaded_files,
+        )
+        st.divider()
+        st.caption("**Planning-Compliant**: headway-driven + surplus rebalancing.\n\n"
+                   "**Efficiency-Maximising**: minimum fleet per route.")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-if uploaded is None:
-    st.markdown("## Welcome to eBus Scheduler")
-    c1, c2, c3, c4 = st.columns(4)
-    icons = ["📁", "⚙️", "📊", "⬇️"]
-    steps = [("Upload", "Drop your config Excel with route, fleet, headway, and travel time data."),
-             ("Generate", "Engine creates trips, assigns buses with min-break enforcement and midday charging."),
-             ("Review", "Check compliance, route depiction, headways, SOC curves, and KM balance."),
-             ("Download", "Get formatted schedule Excel with full trip-by-trip detail.")]
-    for col, (icon, (title, desc)) in zip([c1, c2, c3, c4], zip(icons, steps)):
-        with col:
-            st.markdown(f"### {icon} {title}")
-            st.caption(desc)
+# Ensure variables exist regardless of which sidebar mode was active
+if 'uploaded' not in dir(): uploaded = None
+if 'optimize' not in dir(): optimize = False
+if 'run_btn' not in dir(): run_btn = False
+if 'uploaded_files' not in dir(): uploaded_files = []
+if 'city_optimize' not in dir(): city_optimize = False
+if 'city_run_btn' not in dir(): city_run_btn = False
+if 'total_fleet_override' not in dir(): total_fleet_override = 0
 
-elif run_btn:
-    with st.spinner("Running scheduler..."):
-        try:
-            result = run_pipeline(uploaded, optimize)
-        except ConfigError as e:
-            st.error(f"Config error: {e}"); st.stop()
-        except Exception as e:
-            st.error(f"Error: {e}"); st.stop()
-    config, buses, metrics, trips, output_bytes, compliance = result
-    st.session_state.update({
-        "config": config, "buses": buses, "metrics": metrics, "trips": trips,
-        "output_bytes": output_bytes, "compliance": compliance,
-        "prev_compliance": None, "has_results": True,
-    })
+if app_mode == "🚌 Single Route":
+    # ═══════════════════════════════ SINGLE ROUTE ════════════════════════════════
 
-if st.session_state.get("has_results"):
-    config = st.session_state["config"]
-    buses  = st.session_state["buses"]
-    metrics = st.session_state["metrics"]
-    output_bytes = st.session_state["output_bytes"]
-    compliance = st.session_state.get("compliance", [])
-    prev_compliance = st.session_state.get("prev_compliance")
+    if uploaded is None:
+        st.markdown("## Welcome to eBus Scheduler")
+        c1, c2, c3, c4 = st.columns(4)
+        icons = ["📁", "⚙️", "📊", "⬇️"]
+        steps = [("Upload", "Drop your config Excel with route, fleet, headway, and travel time data."),
+                 ("Generate", "Engine creates trips, assigns buses with min-break enforcement and midday charging."),
+                 ("Review", "Check compliance, route depiction, headways, SOC curves, and KM balance."),
+                 ("Download", "Get formatted schedule Excel with full trip-by-trip detail.")]
+        for col, (icon, (title, desc)) in zip([c1, c2, c3, c4], zip(icons, steps)):
+            with col:
+                st.markdown(f"### {icon} {title}")
+                st.caption(desc)
 
-    # ── Route title + download ────────────────────────────────────────────
-    col_title, col_dl = st.columns([3, 1])
-    with col_title:
-        st.markdown(f"## Route {config.route_code} — {config.route_name}")
-    with col_dl:
-        st.download_button(
-            f"⬇ Download Schedule",
-            data=output_bytes,
-            file_name=f"{config.route_code}_schedule.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-    # ── KPI bar ──────────────────────────────────────────────────────────
-    all_pass = all(r["status"] in ("PASS",) for r in compliance if r.get("priority", 99) <= 6)
-    fail_count = sum(1 for r in compliance if r["status"] == "FAIL")
-    soc_ok = metrics.min_soc_seen >= 25
-    km_ok = metrics.km_range <= 20
-    shuttle_count = sum(1 for b in buses for t in b.trips if t.trip_type == "Shuttle")
-    # trip_ok: all pool trips are covered (revenue + shuttle together)
-    # Shuttle trips are passenger-carrying corridor legs added by the scheduler.
-    # They are not in the pool, so we only check revenue against pool target.
-    trip_ok = metrics.revenue_trips_assigned >= metrics.revenue_trips_total
-    unserved = max(0, metrics.revenue_trips_total - metrics.revenue_trips_assigned)
-
-    # Revenue Trips KPI: show Rev + Shuttle + unserved clearly
-    if shuttle_count > 0:
-        rev_label = (f"{metrics.revenue_trips_assigned}R + {shuttle_count}S"
-                     + (f" ({unserved} unserved)" if unserved > 0 else ""))
-        rev_sub   = f"of {metrics.revenue_trips_total} planned"
-        rev_status = "ok" if unserved == 0 else "warn" if unserved <= 5 else "bad"
-    else:
-        rev_label  = f"{metrics.revenue_trips_assigned}/{metrics.revenue_trips_total}"
-        rev_sub    = "" if unserved == 0 else f"{unserved} unserved"
-        rev_status = "ok" if unserved == 0 else "bad"
-
-    st.markdown(
-        '<div class="kpi-grid">' +
-        kpi("Revenue Trips", rev_label, rev_status, sub=rev_sub) +
-        kpi("Total KM", f"{metrics.total_km:.0f}") +
-        kpi("Dead KM %", f"{metrics.dead_km_ratio:.1%}",
-            "ok" if metrics.dead_km_ratio < 0.15 else "warn") +
-        kpi("KM Deviation", f"{metrics.km_range:.1f} km",
-            "ok" if km_ok else "warn") +
-        kpi("Min SOC", f"{metrics.min_soc_seen:.1f}%",
-            "ok" if soc_ok else "warn") +
-        kpi("Charging Stops", str(metrics.charging_stops)) +
-        kpi("Compliance", f"{10-fail_count}/10",
-            "ok" if fail_count == 0 else "warn" if fail_count <= 2 else "bad") +
-        kpi("Fleet", f"{config.fleet_size} buses") +
-        '</div>', unsafe_allow_html=True,
-    )
-
-    # ── Tabs ─────────────────────────────────────────────────────────────
-    tab_compliance, tab_route, tab_fleet, tab_schedule, tab_bus, tab_config = st.tabs([
-        "✅ Compliance", "🗺 Route Depiction", "📊 Fleet Summary",
-        "📋 Full Schedule", "🚌 Bus Detail", "⚙️ Config",
-    ])
-
-    # ════════════════════════════════════════════════════════════════════
-    # TAB 0: Compliance
-    # ════════════════════════════════════════════════════════════════════
-    with tab_compliance:
-        if prev_compliance:
-            st.info("Showing before/after comparison from config edit.")
-
-        STATUS = {"PASS": ("✅", "pass"), "FAIL": ("❌", "fail"),
-                  "WARN": ("⚠️", "warn"), "INFO": ("✅", "pass")}
-
-        p_rules = [r for r in compliance if r.get("priority", 99) <= 6]
-        o_rules = [r for r in compliance if r.get("priority", 99) > 6]
-
-        for section_label, rules, tag_cls, tag_text in [
-            ("Priority Rules (P1–P6)", p_rules, "tag-p", "P"),
-            ("Operational Rules (O1–O4)", o_rules, "tag-o", "O"),
-        ]:
-            st.markdown(f'<div class="section-title">{section_label}</div>', unsafe_allow_html=True)
-            for i, rule in enumerate(rules):
-                effective = rule["status"]
-                if effective == "INFO" and not rule.get("violations"): effective = "PASS"
-                icon, cls = STATUS.get(effective, ("❓", ""))
-                viols = rule.get("violations", [])
-                if not viols and effective == "WARN": viols = [rule.get("details", "")]
-
-                # before/after badge
-                badge = ""
-                if prev_compliance:
-                    prev_idx = next((j for j, r in enumerate(prev_compliance)
-                                     if r["rule"] == rule["rule"]), None)
-                    if prev_idx is not None and prev_compliance[prev_idx]["status"] != rule["status"]:
-                        pi, _ = STATUS.get(prev_compliance[prev_idx]["status"], ("❓",""))
-                        badge = f' <span style="font-size:.75rem;color:#888">{pi}→{icon}</span>'
-
-                label = f"{icon} {rule['rule']}"
-                with st.expander(label, expanded=(effective == "FAIL")):
-                    st.caption(rule.get("details", ""))
-                    if viols:
-                        for v in viols: st.markdown(f"- {v}")
-                    else:
-                        st.markdown("_No violations._")
-
-        if prev_compliance:
-            changed = [r["rule"] for r in compliance
-                       if any(p["rule"] == r["rule"] and p["status"] != r["status"]
-                              for p in prev_compliance)]
-            if changed: st.warning(f"Rules changed: {', '.join(changed)}")
-            else: st.success("No rule statuses changed.")
-
-    # ════════════════════════════════════════════════════════════════════
-    # TAB 1: Route Depiction
-    # ════════════════════════════════════════════════════════════════════
-    with tab_route:
-        # ── Bus filter + diagram ─────────────────────────────────────────
-        if not _PLOTLY_OK:
-            st.warning("Install **plotly** to enable the route diagram (`pip install plotly` or add to requirements.txt).")
-        else:
-            filter_col, spacer = st.columns([2, 5])
-            with filter_col:
-                bus_opts = ["All buses"] + config.bus_ids()
-                sel = st.selectbox("Filter diagram by bus", bus_opts,
-                                   label_visibility="collapsed")
-            selected_bus_filter = None if sel == "All buses" else sel
+    elif run_btn:
+        with st.spinner("Running scheduler..."):
             try:
-                route_fig = build_route_diagram(config, buses,
-                                                selected_bus=selected_bus_filter)
-                st.plotly_chart(route_fig, use_container_width=True,
-                                config={"displayModeBar": True,
-                                        "modeBarButtonsToRemove": ["lasso2d","select2d"],
-                                        "toImageButtonOptions": {"filename": f"route_{config.route_code}"}})
+                result = run_pipeline(uploaded, optimize)
+            except ConfigError as e:
+                st.error(f"Config error: {e}"); st.stop()
             except Exception as e:
-                st.warning(f"Could not render route diagram: {e}")
-            st.caption(
-                "Straight-line representation: distances in Panel A are cumulative along the route; "
-                "depot is shown off-line for clarity. "
-                "Panel B is a time–space diagram: parallel diagonal lines = even headways; "
-                "converging lines = bunching; gaps = charging or off-peak window."
-            )
-        st.divider()
+                st.error(f"Error: {e}"); st.stop()
+        config, buses, metrics, trips, output_bytes, compliance = result
+        st.session_state.update({
+            "config": config, "buses": buses, "metrics": metrics, "trips": trips,
+            "output_bytes": output_bytes, "compliance": compliance,
+            "prev_compliance": None, "has_results": True,
+        })
 
-        # ── Per-bus trip tables ──────────────────────────────────────────
-        st.markdown('<div class="section-title">Per-Bus Trip Detail</div>', unsafe_allow_html=True)
-        route_df = build_route_depiction(config, buses)
-        for bus in buses:
-            bus_data = route_df[route_df["Bus"] == bus.bus_id].reset_index(drop=True)
-            if bus_data.empty: continue
+    if st.session_state.get("has_results"):
+        config = st.session_state["config"]
+        buses  = st.session_state["buses"]
+        metrics = st.session_state["metrics"]
+        output_bytes = st.session_state["output_bytes"]
+        compliance = st.session_state.get("compliance", [])
+        prev_compliance = st.session_state.get("prev_compliance")
 
-            rev = [t for t in bus.trips if t.trip_type == "Revenue"]
-            dead_km = sum(t.distance_km for t in bus.trips if t.trip_type == "Dead")
-            chg = [t for t in bus.trips if t.trip_type == "Charging"]
-            first = next((t.actual_departure for t in bus.trips if t.actual_departure), None)
-            last  = next((t.actual_arrival for t in reversed(bus.trips) if t.actual_arrival), None)
-
-            st.markdown(
-                f'<div class="bus-header">'
-                f'<span class="bus-pill">{bus.bus_id}</span>'
-                f'{len(rev)} revenue trips &nbsp;·&nbsp; {bus.total_km:.1f} km &nbsp;·&nbsp;'
-                f' SOC {bus.soc_percent:.1f}% final &nbsp;·&nbsp;'
-                f' {first.strftime("%H:%M") if first else "?"} – {last.strftime("%H:%M") if last else "?"}'
-                f'</div>', unsafe_allow_html=True,
+        # ── Route title + download ────────────────────────────────────────────
+        col_title, col_dl = st.columns([3, 1])
+        with col_title:
+            st.markdown(f"## Route {config.route_code} — {config.route_name}")
+        with col_dl:
+            st.download_button(
+                f"⬇ Download Schedule",
+                data=output_bytes,
+                file_name=f"{config.route_code}_schedule.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-            display_rows = []
-            for _, row in bus_data.iterrows():
-                t = row["_type"]; d = row["_dir"]
-                marker = "🔋" if t=="Charging" else "⚫" if t=="Dead" else "🔵" if d=="UP" else "🟢"
-                brk = row["Break"]
-                display_rows.append({
-                    "": marker, "Dep": row["Dep"], "Arr": row["Arr"],
-                    "From": row["From"], "To": row["To"], "Type": row["Type"],
-                    "Dist": row["Dist"],
-                    "SOC": f'{row["SOC"]}{"⚠️" if row["SOC"] < 30 else ""}',
-                    "Break": f"{brk} min" if brk > 0 else "",
-                    "Dead KM": row["Dist"] if t == "Dead" else "",
-                })
+        # ── KPI bar ──────────────────────────────────────────────────────────
+        all_pass = all(r["status"] in ("PASS",) for r in compliance if r.get("priority", 99) <= 6)
+        fail_count = sum(1 for r in compliance if r["status"] == "FAIL")
+        soc_ok = metrics.min_soc_seen >= 25
+        km_ok = metrics.km_range <= 20
+        shuttle_count = sum(1 for b in buses for t in b.trips if t.trip_type == "Shuttle")
+        # trip_ok: all pool trips are covered (revenue + shuttle together)
+        # Shuttle trips are passenger-carrying corridor legs added by the scheduler.
+        # They are not in the pool, so we only check revenue against pool target.
+        trip_ok = metrics.revenue_trips_assigned >= metrics.revenue_trips_total
+        unserved = max(0, metrics.revenue_trips_total - metrics.revenue_trips_assigned)
 
-            df_show = pd.DataFrame(display_rows)
-            st.dataframe(df_show, hide_index=True,
-                         height=min(420, 36 * len(df_show) + 38),
-                         column_config={"": st.column_config.TextColumn(width="small")})
-            st.caption(
-                f"Dead KM: {dead_km:.1f} &nbsp;|&nbsp; "
-                f"Charging: {len(chg)} stop{'s' if len(chg)!=1 else ''} &nbsp;|&nbsp; "
-                f"Shift split: {config.shift_split}"
-            )
-            st.divider()
-
-    # ════════════════════════════════════════════════════════════════════
-    # TAB 2: Fleet Summary
-    # ════════════════════════════════════════════════════════════════════
-    with tab_fleet:
-        fleet_df = build_fleet_df(config, buses)
-        st.dataframe(fleet_df, hide_index=True, use_container_width=True)
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown('<div class="section-title">KM per Bus</div>', unsafe_allow_html=True)
-            km_chart = fleet_df[["Bus","Revenue KM","Dead KM"]].set_index("Bus")
-            st.bar_chart(km_chart, color=["#4f46e5","#94a3b8"])
-        with col2:
-            st.markdown('<div class="section-title">Final SOC per Bus (%)</div>', unsafe_allow_html=True)
-            soc_chart = fleet_df[["Bus","Final SOC (%)"]].set_index("Bus")
-            st.bar_chart(soc_chart, color="#16a34a")
-
-        st.markdown('<div class="section-title">Departure Headways</div>', unsafe_allow_html=True)
-        st.caption("Time gaps between consecutive departures in the same direction. "
-                   "Irregular gaps are expected when bus cycle time ≠ fleet × headway — "
-                   "see Config tab to tune.")
-        hw_data = build_headway_chart_data(config, buses)
-        if not hw_data.empty:
-            col_up, col_dn = st.columns(2)
-            for col, direction, color in [(col_up, "UP", "#4f46e5"), (col_dn, "DN", "#16a34a")]:
-                with col:
-                    dir_data = hw_data[hw_data["Direction"]==direction].sort_values("Departure")
-                    if len(dir_data) < 2: continue
-                    deps = dir_data["Departure"].tolist()
-                    gaps = [{"Dep": deps[i].strftime("%H:%M"),
-                             "Headway (min)": round((deps[i]-deps[i-1]).total_seconds()/60)}
-                            for i in range(1, len(deps))]
-                    gdf = pd.DataFrame(gaps).set_index("Dep")
-                    st.markdown(f"**{direction}** headways")
-                    st.bar_chart(gdf, height=220, color=color)
-
-    # ════════════════════════════════════════════════════════════════════
-    # TAB 3: Full Schedule
-    # ════════════════════════════════════════════════════════════════════
-    with tab_schedule:
-        schedule_df = build_schedule_df(config, buses)
-        fc1, fc2, fc3 = st.columns(3)
-        with fc1:
-            type_filter = st.multiselect("Trip Type", ["Revenue","Dead","Charging"],
-                                         default=["Revenue","Dead","Charging"])
-        with fc2:
-            bus_filter = st.multiselect("Bus", config.bus_ids(), default=config.bus_ids())
-        with fc3:
-            dir_filter = st.multiselect("Direction", schedule_df["Direction"].unique().tolist(),
-                                        default=schedule_df["Direction"].unique().tolist())
-        filtered = schedule_df[
-            schedule_df["Type"].isin(type_filter) &
-            schedule_df["Bus"].isin(bus_filter) &
-            schedule_df["Direction"].isin(dir_filter)
-        ]
-        st.dataframe(filtered, hide_index=True, height=520, use_container_width=True)
-        st.caption(f"Showing {len(filtered)} of {len(schedule_df)} trips")
-
-    # ════════════════════════════════════════════════════════════════════
-    # TAB 4: Bus Detail
-    # ════════════════════════════════════════════════════════════════════
-    with tab_bus:
-        selected_bus = st.selectbox("Select Bus", config.bus_ids(), label_visibility="collapsed")
-        bus_obj = next(b for b in buses if b.bus_id == selected_bus)
-        bus_df = build_schedule_df(config, [bus_obj])
-        rev_count = len([t for t in bus_obj.trips if t.trip_type=="Revenue"])
-        dead_km = sum(t.distance_km for t in bus_obj.trips if t.trip_type=="Dead")
-        util = rev_count / max(1, len(bus_obj.trips)) * 100
+        # Revenue Trips KPI: show R · S · D counts on one line
+        # R = full Revenue trips (pool), S = Shuttle trips (corridor legs), D = Dead runs
+        dead_count = sum(1 for b in buses for t in b.trips if t.trip_type == "Dead")
+        rev_parts  = [f"{metrics.revenue_trips_assigned}R"]
+        if shuttle_count > 0:
+            rev_parts.append(f"{shuttle_count}S")
+        rev_parts.append(f"{dead_count}D")
+        rev_label  = " · ".join(rev_parts)
+        total_trips = metrics.revenue_trips_assigned + shuttle_count + dead_count
+        rev_sub     = f"{total_trips} total trips · of {metrics.revenue_trips_total} planned revenue"
+        rev_status = "ok" if unserved == 0 else "warn" if unserved <= 5 else "bad"
 
         st.markdown(
             '<div class="kpi-grid">' +
-            kpi("Revenue Trips", str(rev_count)) +
-            kpi("Total KM", f"{bus_obj.total_km:.1f}") +
-            kpi("Dead KM", f"{dead_km:.1f}", "ok" if dead_km < 30 else "warn") +
-            kpi("Final SOC", f"{bus_obj.soc_percent:.1f}%",
-                "ok" if bus_obj.soc_percent > 30 else "warn") +
-            kpi("Utilisation", f"{util:.0f}%",
-                "ok" if util > 70 else "warn") +
+            kpi("Revenue Trips", rev_label, rev_status, sub=rev_sub) +
+            kpi("Total KM", f"{metrics.total_km:.0f}") +
+            kpi("Dead KM %", f"{metrics.dead_km_ratio:.1%}",
+                "ok" if metrics.dead_km_ratio < 0.15 else "warn") +
+            kpi("KM Deviation", f"{metrics.km_range:.1f} km",
+                "ok" if km_ok else "warn") +
+            kpi("Min SOC", f"{metrics.min_soc_seen:.1f}%",
+                "ok" if soc_ok else "warn") +
+            kpi("Charging Stops", str(metrics.charging_stops)) +
+            kpi("Compliance", f"{10-fail_count}/10",
+                "ok" if fail_count == 0 else "warn" if fail_count <= 2 else "bad") +
+            kpi("Fleet", f"{config.fleet_size} buses") +
             '</div>', unsafe_allow_html=True,
         )
 
-        st.dataframe(bus_df, hide_index=True, height=380, use_container_width=True)
+        # ── Tabs ─────────────────────────────────────────────────────────────
+        tab_compliance, tab_route, tab_fleet, tab_schedule, tab_bus, tab_config = st.tabs([
+            "✅ Compliance", "🗺 Route Depiction", "📊 Fleet Summary",
+            "📋 Full Schedule", "🚌 Bus Detail", "⚙️ Config",
+        ])
 
-        soc_data = bus_df[bus_df["Departure"] != ""][["Departure","SOC (%)"]].set_index("Departure")
-        if not soc_data.empty:
-            st.markdown('<div class="section-title">SOC Progression</div>', unsafe_allow_html=True)
-            st.line_chart(soc_data, color="#4f46e5")
+        # ════════════════════════════════════════════════════════════════════
+        # TAB 0: Compliance
+        # ════════════════════════════════════════════════════════════════════
+        with tab_compliance:
+            if prev_compliance:
+                st.info("Showing before/after comparison from config edit.")
 
-    # ════════════════════════════════════════════════════════════════════
-    # TAB 5: Config
-    # ════════════════════════════════════════════════════════════════════
-    with tab_config:
-        # Auto-fleet detection banner
-        if st.session_state.get("auto_fleet_mode"):
-            detected_n = st.session_state.get("detected_fleet_size", "?")
-            st.success(
-                f"🚌 **Auto Fleet Detection:** Your Excel had fleet_size = 0. "
-                f"The scheduler found that **{detected_n} buses** are the minimum required "
-                f"to serve all trips while satisfying P1–P6. "
-                f"You can lock this value below and regenerate."
+            STATUS = {"PASS": ("✅", "pass"), "FAIL": ("❌", "fail"),
+                      "WARN": ("⚠️", "warn"), "INFO": ("✅", "pass")}
+
+            p_rules = [r for r in compliance if r.get("priority", 99) <= 6]
+            o_rules = [r for r in compliance if r.get("priority", 99) > 6]
+
+            for section_label, rules, tag_cls, tag_text in [
+                ("Priority Rules (P1–P6)", p_rules, "tag-p", "P"),
+                ("Operational Rules (O1–O4)", o_rules, "tag-o", "O"),
+            ]:
+                st.markdown(f'<div class="section-title">{section_label}</div>', unsafe_allow_html=True)
+                for i, rule in enumerate(rules):
+                    effective = rule["status"]
+                    if effective == "INFO" and not rule.get("violations"): effective = "PASS"
+                    icon, cls = STATUS.get(effective, ("❓", ""))
+                    viols = rule.get("violations", [])
+                    if not viols and effective == "WARN": viols = [rule.get("details", "")]
+
+                    # before/after badge
+                    badge = ""
+                    if prev_compliance:
+                        prev_idx = next((j for j, r in enumerate(prev_compliance)
+                                         if r["rule"] == rule["rule"]), None)
+                        if prev_idx is not None and prev_compliance[prev_idx]["status"] != rule["status"]:
+                            pi, _ = STATUS.get(prev_compliance[prev_idx]["status"], ("❓",""))
+                            badge = f' <span style="font-size:.75rem;color:#888">{pi}→{icon}</span>'
+
+                    label = f"{icon} {rule['rule']}"
+                    with st.expander(label, expanded=(effective == "FAIL")):
+                        st.caption(rule.get("details", ""))
+                        if viols:
+                            for v in viols: st.markdown(f"- {v}")
+                        else:
+                            st.markdown("_No violations._")
+
+            if prev_compliance:
+                changed = [r["rule"] for r in compliance
+                           if any(p["rule"] == r["rule"] and p["status"] != r["status"]
+                                  for p in prev_compliance)]
+                if changed: st.warning(f"Rules changed: {', '.join(changed)}")
+                else: st.success("No rule statuses changed.")
+
+        # ════════════════════════════════════════════════════════════════════
+        # TAB 1: Route Depiction
+        # ════════════════════════════════════════════════════════════════════
+        with tab_route:
+            # ── Bus filter + diagram ─────────────────────────────────────────
+            if not _PLOTLY_OK:
+                st.warning("Install **plotly** to enable the route diagram (`pip install plotly` or add to requirements.txt).")
+            else:
+                filter_col, spacer = st.columns([2, 5])
+                with filter_col:
+                    bus_opts = ["All buses"] + config.bus_ids()
+                    sel = st.selectbox("Filter diagram by bus", bus_opts,
+                                       label_visibility="collapsed")
+                selected_bus_filter = None if sel == "All buses" else sel
+                try:
+                    route_fig = build_route_diagram(config, buses,
+                                                    selected_bus=selected_bus_filter)
+                    st.plotly_chart(route_fig, use_container_width=True,
+                                    config={"displayModeBar": True,
+                                            "modeBarButtonsToRemove": ["lasso2d","select2d"],
+                                            "toImageButtonOptions": {"filename": f"route_{config.route_code}"}})
+                except Exception as e:
+                    st.warning(f"Could not render route diagram: {e}")
+                st.caption(
+                    "Straight-line representation: distances in Panel A are cumulative along the route; "
+                    "depot is shown off-line for clarity. "
+                    "Panel B is a time–space diagram: parallel diagonal lines = even headways; "
+                    "converging lines = bunching; gaps = charging or off-peak window."
+                )
+            st.divider()
+
+            # ── Per-bus trip tables ──────────────────────────────────────────
+            st.markdown('<div class="section-title">Per-Bus Trip Detail</div>', unsafe_allow_html=True)
+            route_df = build_route_depiction(config, buses)
+            for bus in buses:
+                bus_data = route_df[route_df["Bus"] == bus.bus_id].reset_index(drop=True)
+                if bus_data.empty: continue
+
+                rev = [t for t in bus.trips if t.trip_type == "Revenue"]
+                dead_km = sum(t.distance_km for t in bus.trips if t.trip_type == "Dead")
+                chg = [t for t in bus.trips if t.trip_type == "Charging"]
+                first = next((t.actual_departure for t in bus.trips if t.actual_departure), None)
+                last  = next((t.actual_arrival for t in reversed(bus.trips) if t.actual_arrival), None)
+
+                st.markdown(
+                    f'<div class="bus-header">'
+                    f'<span class="bus-pill">{bus.bus_id}</span>'
+                    f'{len(rev)} revenue trips &nbsp;·&nbsp; {bus.total_km:.1f} km &nbsp;·&nbsp;'
+                    f' SOC {bus.soc_percent:.1f}% final &nbsp;·&nbsp;'
+                    f' {first.strftime("%H:%M") if first else "?"} – {last.strftime("%H:%M") if last else "?"}'
+                    f'</div>', unsafe_allow_html=True,
+                )
+
+                display_rows = []
+                for _, row in bus_data.iterrows():
+                    t = row["_type"]; d = row["_dir"]
+                    marker = "🔋" if t=="Charging" else "⚫" if t=="Dead" else "🔵" if d=="UP" else "🟢"
+                    brk = row["Break"]
+                    display_rows.append({
+                        "": marker, "Dep": row["Dep"], "Arr": row["Arr"],
+                        "From": row["From"], "To": row["To"], "Type": row["Type"],
+                        "Dist": row["Dist"],
+                        "SOC": f'{row["SOC"]}{"⚠️" if row["SOC"] < 30 else ""}',
+                        "Break": f"{brk} min" if brk > 0 else "",
+                        "Dead KM": row["Dist"] if t == "Dead" else "",
+                    })
+
+                df_show = pd.DataFrame(display_rows)
+                st.dataframe(df_show, hide_index=True,
+                             height=min(420, 36 * len(df_show) + 38),
+                             column_config={"": st.column_config.TextColumn(width="small")})
+                st.caption(
+                    f"Dead KM: {dead_km:.1f} &nbsp;|&nbsp; "
+                    f"Charging: {len(chg)} stop{'s' if len(chg)!=1 else ''} &nbsp;|&nbsp; "
+                    f"Shift split: {config.shift_split}"
+                )
+                st.divider()
+
+        # ════════════════════════════════════════════════════════════════════
+        # TAB 2: Fleet Summary
+        # ════════════════════════════════════════════════════════════════════
+        with tab_fleet:
+            fleet_df = build_fleet_df(config, buses)
+            st.dataframe(fleet_df, hide_index=True, use_container_width=True)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown('<div class="section-title">KM per Bus</div>', unsafe_allow_html=True)
+                km_chart = fleet_df[["Bus","Revenue KM","Dead KM"]].set_index("Bus")
+                st.bar_chart(km_chart, color=["#4f46e5","#94a3b8"])
+            with col2:
+                st.markdown('<div class="section-title">Final SOC per Bus (%)</div>', unsafe_allow_html=True)
+                soc_chart = fleet_df[["Bus","Final SOC (%)"]].set_index("Bus")
+                st.bar_chart(soc_chart, color="#16a34a")
+
+            st.markdown('<div class="section-title">Departure Headways</div>', unsafe_allow_html=True)
+            st.caption("Time gaps between consecutive departures in the same direction. "
+                       "Irregular gaps are expected when bus cycle time ≠ fleet × headway — "
+                       "see Config tab to tune.")
+            hw_data = build_headway_chart_data(config, buses)
+            if not hw_data.empty:
+                col_up, col_dn = st.columns(2)
+                for col, direction, color in [(col_up, "UP", "#4f46e5"), (col_dn, "DN", "#16a34a")]:
+                    with col:
+                        dir_data = hw_data[hw_data["Direction"]==direction].sort_values("Departure")
+                        if len(dir_data) < 2: continue
+                        deps = dir_data["Departure"].tolist()
+                        gaps = [{"Dep": deps[i].strftime("%H:%M"),
+                                 "Headway (min)": round((deps[i]-deps[i-1]).total_seconds()/60)}
+                                for i in range(1, len(deps))]
+                        gdf = pd.DataFrame(gaps).set_index("Dep")
+                        st.markdown(f"**{direction}** headways")
+                        st.bar_chart(gdf, height=220, color=color)
+
+        # ════════════════════════════════════════════════════════════════════
+        # TAB 3: Full Schedule
+        # ════════════════════════════════════════════════════════════════════
+        with tab_schedule:
+            schedule_df = build_schedule_df(config, buses)
+            fc1, fc2, fc3 = st.columns(3)
+            with fc1:
+                type_filter = st.multiselect("Trip Type", ["Revenue","Dead","Charging"],
+                                             default=["Revenue","Dead","Charging"])
+            with fc2:
+                bus_filter = st.multiselect("Bus", config.bus_ids(), default=config.bus_ids())
+            with fc3:
+                dir_filter = st.multiselect("Direction", schedule_df["Direction"].unique().tolist(),
+                                            default=schedule_df["Direction"].unique().tolist())
+            filtered = schedule_df[
+                schedule_df["Type"].isin(type_filter) &
+                schedule_df["Bus"].isin(bus_filter) &
+                schedule_df["Direction"].isin(dir_filter)
+            ]
+            st.dataframe(filtered, hide_index=True, height=520, use_container_width=True)
+            st.caption(f"Showing {len(filtered)} of {len(schedule_df)} trips")
+
+        # ════════════════════════════════════════════════════════════════════
+        # TAB 4: Bus Detail
+        # ════════════════════════════════════════════════════════════════════
+        with tab_bus:
+            selected_bus = st.selectbox("Select Bus", config.bus_ids(), label_visibility="collapsed")
+            bus_obj = next(b for b in buses if b.bus_id == selected_bus)
+            bus_df = build_schedule_df(config, [bus_obj])
+            rev_count = len([t for t in bus_obj.trips if t.trip_type=="Revenue"])
+            dead_km = sum(t.distance_km for t in bus_obj.trips if t.trip_type=="Dead")
+            util = rev_count / max(1, len(bus_obj.trips)) * 100
+
+            st.markdown(
+                '<div class="kpi-grid">' +
+                kpi("Revenue Trips", str(rev_count)) +
+                kpi("Total KM", f"{bus_obj.total_km:.1f}") +
+                kpi("Dead KM", f"{dead_km:.1f}", "ok" if dead_km < 30 else "warn") +
+                kpi("Final SOC", f"{bus_obj.soc_percent:.1f}%",
+                    "ok" if bus_obj.soc_percent > 30 else "warn") +
+                kpi("Utilisation", f"{util:.0f}%",
+                    "ok" if util > 70 else "warn") +
+                '</div>', unsafe_allow_html=True,
             )
 
-        st.caption("Edit any value and click **Apply & Regenerate** — no re-upload needed.")
-        with st.form("config_edit_form"):
-            col_a, col_b = st.columns(2)
+            st.dataframe(bus_df, hide_index=True, height=380, use_container_width=True)
 
-            with col_a:
-                st.markdown("#### 🚍 Fleet & Battery")
-                new_fleet = st.number_input(
-                    "Fleet Size (0 = auto-detect minimum)",
-                    value=config.fleet_size, min_value=0, max_value=50, step=1,
-                    help="Set to 0 to let the scheduler find the minimum fleet that satisfies all P1-P6 rules.")
-                new_battery = st.number_input("Battery (kWh)", value=float(config.battery_kwh), min_value=10.0, step=10.0)
-                new_cons    = st.number_input("Consumption (kWh/km)", value=float(config.consumption_rate), min_value=0.1, step=0.1, format="%.2f")
-                new_init_soc= st.number_input("Initial SOC (%)", value=float(config.initial_soc_percent), min_value=20.0, max_value=100.0, step=5.0)
-                new_min_km  = st.number_input("Min KM per Bus (0=none)", value=float(config.min_km_per_bus), min_value=0.0, step=10.0)
-                new_avg_spd = st.number_input(
-                    "Average Speed (km/hr) — fallback when segment time is missing",
-                    value=float(getattr(config, "avg_speed_kmph", 30.0)),
-                    min_value=5.0, max_value=120.0, step=5.0,
-                    help="Used by the distance engine to estimate travel time when a segment's time is not in the Excel.")
+            soc_data = bus_df[bus_df["Departure"] != ""][["Departure","SOC (%)"]].set_index("Departure")
+            if not soc_data.empty:
+                st.markdown('<div class="section-title">SOC Progression</div>', unsafe_allow_html=True)
+                st.line_chart(soc_data, color="#4f46e5")
 
-                st.markdown("#### ⏰ Operating Hours")
-                new_op_start = st.text_input("Start (HH:MM)", value=config.operating_start.strftime("%H:%M"))
-                new_op_end   = st.text_input("End (HH:MM)",   value=config.operating_end.strftime("%H:%M"))
-                new_shift    = st.text_input("Shift Split (HH:MM)", value=config.shift_split.strftime("%H:%M"))
+        # ════════════════════════════════════════════════════════════════════
+        # TAB 5: Config
+        # ════════════════════════════════════════════════════════════════════
+        with tab_config:
+            # Auto-fleet detection banner
+            if st.session_state.get("auto_fleet_mode"):
+                detected_n = st.session_state.get("detected_fleet_size", "?")
+                st.success(
+                    f"🚌 **Auto Fleet Detection:** Your Excel had fleet_size = 0. "
+                    f"The scheduler found that **{detected_n} buses** are the minimum required "
+                    f"to serve all trips while satisfying P1–P6. "
+                    f"You can lock this value below and regenerate."
+                )
 
-            with col_b:
-                st.markdown("#### 🔋 Charging")
-                new_depot_kw    = st.number_input("Depot Charger (kW)", value=float(config.depot_charger_kw), min_value=0.0, step=10.0)
-                new_depot_eff   = st.number_input("Depot Efficiency (0–1)", value=float(config.depot_charger_efficiency), min_value=0.0, max_value=1.0, step=0.05, format="%.2f")
-                new_trigger_soc = st.number_input(
-                    "Charge Trigger SOC (%)",
-                    value=float(config.trigger_soc_percent), min_value=20.0, max_value=100.0, step=5.0,
-                    help="SOC level below which the scheduler sends a bus for a reactive charge stop.")
-                new_target_soc  = st.number_input("Charge Target SOC (%)", value=float(config.target_soc_percent), min_value=20.0, max_value=100.0, step=5.0)
-                new_midday_soc  = st.number_input(
-                    "Midday Charge Trigger SOC (%) — P5",
-                    value=float(getattr(config, "midday_charge_soc_percent", 65.0)),
-                    min_value=20.0, max_value=100.0, step=5.0,
-                    help="Bus must be below this SOC to be sent for midday charging (P5 window 12:00-15:00). Fleet > 10 waives this rule.")
+            st.caption("Edit any value and click **Apply & Regenerate** — no re-upload needed.")
+            with st.form("config_edit_form"):
+                col_a, col_b = st.columns(2)
 
-                st.markdown("#### 🔁 Break & Layover")
-                new_pref_layover = st.number_input(
-                    "Min Driver Break (min) — P4",
-                    value=int(config.preferred_layover_min), min_value=1, step=1,
-                    help="Minimum break enforced between every pair of revenue trips (P4).")
-                new_max_layover  = st.number_input(
-                    "Max Layover (min) — P4 upper bound",
-                    value=int(getattr(config, "max_layover_min", 20)),
-                    min_value=1, max_value=120, step=1,
-                    help="Maximum allowed gap between revenue trips. Replaces the hardcoded 20-minute ceiling.")
-                new_off_peak_extra = st.number_input(
-                    "Off-Peak Extra Break (min) — 11:00–16:00",
-                    value=int(getattr(config, "off_peak_layover_extra_min", 0)),
-                    min_value=0, max_value=60, step=1,
-                    help="Added on top of Min Driver Break during off-peak hours to widen headways. Capped at Max Layover.")
-                new_min_layover  = st.number_input("Min Terminus Layover (min)", value=int(config.min_layover_min), min_value=0, step=1)
-                new_dead_buf     = st.number_input("Dead Run Buffer (min)", value=int(config.dead_run_buffer_min), min_value=0, step=1)
-                new_adj_buf      = st.number_input(
-                    "Break Adjustment Buffer (min)",
-                    value=int(config.max_headway_deviation_min), min_value=0, step=1,
-                    help="Max minutes the safety-net pass can shift a trip to enforce the driver break.")
+                with col_a:
+                    st.markdown("#### 🚍 Fleet & Battery")
+                    new_fleet = st.number_input(
+                        "Fleet Size (0 = auto-detect minimum)",
+                        value=config.fleet_size, min_value=0, max_value=50, step=1,
+                        help="Set to 0 to let the scheduler find the minimum fleet that satisfies all P1-P6 rules.")
+                    new_battery = st.number_input("Battery (kWh)", value=float(config.battery_kwh), min_value=10.0, step=10.0)
+                    new_cons    = st.number_input("Consumption (kWh/km)", value=float(config.consumption_rate), min_value=0.1, step=0.1, format="%.2f")
+                    new_init_soc= st.number_input("Initial SOC (%)", value=float(config.initial_soc_percent), min_value=20.0, max_value=100.0, step=5.0)
+                    new_min_km  = st.number_input("Min KM per Bus (0=none)", value=float(config.min_km_per_bus), min_value=0.0, step=10.0)
+                    new_avg_spd = st.number_input(
+                        "Average Speed (km/hr) — fallback when segment time is missing",
+                        value=float(getattr(config, "avg_speed_kmph", 30.0)),
+                        min_value=5.0, max_value=120.0, step=5.0,
+                        help="Used by the distance engine to estimate travel time when a segment's time is not in the Excel.")
 
-            # Segment distances (read-only)
-            with st.expander("📍 Segment Distances & Times (read-only)"):
-                seg_rows = [{"Segment": k, "Distance (km)": d,
-                             "Time (min)": config.segment_times.get(k, 0)}
-                            for k, d in sorted(config.segment_distances.items())]
-                st.dataframe(pd.DataFrame(seg_rows), hide_index=True)
+                    st.markdown("#### ⏰ Operating Hours")
+                    new_op_start = st.text_input("Start (HH:MM)", value=config.operating_start.strftime("%H:%M"))
+                    new_op_end   = st.text_input("End (HH:MM)",   value=config.operating_end.strftime("%H:%M"))
+                    new_shift    = st.text_input("Shift Split (HH:MM)", value=config.shift_split.strftime("%H:%M"))
 
-            apply_btn = st.form_submit_button("🔄 Apply & Regenerate", type="primary")
+                with col_b:
+                    st.markdown("#### 🔋 Charging")
+                    new_depot_kw    = st.number_input("Depot Charger (kW)", value=float(config.depot_charger_kw), min_value=0.0, step=10.0)
+                    new_depot_eff   = st.number_input("Depot Efficiency (0–1)", value=float(config.depot_charger_efficiency), min_value=0.0, max_value=1.0, step=0.05, format="%.2f")
+                    new_trigger_soc = st.number_input(
+                        "Charge Trigger SOC (%)",
+                        value=float(config.trigger_soc_percent), min_value=20.0, max_value=100.0, step=5.0,
+                        help="SOC level below which the scheduler sends a bus for a reactive charge stop.")
+                    new_target_soc  = st.number_input("Charge Target SOC (%)", value=float(config.target_soc_percent), min_value=20.0, max_value=100.0, step=5.0)
+                    new_midday_soc  = st.number_input(
+                        "Midday Charge Trigger SOC (%) — P5",
+                        value=float(getattr(config, "midday_charge_soc_percent", 65.0)),
+                        min_value=20.0, max_value=100.0, step=5.0,
+                        help="Bus must be below this SOC to be sent for midday charging (P5 window 12:00-15:00). Fleet > 10 waives this rule.")
 
-        if apply_btn:
-            def _pt(s):
-                try: h, m = s.strip().split(":"); return dtime(int(h), int(m))
-                except: return None
+                    st.markdown("#### 🔁 Break & Layover")
+                    new_pref_layover = st.number_input(
+                        "Min Driver Break (min) — P4",
+                        value=int(config.preferred_layover_min), min_value=1, step=1,
+                        help="Minimum break enforced between every pair of revenue trips (P4).")
+                    new_max_layover  = st.number_input(
+                        "Max Layover (min) — P4 upper bound",
+                        value=int(getattr(config, "max_layover_min", 20)),
+                        min_value=1, max_value=120, step=1,
+                        help="Maximum allowed gap between revenue trips. Replaces the hardcoded 20-minute ceiling.")
+                    new_off_peak_extra = st.number_input(
+                        "Off-Peak Extra Break (min) — 11:00–15:00",
+                        value=int(getattr(config, "off_peak_layover_extra_min", 0)),
+                        min_value=0, max_value=60, step=1,
+                        help="Added on top of Min Driver Break during off-peak hours to widen headways. Capped at Max Layover.")
+                    new_min_layover  = st.number_input("Min Terminus Layover (min)", value=int(config.min_layover_min), min_value=0, step=1)
+                    new_dead_buf     = st.number_input("Dead Run Buffer (min)", value=int(config.dead_run_buffer_min), min_value=0, step=1)
+                    new_adj_buf      = st.number_input(
+                        "Break Adjustment Buffer (min)",
+                        value=int(config.max_headway_deviation_min), min_value=0, step=1,
+                        help="Max minutes the safety-net pass can shift a trip to enforce the driver break.")
 
-            overrides = {
-                "fleet_size": new_fleet, "battery_kwh": new_battery,
-                "consumption_rate": new_cons, "initial_soc_percent": new_init_soc,
-                "min_km_per_bus": new_min_km, "avg_speed_kmph": new_avg_spd,
-                "depot_charger_kw": new_depot_kw, "depot_charger_efficiency": new_depot_eff,
-                "trigger_soc_percent": new_trigger_soc, "target_soc_percent": new_target_soc,
-                "midday_charge_soc_percent": new_midday_soc,
-                "preferred_layover_min": new_pref_layover, "max_layover_min": new_max_layover,
-                "off_peak_layover_extra_min": new_off_peak_extra,
-                "min_layover_min": new_min_layover, "dead_run_buffer_min": new_dead_buf,
-                "max_headway_deviation_min": new_adj_buf,
-            }
-            for key, val in [("operating_start", new_op_start),
-                              ("operating_end", new_op_end), ("shift_split", new_shift)]:
-                t = _pt(val)
-                if t: overrides[key] = t
+                # Segment distances (read-only)
+                with st.expander("📍 Segment Distances & Times (read-only)"):
+                    seg_rows = [{"Segment": k, "Distance (km)": d,
+                                 "Time (min)": config.segment_times.get(k, 0)}
+                                for k, d in sorted(config.segment_distances.items())]
+                    st.dataframe(pd.DataFrame(seg_rows), hide_index=True)
 
-            with st.spinner("Regenerating..."):
+                # Headway profile (editable) ─────────────────────────────────────
+                st.markdown("#### 🕐 Headway Profile")
+                st.caption(
+                    "Edit **Headway (min)** per time band. "
+                    "Time columns are read-only. "
+                    "Changes take effect when you click Apply & Regenerate."
+                )
+                _hw_src = st.session_state.get("raw_headway_df", pd.DataFrame())
+                if not _hw_src.empty:
+                    edited_hw_df = st.data_editor(
+                        _hw_src[["time_from", "time_to", "headway_min"]].copy(),
+                        column_config={
+                            "time_from": st.column_config.TextColumn("From", disabled=True),
+                            "time_to":   st.column_config.TextColumn("To",   disabled=True),
+                            "headway_min": st.column_config.NumberColumn(
+                                "Headway (min)", min_value=5, max_value=120, step=1,
+                                help=(
+                                    "Minimum gap (minutes) between consecutive same-direction "
+                                    "departures from the same terminal in this time band. "
+                                    "Applies fleet-wide."
+                                ),
+                            ),
+                        },
+                        hide_index=True,
+                        use_container_width=True,
+                        num_rows="fixed",
+                        key="headway_editor",
+                    )
+                else:
+                    edited_hw_df = None
+                    st.caption("Run a schedule first to enable headway editing.")
+
+                apply_btn = st.form_submit_button("🔄 Apply & Regenerate", type="primary")
+
+            if apply_btn:
+                def _pt(s):
+                    try: h, m = s.strip().split(":"); return dtime(int(h), int(m))
+                    except: return None
+
+                overrides = {
+                    "fleet_size": new_fleet, "battery_kwh": new_battery,
+                    "consumption_rate": new_cons, "initial_soc_percent": new_init_soc,
+                    "min_km_per_bus": new_min_km, "avg_speed_kmph": new_avg_spd,
+                    "depot_charger_kw": new_depot_kw, "depot_charger_efficiency": new_depot_eff,
+                    "trigger_soc_percent": new_trigger_soc, "target_soc_percent": new_target_soc,
+                    "midday_charge_soc_percent": new_midday_soc,
+                    "preferred_layover_min": new_pref_layover, "max_layover_min": new_max_layover,
+                    "off_peak_layover_extra_min": new_off_peak_extra,
+                    "min_layover_min": new_min_layover, "dead_run_buffer_min": new_dead_buf,
+                    "max_headway_deviation_min": new_adj_buf,
+                }
+                for key, val in [("operating_start", new_op_start),
+                                  ("operating_end", new_op_end), ("shift_split", new_shift)]:
+                    t = _pt(val)
+                    if t: overrides[key] = t
+
+                hw_overrides = edited_hw_df.copy() if edited_hw_df is not None else None
+
+                with st.spinner("Regenerating..."):
+                    try:
+                        result = rerun_from_overrides(overrides, headway_overrides=hw_overrides)
+                    except Exception as e:
+                        st.error(f"Error: {e}"); result = None
+
+                if result:
+                    new_cfg, new_buses, new_metrics, new_trips, new_out, new_comp = result
+                    st.session_state["prev_compliance"] = st.session_state.get("compliance")
+                    st.session_state.update({
+                        "config": new_cfg, "buses": new_buses, "metrics": new_metrics,
+                        "trips": new_trips, "output_bytes": new_out, "compliance": new_comp,
+                    })
+                    st.success("✅ Regenerated! Switch tabs to see updated results.")
+                    st.rerun()
+
+
+
+elif app_mode == "🏙️ Citywide":
+    # ═══════════════════════════════ CITYWIDE ════════════════════════════════════
+
+    if not st.session_state.get("has_city_results") and not uploaded_files:
+        st.markdown("## Welcome to Citywide eBus Scheduler")
+        st.markdown("Upload config Excel files for each route in the sidebar. "
+                    "The system will schedule all routes and rebalance fleet across them.")
+        c1, c2, c3, c4 = st.columns(4)
+        icons = ["📁", "⚡", "🔄", "📊"]
+        steps = [
+            ("Upload", "Drop config Excel files — one per route. Same format as single-route scheduler."),
+            ("Schedule", "Each route scheduled independently using its headway & travel time profiles."),
+            ("Rebalance", "Surplus buses from over-allocated routes transferred to under-served routes."),
+            ("Review", "Citywide KPIs, per-route drill-down, fleet transfer summary."),
+        ]
+        for col, (icon, (title, desc)) in zip([c1, c2, c3, c4], zip(icons, steps)):
+            with col:
+                st.markdown(f"### {icon} {title}")
+                st.caption(desc)
+
+    if city_run_btn and uploaded_files:
+        with st.spinner("Loading configs and generating citywide schedule..."):
+            try:
+                city_config, load_warnings = load_city_config_from_files(uploaded_files)
+                if total_fleet_override > 0:
+                    city_config.total_fleet = total_fleet_override
+                city_result = schedule_city(city_config, optimize=city_optimize)
+            except ConfigError as e:
+                st.error(f"Config error: {e}"); st.stop()
+            except Exception as e:
+                st.error(f"Error: {e}"); import traceback; st.code(traceback.format_exc()); st.stop()
+        st.session_state["city_result"] = city_result
+        st.session_state["city_config"] = city_config
+        st.session_state["load_warnings"] = load_warnings
+        st.session_state["has_city_results"] = True
+
+    if not st.session_state.get("has_city_results"):
+        if uploaded_files:
+            st.info("Click **▶ Generate Citywide Schedule** in the sidebar to run.")
+        st.stop()
+
+    cs: CitySchedule = st.session_state["city_result"]
+    city_cfg: CityConfig = st.session_state["city_config"]
+    load_warnings = st.session_state.get("load_warnings", [])
+
+    if load_warnings:
+        with st.expander(f"⚠ {len(load_warnings)} loading warning(s)", expanded=False):
+            for w in load_warnings:
+                st.warning(w)
+
+    mode_label = "⚡ Efficiency-Maximising" if city_optimize else "📋 Planning-Compliant"
+    st.markdown(f"## 🏙️ Citywide Schedule — {len(cs.results)} Routes")
+    st.caption(f"Mode: **{mode_label}** · Depot: **{city_cfg.depot_name}**")
+    if city_optimize:
+        st.info("⚡ **Efficiency-Maximising mode**: minimum feasible fleet per route. "
+                "Headway profile is ignored — use for capacity planning only.", icon="⚡")
+    else:
+        st.info("📋 **Planning-Compliant mode**: headway profile respected. "
+                "Surplus buses redistributed to deficit routes based on time-sliced PVR.", icon="📋")
+
+    # Citywide KPIs
+    st.markdown(
+        '<div class="kpi-grid">' +
+        kpi("Routes", str(len(cs.results))) +
+        kpi("Total Fleet", str(cs.total_buses_used),
+            sub=f"configured: {city_cfg.total_configured_fleet}") +
+        kpi("Revenue Trips", str(cs.total_revenue_trips)) +
+        kpi("Revenue KM", f"{cs.total_revenue_km:,.0f}") +
+        kpi("Dead KM %", f"{cs.citywide_dead_km_ratio:.1%}",
+            "ok" if cs.citywide_dead_km_ratio < 0.15 else "warn") +
+        kpi("Min SOC", f"{cs.min_soc_citywide:.1f}%",
+            "ok" if cs.min_soc_citywide >= 25 else "warn" if cs.min_soc_citywide >= 20 else "bad") +
+        kpi("Utilization", f"{cs.citywide_utilization_pct:.0f}%",
+            "ok" if cs.citywide_utilization_pct >= 85 else "warn") +
+        kpi("Transfers", str(len(cs.transfers)),
+            "ok" if len(cs.transfers) == 0 else "warn") +
+        '</div>', unsafe_allow_html=True,
+    )
+
+    tab_overview, tab_rebalance, tab_pvr, tab_headways, tab_route_detail, tab_fleet_config, tab_stability = st.tabs([
+        "📊 Overview", "🔄 Fleet Rebalancing", "📐 PVR Analysis",
+        "📈 Headways", "🗺 Route Detail", "⚙️ Fleet Config", "🔍 Stability",
+    ])
+
+    # ── CITY TAB 1: Overview ──────────────────────────────────────────────────
+    with tab_overview:
+        st.markdown('<div class="section-title">Route Summary</div>', unsafe_allow_html=True)
+        summary_df = pd.DataFrame(cs.route_summary_rows())
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+        if _PLOTLY_OK and len(cs.results) > 1:
+            st.markdown('<div class="section-title">Fleet Allocation: PVR vs Allocated</div>',
+                        unsafe_allow_html=True)
+            codes = sorted(cs.results.keys())
+            fig = go.Figure()
+            fig.add_trace(go.Bar(name="PVR (minimum)", x=codes,
+                                 y=[cs.results[c].pvr for c in codes], marker_color="#94a3b8"))
+            fig.add_trace(go.Bar(name="Config Fleet", x=codes,
+                                 y=[cs.results[c].fleet_original for c in codes], marker_color="#c7d2fe"))
+            fig.add_trace(go.Bar(name="Final Allocated", x=codes,
+                                 y=[cs.results[c].fleet_allocated for c in codes], marker_color="#4f46e5"))
+            fig.update_layout(barmode="group", height=350,
+                              legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.5, xanchor="center"),
+                              margin=dict(l=40, r=20, t=20, b=40), plot_bgcolor="white")
+            st.plotly_chart(fig, use_container_width=True)
+
+        if _PLOTLY_OK and len(cs.results) > 1:
+            st.markdown('<div class="section-title">Dead KM % by Route</div>', unsafe_allow_html=True)
+            codes = sorted(cs.results.keys())
+            dead_pcts = [cs.results[c].metrics.dead_km_ratio * 100 for c in codes]
+            fig2 = go.Figure(go.Bar(x=codes, y=dead_pcts, marker_color=[
+                "#16a34a" if d < 15 else "#d97706" if d < 25 else "#dc2626" for d in dead_pcts]))
+            fig2.update_layout(height=280, yaxis_title="Dead KM %",
+                               margin=dict(l=40, r=20, t=20, b=40), plot_bgcolor="white")
+            st.plotly_chart(fig2, use_container_width=True)
+
+    # ── CITY TAB 2: Fleet Rebalancing ─────────────────────────────────────────
+    with tab_rebalance:
+        if not cs.transfers:
+            st.success("✅ No fleet rebalancing needed — all routes adequately staffed.")
+        else:
+            st.markdown(f'<div class="section-title">Fleet Transfers ({len(cs.transfers)})</div>',
+                        unsafe_allow_html=True)
+            for t in cs.transfers:
+                st.markdown(
+                    f'<div class="transfer-card">'
+                    f'<strong>{t.from_route}</strong> '
+                    f'<span class="transfer-arrow">→</span> '
+                    f'<strong>{t.to_route}</strong> '
+                    f'<span style="color:#666; font-size:0.85rem; margin-left:8px;">({t.reason})</span>'
+                    f'</div>', unsafe_allow_html=True)
+
+            st.markdown('<div class="section-title">Before & After</div>', unsafe_allow_html=True)
+            ba_rows = []
+            for code in sorted(cs.results):
+                r = cs.results[code]
+                donated = sum(1 for t in cs.transfers if t.from_route == code)
+                received = sum(1 for t in cs.transfers if t.to_route == code)
+                change = received - donated
+                ba_rows.append({"Route": code, "PVR": r.pvr, "Before": r.fleet_original,
+                                "After": r.fleet_allocated,
+                                "Change": f"+{change}" if change > 0 else str(change) if change < 0 else "—",
+                                "Donated": donated, "Received": received})
+            st.dataframe(pd.DataFrame(ba_rows), use_container_width=True, hide_index=True)
+
+        st.markdown('<div class="section-title">Fleet Balance Analysis (PVR-based)</div>',
+                    unsafe_allow_html=True)
+        balance = compute_fleet_balance(city_cfg)
+        bal_df = pd.DataFrame([
+            {"Route": code, "PVR": b["pvr"], "Allocated": b["allocated"],
+             "Surplus": b["surplus"] if b["surplus"] > 0 else "",
+             "Deficit": b["deficit"] if b["deficit"] > 0 else "",
+             "Headroom %": f"{b['headroom_pct']:+.0f}%"}
+            for code, b in sorted(balance.items())
+        ])
+        st.dataframe(bal_df, use_container_width=True, hide_index=True)
+
+    # ── CITY TAB 3: PVR Analysis ──────────────────────────────────────────────
+    with tab_pvr:
+        st.caption(
+            "**PVR (Peak)** — minimum buses at tightest headway band, drives rebalancing.  "
+            "**PVR (Off-Peak)** — minimum buses during 11:00–15:00.  "
+            "**PVR (Charging)** — conservative upper bound during P5 midday charging (+25%)."
+        )
+        try:
+            slices_all = compute_pvr_slices_all(city_cfg)
+            pvr_rows   = [s.as_dict() for s in slices_all.values()]
+            pvr_df     = pd.DataFrame(pvr_rows)
+            alloc_map  = {code: r.fleet_allocated for code, r in cs.results.items()}
+            pvr_df["Allocated"] = pvr_df["Route"].map(alloc_map)
+            pvr_df["vs PVR Peak"] = pvr_df.apply(
+                lambda row: (
+                    f"+{row['Allocated'] - row['PVR (Peak)']} surplus"
+                    if row["Allocated"] > row["PVR (Peak)"]
+                    else (f"{row['Allocated'] - row['PVR (Peak)']} deficit"
+                          if row["Allocated"] < row["PVR (Peak)"] else "✅ exact")
+                ), axis=1
+            )
+            st.dataframe(pvr_df, hide_index=True, use_container_width=True)
+
+            if _PLOTLY_OK and len(cs.results) > 1:
+                st.markdown('<div class="section-title">Fleet vs PVR Slices</div>',
+                            unsafe_allow_html=True)
+                codes = sorted(cs.results.keys())
+                fig_pvr = go.Figure()
+                fig_pvr.add_trace(go.Bar(name="PVR (Peak)",     x=codes,
+                    y=[slices_all[c].pvr_peak     for c in codes], marker_color="#dc2626"))
+                fig_pvr.add_trace(go.Bar(name="PVR (Off-Peak)", x=codes,
+                    y=[slices_all[c].pvr_offpeak  for c in codes], marker_color="#f97316"))
+                fig_pvr.add_trace(go.Bar(name="PVR (Charging)", x=codes,
+                    y=[slices_all[c].pvr_charging for c in codes], marker_color="#fbbf24"))
+                fig_pvr.add_trace(go.Bar(name="Allocated",      x=codes,
+                    y=[alloc_map.get(c, 0)        for c in codes], marker_color="#4f46e5"))
+                fig_pvr.update_layout(
+                    barmode="group", height=350,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.5, xanchor="center"),
+                    margin=dict(l=40, r=20, t=20, b=40), plot_bgcolor="white",
+                )
+                st.plotly_chart(fig_pvr, use_container_width=True)
+        except Exception as e:
+            st.warning(f"PVR analysis unavailable: {e}")
+
+    # ── CITY TAB 4: Headways (per-route selector) ─────────────────────────────
+    with tab_headways:
+        st.caption(
+            "Departure gaps between consecutive same-direction buses. "
+            "Select a route to inspect actual vs configured headways."
+        )
+        hw_route_codes = sorted(cs.results.keys())
+        selected_hw_route = st.selectbox(
+            "Route", hw_route_codes,
+            format_func=lambda c: f"{c} — {cs.results[c].config.route_name}",
+            key="city_hw_route",
+        )
+        if selected_hw_route:
+            rr_hw  = cs.results[selected_hw_route]
+            hw_data = build_headway_chart_data(rr_hw.config, rr_hw.buses)
+            if hw_data.empty:
+                st.info("No revenue trips found for this route.")
+            else:
+                col_up, col_dn = st.columns(2)
+                for col, direction, color in [
+                    (col_up, "UP", "#4f46e5"),
+                    (col_dn, "DN", "#16a34a"),
+                ]:
+                    with col:
+                        dir_data = hw_data[hw_data["Direction"] == direction].sort_values("Departure")
+                        if len(dir_data) < 2:
+                            st.caption(f"**{direction}** — fewer than 2 departures.")
+                            continue
+                        deps = dir_data["Departure"].tolist()
+                        gaps = [
+                            {"Dep": deps[i].strftime("%H:%M"),
+                             "Headway (min)": round((deps[i] - deps[i-1]).total_seconds() / 60)}
+                            for i in range(1, len(deps))
+                        ]
+                        gdf = pd.DataFrame(gaps).set_index("Dep")
+                        st.markdown(f"**{direction}** headways — {selected_hw_route}")
+                        st.bar_chart(gdf, height=260, color=color)
+
+                with st.expander("📋 Configured headway profile"):
+                    st.dataframe(rr_hw.headway_df, hide_index=True, use_container_width=True)
+
+    # ── CITY TAB 6: Route Detail (drill-down with full Gantt) ─────────────────
+    with tab_route_detail:
+        route_codes = sorted(cs.results.keys())
+        selected_route = st.selectbox("Select Route", route_codes,
+                                      format_func=lambda c: f"{c} — {cs.results[c].config.route_name}")
+        if selected_route:
+            r = cs.results[selected_route]
+            m = r.metrics
+            st.markdown(f"### {r.route_code} — {r.config.route_name}")
+
+            shuttle_ct = sum(1 for b in r.buses for t in b.trips if t.trip_type == "Shuttle")
+            dead_ct = sum(1 for b in r.buses for t in b.trips if t.trip_type == "Dead")
+            st.markdown(
+                '<div class="kpi-grid">' +
+                kpi("Fleet", f"{r.fleet_allocated}",
+                    sub=f"config: {r.fleet_original} · PVR: {r.pvr}") +
+                kpi("Rev Trips", str(m.revenue_trips_assigned),
+                    sub=f"of {m.revenue_trips_total} planned") +
+                kpi("Total KM", f"{m.total_km:.0f}") +
+                kpi("Dead %", f"{m.dead_km_ratio:.1%}",
+                    "ok" if m.dead_km_ratio < 0.15 else "warn") +
+                kpi("Min SOC", f"{m.min_soc_seen:.1f}%",
+                    "ok" if m.min_soc_seen >= 25 else "warn") +
+                kpi("KM Range", f"{m.km_range:.1f}") +
+                kpi("Score", f"{m.weighted_score():.4f}") +
+                '</div>', unsafe_allow_html=True)
+
+            # Reuse the full Gantt diagram from single-route mode
+            if _PLOTLY_OK:
+                st.markdown('<div class="section-title">Schedule Timeline</div>',
+                            unsafe_allow_html=True)
                 try:
-                    result = rerun_from_overrides(overrides)
+                    gantt_fig = build_route_diagram(r.config, r.buses)
+                    st.plotly_chart(gantt_fig, use_container_width=True)
                 except Exception as e:
-                    st.error(f"Error: {e}"); result = None
+                    st.warning(f"Could not render route diagram: {e}")
 
-            if result:
-                new_cfg, new_buses, new_metrics, new_trips, new_out, new_comp = result
-                st.session_state["prev_compliance"] = st.session_state.get("compliance")
-                st.session_state.update({
-                    "config": new_cfg, "buses": new_buses, "metrics": new_metrics,
-                    "trips": new_trips, "output_bytes": new_out, "compliance": new_comp,
+            st.markdown('<div class="section-title">Bus Summary</div>', unsafe_allow_html=True)
+            bus_rows = []
+            for bus in r.buses:
+                rev_trips = [t for t in bus.trips if t.trip_type == "Revenue"]
+                bus_rows.append({
+                    "Bus": bus.bus_id, "Total Trips": len(bus.trips),
+                    "Revenue": len(rev_trips),
+                    "Dead": sum(1 for t in bus.trips if t.trip_type == "Dead"),
+                    "Charging": sum(1 for t in bus.trips if t.trip_type == "Charging"),
+                    "Total KM": round(bus.total_km, 1),
+                    "Final SOC": f"{bus.soc_percent:.1f}%",
+                    "Last Location": bus.current_location,
                 })
-                st.success("✅ Regenerated! Switch tabs to see updated results.")
-                st.rerun()
+            st.dataframe(pd.DataFrame(bus_rows), use_container_width=True, hide_index=True)
+
+            with st.expander("📋 Full Trip Schedule"):
+                trip_rows = []
+                for bus in r.buses:
+                    for trip in bus.trips:
+                        trip_rows.append({
+                            "Bus": trip.assigned_bus, "Type": trip.trip_type,
+                            "Dir": trip.direction, "From": trip.start_location,
+                            "To": trip.end_location,
+                            "Depart": trip.actual_departure.strftime("%H:%M") if trip.actual_departure else "",
+                            "Arrive": trip.actual_arrival.strftime("%H:%M") if trip.actual_arrival else "",
+                            "KM": round(trip.distance_km, 1),
+                        })
+                if trip_rows:
+                    st.dataframe(pd.DataFrame(trip_rows).sort_values("Depart"),
+                                 use_container_width=True, hide_index=True)
+
+            # Per-bus trip detail tables (same as single-route tab)
+            st.divider()
+            st.markdown('<div class="section-title">Per-Bus Trip Detail</div>', unsafe_allow_html=True)
+            route_dep_df = build_route_depiction(r.config, r.buses)
+            for bus in r.buses:
+                bus_data = route_dep_df[route_dep_df["Bus"] == bus.bus_id].reset_index(drop=True)
+                if bus_data.empty: continue
+                rev = [t for t in bus.trips if t.trip_type == "Revenue"]
+                dead_km_bus = sum(t.distance_km for t in bus.trips if t.trip_type == "Dead")
+                chg = [t for t in bus.trips if t.trip_type == "Charging"]
+                first = next((t.actual_departure for t in bus.trips if t.actual_departure), None)
+                last  = next((t.actual_arrival for t in reversed(bus.trips) if t.actual_arrival), None)
+                st.markdown(
+                    f'<div class="bus-header">'
+                    f'<span class="bus-pill">{bus.bus_id}</span>'
+                    f'{len(rev)} revenue trips &nbsp;·&nbsp; {bus.total_km:.1f} km &nbsp;·&nbsp;'
+                    f' SOC {bus.soc_percent:.1f}% final &nbsp;·&nbsp;'
+                    f' {first.strftime("%H:%M") if first else "?"} – {last.strftime("%H:%M") if last else "?"}'
+                    f'</div>', unsafe_allow_html=True)
+                display_rows = []
+                for _, row in bus_data.iterrows():
+                    tp = row["_type"]; dr = row["_dir"]
+                    marker = "🔋" if tp=="Charging" else "⚫" if tp=="Dead" else "🔵" if dr=="UP" else "🟢"
+                    brk = row["Break"]
+                    display_rows.append({
+                        "": marker, "Dep": row["Dep"], "Arr": row["Arr"],
+                        "From": row["From"], "To": row["To"], "Type": row["Type"],
+                        "Dist": row["Dist"],
+                        "SOC": f'{row["SOC"]}{"⚠️" if row["SOC"] < 30 else ""}',
+                        "Break": f"{brk} min" if brk > 0 else "",
+                    })
+                st.dataframe(pd.DataFrame(display_rows), hide_index=True,
+                             height=min(420, 36 * len(display_rows) + 38),
+                             column_config={"": st.column_config.TextColumn(width="small")})
+                st.divider()
+
+    # ── CITY TAB 7: Fleet Config Editor ───────────────────────────────────────
+    with tab_fleet_config:
+        st.markdown('<div class="section-title">Adjust Fleet Size per Route</div>',
+                    unsafe_allow_html=True)
+        st.caption("Edit fleet sizes below and click Re-run to regenerate with updated allocation.")
+        pvrs = compute_pvr_all(city_cfg)
+        edit_rows = []
+        for code in sorted(city_cfg.routes.keys()):
+            ri = city_cfg.routes[code]
+            edit_rows.append({
+                "Route": code, "Name": ri.config.route_name,
+                "Fleet Size": ri.config.fleet_size,
+                "PVR": pvrs.get(code, 0),
+                "Operating": f"{ri.config.operating_start.strftime('%H:%M')}–{ri.config.operating_end.strftime('%H:%M')}",
+                "Peak Headway": int(ri.headway_df["headway_min"].min()) if len(ri.headway_df) > 0 else 30,
+            })
+        edit_df = pd.DataFrame(edit_rows)
+        edited = st.data_editor(
+            edit_df,
+            column_config={
+                "Route": st.column_config.TextColumn(disabled=True),
+                "Name": st.column_config.TextColumn(disabled=True),
+                "Fleet Size": st.column_config.NumberColumn(min_value=1, max_value=30, step=1),
+                "PVR": st.column_config.NumberColumn(disabled=True),
+                "Operating": st.column_config.TextColumn(disabled=True),
+                "Peak Headway": st.column_config.NumberColumn(disabled=True),
+            },
+            use_container_width=True, hide_index=True,
+        )
+        total_edited = edited["Fleet Size"].sum()
+        st.caption(f"**Total fleet: {total_edited}** (configured: {city_cfg.total_configured_fleet})")
+
+        if st.button("🔄 Re-run with Updated Fleet", type="primary"):
+            for _, row in edited.iterrows():
+                code = row["Route"]
+                new_fleet = int(row["Fleet Size"])
+                if code in city_cfg.routes:
+                    city_cfg.routes[code].config.fleet_size = new_fleet
+            city_cfg.total_fleet = int(total_edited)
+            with st.spinner("Re-running citywide schedule..."):
+                try:
+                    city_result = schedule_city(city_cfg, optimize=city_optimize)
+                    st.session_state["city_result"] = city_result
+                    st.session_state["city_config"] = city_cfg
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+    # ── CITY TAB 8: Stability ─────────────────────────────────────────────────
+    with tab_stability:
+        st.caption(
+            "Post-rebalance PVR stability check. "
+            "A **drift > 0.5** means the re-run shifted cycle time enough to change the PVR, "
+            "making the transfer plan potentially stale. Re-running the citywide scheduler resolves this."
+        )
+        stability_flags = getattr(cs, "stability_flags", [])
+        if not stability_flags:
+            st.info("Stability check not applicable in Efficiency-Maximising mode, "
+                    "or no transfers were needed.")
+        else:
+            flag_rows = [f.as_dict() for f in stability_flags]
+            flag_df   = pd.DataFrame(flag_rows)
+            unstable  = flag_df[flag_df["Status"] == "⚠️ Drifted"]
+            if unstable.empty:
+                st.success("✅ All routes stable — no PVR drift detected after rebalancing.")
+            else:
+                st.warning(
+                    f"⚠️ {len(unstable)} route(s) show PVR drift > 0.5. "
+                    "Consider re-running the citywide schedule to stabilise."
+                )
+            st.dataframe(flag_df, hide_index=True, use_container_width=True)
