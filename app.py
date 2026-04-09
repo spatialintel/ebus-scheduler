@@ -734,7 +734,8 @@ with st.sidebar:
                  "Off = Planning-Compliant: follows headway profile strictly.",
         )
         if optimize:
-            st.info("⚡ **Efficiency-Maximising** — minimum fleet, KPI-driven.", icon="⚡")
+            st.info("⚡ **Efficiency-Maximising** — finds minimum fleet satisfying all rules. "
+                    "Fleet size from config is overridden; headway floor is still enforced.", icon="⚡")
         else:
             st.info("📋 **Planning-Compliant** — follows headway profile.", icon="📋")
         run_btn = st.button("▶ Generate Schedule", type="primary", disabled=uploaded is None)
@@ -752,7 +753,8 @@ with st.sidebar:
                  "On  = Efficiency-Maximising: binary-searches minimum fleet per route.",
         )
         if city_optimize:
-            st.info("⚡ **Efficiency-Maximising** — minimum fleet per route, KPI-driven.", icon="⚡")
+            st.info("⚡ **Efficiency-Maximising** — finds minimum fleet per route satisfying all rules. "
+                    "Config fleet size is overridden; headway floor is still enforced.", icon="⚡")
         else:
             st.info("📋 **Planning-Compliant** — headway profile respected, surplus rebalanced.", icon="📋")
         total_fleet_override = st.number_input(
@@ -764,8 +766,9 @@ with st.sidebar:
             disabled=not uploaded_files,
         )
         st.divider()
-        st.caption("**Planning-Compliant**: headway-driven + surplus rebalancing.\n\n"
-                   "**Efficiency-Maximising**: minimum fleet per route.")
+        st.caption("**Planning-Compliant**: follows headway profile, rebalances surplus fleet.\n\n"
+                   "**Efficiency-Maximising**: binary-searches minimum fleet per route; "
+                   "headway floor still enforced, config fleet size overridden.")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -1304,8 +1307,10 @@ elif app_mode == "🏙️ Citywide":
     st.markdown(f"## 🏙️ Citywide Schedule — {len(cs.results)} Routes")
     st.caption(f"Mode: **{mode_label}** · Depot: **{city_cfg.depot_name}**")
     if city_optimize:
-        st.info("⚡ **Efficiency-Maximising mode**: minimum feasible fleet per route. "
-                "Headway profile is ignored — use for capacity planning only.", icon="⚡")
+        st.info("⚡ **Efficiency-Maximising mode**: binary-searches the minimum fleet per route "
+                "that satisfies all P1–P6 rules. Config fleet size is overridden. "
+                "Headway floor from the profile is still enforced — "
+                "what changes is fleet size, not headway.", icon="⚡")
     else:
         st.info("📋 **Planning-Compliant mode**: headway profile respected. "
                 "Surplus buses redistributed to deficit routes based on time-sliced PVR.", icon="📋")

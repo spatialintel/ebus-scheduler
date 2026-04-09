@@ -12,10 +12,15 @@ Two modes:
     6. Return CitySchedule
 
   Optimizer ON (efficiency-maximising, KPI-driven):
-    1. For each route, binary-search minimum fleet satisfying P1-P6
+    1. For each route, binary-search minimum fleet satisfying ALL P1-P6 rules
+       (including the headway floor from the profile — headway is NOT ignored)
     2. Sum = citywide minimum fleet
     3. If user fleet > minimum, distribute extras to worst-scoring routes
     4. Return CitySchedule
+
+  Key distinction:
+    Planning-Compliant  -> respects config fleet_size; rebalances surplus
+    Efficiency-Maximising -> overrides fleet_size; headway floor still enforced
 
 Mode labels shown in the UI:
   Optimizer OFF -> "Planning-Compliant" (follows headway profile strictly)
