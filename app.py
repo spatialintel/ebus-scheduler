@@ -25,6 +25,16 @@ from src.bus_scheduler import schedule_buses, check_compliance
 from src.output_formatter import write_schedule
 from src.metrics import compute_metrics
 
+# Citywide imports — safe fallback if files not yet deployed
+try:
+    from src.city_config_loader import load_city_config_from_files
+    from src.city_scheduler import schedule_city
+    from src.city_models import CityConfig, CitySchedule, RouteResult
+    from src.fleet_analyzer import compute_pvr_all, compute_fleet_balance
+    _CITY_OK = True
+except ImportError:
+    _CITY_OK = False
+
 st.set_page_config(page_title="eBus Scheduler", page_icon="🚌", layout="wide",
                    initial_sidebar_state="expanded")
 
@@ -701,14 +711,45 @@ def rerun_from_overrides(config_overrides, headway_overrides=None, optimize=Fals
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🚌 eBus Scheduler")
-    st.caption("Upload route config Excel to generate a schedule.")
+
+    if _CITY_OK:
+        app_mode = st.radio(
+            "Mode", ["🚌 Single Route", "🏙️ Citywide"], index=0,
+            help="Single Route: one config. Citywide: multiple configs with fleet rebalancing.",
+        )
+    else:
+        app_mode = "🚌 Single Route"
+
     st.divider()
-    uploaded = st.file_uploader("Config Excel", type=["xlsx"], label_visibility="collapsed")
-    optimize = st.toggle("Run Optimizer", value=False,
-                         help="Tunes headway bands to balance KM across fleet (10–20 sec).")
-    run_btn = st.button("▶ Generate Schedule", type="primary", disabled=uploaded is None)
-    st.divider()
-    st.caption("Rules enforced: P4 break from config, P2 via nearest node, P5 midday charge, P3 SOC ≥ 20%.")
+
+    if app_mode == "🚌 Single Route":
+        st.caption("Upload route config Excel to generate a schedule.")
+        uploaded = st.file_uploader("Config Excel", type=["xlsx"], label_visibility="collapsed")
+        optimize = st.toggle("Run Optimizer", value=False,
+                             help="Tunes headway bands to balance KM across fleet (10–20 sec).")
+        run_btn = st.button("▶ Generate Schedule", type="primary", disabled=uploaded is None)
+        st.divider()
+        st.caption("Rules enforced: P4 break from config, P2 via nearest node, P5 midday charge, P3 SOC ≥ 20%.")
+    else:
+        st.caption("Upload config Excel files for all routes.")
+        uploaded_files = st.file_uploader(
+            "Route Config Files", type=["xlsx", "xlsm"],
+            accept_multiple_files=True, label_visibility="collapsed",
+        )
+        city_optimize = st.toggle(
+            "Optimizer ON", value=False,
+            help="ON = find minimum fleet per route. OFF = follow headway, rebalance surplus.",
+        )
+        total_fleet_override = st.number_input(
+            "Total Fleet Override", min_value=0, value=0, step=1,
+            help="0 = use sum from configs. >0 = cap total citywide fleet.",
+        )
+        city_run_btn = st.button(
+            "▶ Generate Citywide Schedule", type="primary",
+            disabled=not uploaded_files,
+        )
+        st.divider()
+        st.caption("**OFF**: Headway-driven + surplus rebalancing.\n\n**ON**: Minimum fleet per route.")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
