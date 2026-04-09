@@ -71,6 +71,7 @@ class CitySchedule:
     city_config: CityConfig
     results: dict[str, RouteResult]     # route_code → RouteResult
     transfers: list[Transfer] = field(default_factory=list)
+    stability_flags: list = field(default_factory=list)  # list[StabilityFlag]
 
     # ── Aggregate KPIs ────────────────────────────────────────────────────────
 

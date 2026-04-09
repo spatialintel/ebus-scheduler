@@ -2,7 +2,7 @@
 app.py — eBus Scheduler Dashboard
 """
 from __future__ import annotations
-__version__ = "2026-03-30-b5"  # auto-stamped
+__version__ = "2026-04-09-p2"
 import sys, tempfile
 from pathlib import Path
 from datetime import datetime, timedelta, time as dtime
@@ -30,9 +30,12 @@ try:
     from src.city_config_loader import load_city_config_from_files
     from src.city_scheduler import schedule_city
     from src.city_models import CityConfig, CitySchedule, RouteResult
-    from src.fleet_analyzer import compute_pvr_all, compute_fleet_balance
+    from src.fleet_analyzer import (
+        compute_pvr_all, compute_pvr_slices_all,
+        compute_fleet_balance,
+    )
     _CITY_OK = True
-except ImportError:
+except Exception:
     _CITY_OK = False
 
 st.set_page_config(page_title="eBus Scheduler", page_icon="🚌", layout="wide",
@@ -725,8 +728,15 @@ with st.sidebar:
     if app_mode == "🚌 Single Route":
         st.caption("Upload route config Excel to generate a schedule.")
         uploaded = st.file_uploader("Config Excel", type=["xlsx"], label_visibility="collapsed")
-        optimize = st.toggle("Run Optimizer", value=False,
-                             help="Tunes headway bands to balance KM across fleet (10–20 sec).")
+        optimize = st.toggle(
+            "Run Optimizer", value=False,
+            help="Efficiency-Maximising: finds minimum feasible fleet, ignores headway profile.\n"
+                 "Off = Planning-Compliant: follows headway profile strictly.",
+        )
+        if optimize:
+            st.info("⚡ **Efficiency-Maximising** — minimum fleet, KPI-driven.", icon="⚡")
+        else:
+            st.info("📋 **Planning-Compliant** — follows headway profile.", icon="📋")
         run_btn = st.button("▶ Generate Schedule", type="primary", disabled=uploaded is None)
         st.divider()
         st.caption("Rules enforced: P4 break from config, P2 via nearest node, P5 midday charge, P3 SOC ≥ 20%.")
@@ -737,9 +747,14 @@ with st.sidebar:
             accept_multiple_files=True, label_visibility="collapsed",
         )
         city_optimize = st.toggle(
-            "Optimizer ON", value=False,
-            help="ON = find minimum fleet per route. OFF = follow headway, rebalance surplus.",
+            "Efficiency-Maximising Mode", value=False,
+            help="Off = Planning-Compliant: follows headway profile, rebalances surplus.\n"
+                 "On  = Efficiency-Maximising: binary-searches minimum fleet per route.",
         )
+        if city_optimize:
+            st.info("⚡ **Efficiency-Maximising** — minimum fleet per route, KPI-driven.", icon="⚡")
+        else:
+            st.info("📋 **Planning-Compliant** — headway profile respected, surplus rebalanced.", icon="📋")
         total_fleet_override = st.number_input(
             "Total Fleet Override", min_value=0, value=0, step=1,
             help="0 = use sum from configs. >0 = cap total citywide fleet.",
@@ -749,7 +764,8 @@ with st.sidebar:
             disabled=not uploaded_files,
         )
         st.divider()
-        st.caption("**OFF**: Headway-driven + surplus rebalancing.\n\n**ON**: Minimum fleet per route.")
+        st.caption("**Planning-Compliant**: headway-driven + surplus rebalancing.\n\n"
+                   "**Efficiency-Maximising**: minimum fleet per route.")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -1284,9 +1300,15 @@ elif app_mode == "🏙️ Citywide":
             for w in load_warnings:
                 st.warning(w)
 
-    mode_label = "Optimizer ON (KPI-Driven)" if city_optimize else "Optimizer OFF (Headway-Driven)"
+    mode_label = "⚡ Efficiency-Maximising" if city_optimize else "📋 Planning-Compliant"
     st.markdown(f"## 🏙️ Citywide Schedule — {len(cs.results)} Routes")
     st.caption(f"Mode: **{mode_label}** · Depot: **{city_cfg.depot_name}**")
+    if city_optimize:
+        st.info("⚡ **Efficiency-Maximising mode**: minimum feasible fleet per route. "
+                "Headway profile is ignored — use for capacity planning only.", icon="⚡")
+    else:
+        st.info("📋 **Planning-Compliant mode**: headway profile respected. "
+                "Surplus buses redistributed to deficit routes based on time-sliced PVR.", icon="📋")
 
     # Citywide KPIs
     st.markdown(
@@ -1307,8 +1329,9 @@ elif app_mode == "🏙️ Citywide":
         '</div>', unsafe_allow_html=True,
     )
 
-    tab_overview, tab_rebalance, tab_route_detail, tab_fleet_config = st.tabs([
-        "📊 Overview", "🔄 Fleet Rebalancing", "🗺 Route Detail", "⚙️ Fleet Config",
+    tab_overview, tab_rebalance, tab_pvr, tab_headways, tab_route_detail, tab_fleet_config, tab_stability = st.tabs([
+        "📊 Overview", "🔄 Fleet Rebalancing", "📐 PVR Analysis",
+        "📈 Headways", "🗺 Route Detail", "⚙️ Fleet Config", "🔍 Stability",
     ])
 
     # ── CITY TAB 1: Overview ──────────────────────────────────────────────────
@@ -1384,7 +1407,93 @@ elif app_mode == "🏙️ Citywide":
         ])
         st.dataframe(bal_df, use_container_width=True, hide_index=True)
 
-    # ── CITY TAB 3: Route Detail (drill-down with full Gantt) ─────────────────
+    # ── CITY TAB 3: PVR Analysis ──────────────────────────────────────────────
+    with tab_pvr:
+        st.caption(
+            "**PVR (Peak)** — minimum buses at tightest headway band, drives rebalancing.  "
+            "**PVR (Off-Peak)** — minimum buses during 11:00–15:00.  "
+            "**PVR (Charging)** — conservative upper bound during P5 midday charging (+25%)."
+        )
+        try:
+            slices_all = compute_pvr_slices_all(city_cfg)
+            pvr_rows   = [s.as_dict() for s in slices_all.values()]
+            pvr_df     = pd.DataFrame(pvr_rows)
+            alloc_map  = {code: r.fleet_allocated for code, r in cs.results.items()}
+            pvr_df["Allocated"] = pvr_df["Route"].map(alloc_map)
+            pvr_df["vs PVR Peak"] = pvr_df.apply(
+                lambda row: (
+                    f"+{row['Allocated'] - row['PVR (Peak)']} surplus"
+                    if row["Allocated"] > row["PVR (Peak)"]
+                    else (f"{row['Allocated'] - row['PVR (Peak)']} deficit"
+                          if row["Allocated"] < row["PVR (Peak)"] else "✅ exact")
+                ), axis=1
+            )
+            st.dataframe(pvr_df, hide_index=True, use_container_width=True)
+
+            if _PLOTLY_OK and len(cs.results) > 1:
+                st.markdown('<div class="section-title">Fleet vs PVR Slices</div>',
+                            unsafe_allow_html=True)
+                codes = sorted(cs.results.keys())
+                fig_pvr = go.Figure()
+                fig_pvr.add_trace(go.Bar(name="PVR (Peak)",     x=codes,
+                    y=[slices_all[c].pvr_peak     for c in codes], marker_color="#dc2626"))
+                fig_pvr.add_trace(go.Bar(name="PVR (Off-Peak)", x=codes,
+                    y=[slices_all[c].pvr_offpeak  for c in codes], marker_color="#f97316"))
+                fig_pvr.add_trace(go.Bar(name="PVR (Charging)", x=codes,
+                    y=[slices_all[c].pvr_charging for c in codes], marker_color="#fbbf24"))
+                fig_pvr.add_trace(go.Bar(name="Allocated",      x=codes,
+                    y=[alloc_map.get(c, 0)        for c in codes], marker_color="#4f46e5"))
+                fig_pvr.update_layout(
+                    barmode="group", height=350,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.5, xanchor="center"),
+                    margin=dict(l=40, r=20, t=20, b=40), plot_bgcolor="white",
+                )
+                st.plotly_chart(fig_pvr, use_container_width=True)
+        except Exception as e:
+            st.warning(f"PVR analysis unavailable: {e}")
+
+    # ── CITY TAB 4: Headways (per-route selector) ─────────────────────────────
+    with tab_headways:
+        st.caption(
+            "Departure gaps between consecutive same-direction buses. "
+            "Select a route to inspect actual vs configured headways."
+        )
+        hw_route_codes = sorted(cs.results.keys())
+        selected_hw_route = st.selectbox(
+            "Route", hw_route_codes,
+            format_func=lambda c: f"{c} — {cs.results[c].config.route_name}",
+            key="city_hw_route",
+        )
+        if selected_hw_route:
+            rr_hw  = cs.results[selected_hw_route]
+            hw_data = build_headway_chart_data(rr_hw.config, rr_hw.buses)
+            if hw_data.empty:
+                st.info("No revenue trips found for this route.")
+            else:
+                col_up, col_dn = st.columns(2)
+                for col, direction, color in [
+                    (col_up, "UP", "#4f46e5"),
+                    (col_dn, "DN", "#16a34a"),
+                ]:
+                    with col:
+                        dir_data = hw_data[hw_data["Direction"] == direction].sort_values("Departure")
+                        if len(dir_data) < 2:
+                            st.caption(f"**{direction}** — fewer than 2 departures.")
+                            continue
+                        deps = dir_data["Departure"].tolist()
+                        gaps = [
+                            {"Dep": deps[i].strftime("%H:%M"),
+                             "Headway (min)": round((deps[i] - deps[i-1]).total_seconds() / 60)}
+                            for i in range(1, len(deps))
+                        ]
+                        gdf = pd.DataFrame(gaps).set_index("Dep")
+                        st.markdown(f"**{direction}** headways — {selected_hw_route}")
+                        st.bar_chart(gdf, height=260, color=color)
+
+                with st.expander("📋 Configured headway profile"):
+                    st.dataframe(rr_hw.headway_df, hide_index=True, use_container_width=True)
+
+    # ── CITY TAB 6: Route Detail (drill-down with full Gantt) ─────────────────
     with tab_route_detail:
         route_codes = sorted(cs.results.keys())
         selected_route = st.selectbox("Select Route", route_codes,
@@ -1488,7 +1597,7 @@ elif app_mode == "🏙️ Citywide":
                              column_config={"": st.column_config.TextColumn(width="small")})
                 st.divider()
 
-    # ── CITY TAB 4: Fleet Config Editor ───────────────────────────────────────
+    # ── CITY TAB 7: Fleet Config Editor ───────────────────────────────────────
     with tab_fleet_config:
         st.markdown('<div class="section-title">Adjust Fleet Size per Route</div>',
                     unsafe_allow_html=True)
@@ -1535,3 +1644,27 @@ elif app_mode == "🏙️ Citywide":
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error: {e}")
+
+    # ── CITY TAB 8: Stability ─────────────────────────────────────────────────
+    with tab_stability:
+        st.caption(
+            "Post-rebalance PVR stability check. "
+            "A **drift > 0.5** means the re-run shifted cycle time enough to change the PVR, "
+            "making the transfer plan potentially stale. Re-running the citywide scheduler resolves this."
+        )
+        stability_flags = getattr(cs, "stability_flags", [])
+        if not stability_flags:
+            st.info("Stability check not applicable in Efficiency-Maximising mode, "
+                    "or no transfers were needed.")
+        else:
+            flag_rows = [f.as_dict() for f in stability_flags]
+            flag_df   = pd.DataFrame(flag_rows)
+            unstable  = flag_df[flag_df["Status"] == "⚠️ Drifted"]
+            if unstable.empty:
+                st.success("✅ All routes stable — no PVR drift detected after rebalancing.")
+            else:
+                st.warning(
+                    f"⚠️ {len(unstable)} route(s) show PVR drift > 0.5. "
+                    "Consider re-running the citywide schedule to stabilise."
+                )
+            st.dataframe(flag_df, hide_index=True, use_container_width=True)

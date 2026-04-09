@@ -2,71 +2,64 @@
 fleet_analyzer.py — Peak Vehicle Requirement (PVR) and fleet rebalancing.
 
 PVR is the theoretical minimum buses needed to maintain a headway profile
-on a route, computed as:
+on a route.  Phase 1 used a single static value (cycle_time / peak_headway).
+This version computes THREE time-sliced PVR values that better reflect
+real fleet demand across the operating day:
 
-    PVR = ceil(cycle_time / headway)
+    PVR_peak      = ceil(cycle_time / peak_headway)
+                    -> buses needed during the tightest headway band
+                    -> drives rebalancing decisions
 
-where cycle_time = round_trip_time + 2 × min_break.
+    PVR_offpeak   = ceil(cycle_time / avg_offpeak_headway)
+                    -> buses needed outside peak (11:00-15:00 window)
+                    -> identifies off-peak slack available for transfer
 
-The rebalancer identifies surplus routes (allocated > PVR) and deficit routes
-(allocated < PVR), then proposes transfers to balance the citywide fleet.
+    PVR_charging  = ceil(PVR_peak * (1 + CHARGING_FRACTION))
+                    -> adds buses temporarily unavailable due to P5 midday
+                       charging; conservative upper bound during 12:00-15:00
+
+Rebalancing algorithm:
+    1. Compute PVR_peak per route (primary driver)
+    2. Identify surplus (allocated > PVR_peak) and deficit routes
+    3. Check depot compatibility before any transfer (same depot only)
+    4. Greedy assignment ranked by urgency score
+    5. Post-rebalance stability check: flag PVR drift > 0.5
 
 Usage:
-    from src.fleet_analyzer import compute_pvr, compute_rebalancing_plan
+    from src.fleet_analyzer import compute_pvr_slices, compute_rebalancing_plan
 """
 
 from __future__ import annotations
-__version__ = "2026-04-08-p1"
+__version__ = "2026-04-09-p2"
 
 import math
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import datetime, time as _time
 
 from src.city_models import CityConfig, RouteInput, Transfer
 
 
-REF_DATE = datetime(2025, 1, 1)
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+OFFPEAK_START_MIN: int  = 11 * 60   # 11:00
+OFFPEAK_END_MIN: int    = 15 * 60   # 15:00
+
+# Fraction of fleet assumed charging simultaneously in midday window (P5).
+# Conservative: ~25 % of buses cycle through depot charging 12:00-15:00.
+CHARGING_FRACTION: float = 0.25
+
+# PVR drift threshold for stability check (in PVR units).
+STABILITY_THRESHOLD: float = 0.5
 
 
-# ── PVR Computation ──────────────────────────────────────────────────────────
-
-def _avg_headway(ri: RouteInput) -> float:
-    """Weighted-average headway across all time bands."""
-    df = ri.headway_df
-    total_weight = 0.0
-    total_hw = 0.0
-    for _, row in df.iterrows():
-        try:
-            t_from = _to_minutes(row["time_from"])
-            t_to = _to_minutes(row["time_to"])
-            span = t_to - t_from
-            if span <= 0:
-                continue
-            total_weight += span
-            total_hw += span * float(row["headway_min"])
-        except Exception:
-            continue
-    return total_hw / total_weight if total_weight > 0 else 30.0
-
-
-def _peak_headway(ri: RouteInput) -> float:
-    """Minimum (tightest) headway across all bands — this drives PVR."""
-    try:
-        return float(ri.headway_df["headway_min"].min())
-    except Exception:
-        return 30.0
-
-
-def _avg_travel_time(ri: RouteInput) -> tuple[float, float]:
-    """Average UP and DN travel times across bands."""
-    df = ri.travel_time_df
-    up = df["up_min"].mean() if "up_min" in df.columns else 45.0
-    dn = df["dn_min"].mean() if "dn_min" in df.columns else 45.0
-    return float(up), float(dn)
-
+# ---------------------------------------------------------------------------
+# Time helpers
+# ---------------------------------------------------------------------------
 
 def _to_minutes(val) -> float:
-    """Convert HH:MM string or time object to minutes since midnight."""
-    from datetime import time as _time
+    """Convert HH:MM string, datetime.time, or datetime to minutes since midnight."""
     if isinstance(val, _time):
         return val.hour * 60 + val.minute
     if isinstance(val, datetime):
@@ -75,85 +68,224 @@ def _to_minutes(val) -> float:
     return int(parts[0]) * 60 + int(parts[1])
 
 
-def compute_pvr(ri: RouteInput) -> int:
+def _band_overlap(t_from: float, t_to: float, win_start: float, win_end: float) -> float:
+    """Minutes of overlap between [t_from, t_to) and [win_start, win_end)."""
+    return max(0.0, min(t_to, win_end) - max(t_from, win_start))
+
+
+# ---------------------------------------------------------------------------
+# Headway extraction
+# ---------------------------------------------------------------------------
+
+def _peak_headway(ri: RouteInput) -> float:
+    """Tightest (minimum) headway across all bands."""
+    try:
+        return float(ri.headway_df["headway_min"].min())
+    except Exception:
+        return 30.0
+
+
+def _offpeak_headway(ri: RouteInput) -> float:
     """
-    Peak Vehicle Requirement for a single route.
+    Weighted-average headway during the off-peak window (11:00-15:00).
+    Falls back to overall weighted average if no bands overlap the window.
+    """
+    df = ri.headway_df
+    weight, weighted_hw = 0.0, 0.0
+    for _, row in df.iterrows():
+        try:
+            t_from  = _to_minutes(row["time_from"])
+            t_to    = _to_minutes(row["time_to"])
+            overlap = _band_overlap(t_from, t_to, OFFPEAK_START_MIN, OFFPEAK_END_MIN)
+            if overlap <= 0:
+                continue
+            weight      += overlap
+            weighted_hw += overlap * float(row["headway_min"])
+        except Exception:
+            continue
 
-    PVR = ceil(cycle_time / peak_headway)
+    if weight > 0:
+        return weighted_hw / weight
 
-    cycle_time = avg_up_travel + avg_dn_travel + 2 × preferred_layover
-    peak_headway = minimum headway from headway profile
+    # Fallback: overall weighted average
+    weight, weighted_hw = 0.0, 0.0
+    for _, row in df.iterrows():
+        try:
+            t_from = _to_minutes(row["time_from"])
+            t_to   = _to_minutes(row["time_to"])
+            span   = t_to - t_from
+            if span <= 0:
+                continue
+            weight      += span
+            weighted_hw += span * float(row["headway_min"])
+        except Exception:
+            continue
+    return weighted_hw / weight if weight > 0 else 30.0
+
+
+def _avg_travel_time(ri: RouteInput) -> tuple[float, float]:
+    """Average UP and DN travel times across all bands."""
+    df = ri.travel_time_df
+    up = float(df["up_min"].mean()) if "up_min" in df.columns else 45.0
+    dn = float(df["dn_min"].mean()) if "dn_min" in df.columns else 45.0
+    return up, dn
+
+
+# ---------------------------------------------------------------------------
+# PVR slice dataclass
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PVRSlices:
+    """Three time-sliced PVR values for a single route."""
+    route_code: str
+    pvr_peak: int           # minimum fleet during tightest headway band
+    pvr_offpeak: int        # minimum fleet during 11:00-15:00 off-peak
+    pvr_charging: int       # conservative upper bound during midday charging
+    peak_headway_min: float
+    offpeak_headway_min: float
+    cycle_time_min: float
+
+    @property
+    def slack_buses(self) -> int:
+        """Buses free during off-peak — potentially shareable."""
+        return max(0, self.pvr_peak - self.pvr_offpeak)
+
+    def as_dict(self) -> dict:
+        return {
+            "Route":              self.route_code,
+            "PVR (Peak)":         self.pvr_peak,
+            "PVR (Off-Peak)":     self.pvr_offpeak,
+            "PVR (Charging)":     self.pvr_charging,
+            "Peak HW (min)":      round(self.peak_headway_min, 1),
+            "Off-Peak HW (min)":  round(self.offpeak_headway_min, 1),
+            "Cycle Time (min)":   round(self.cycle_time_min, 1),
+            "Off-Peak Slack":     self.slack_buses,
+        }
+
+
+def compute_pvr_slices(ri: RouteInput) -> PVRSlices:
+    """
+    Compute all three PVR slices for one route.
+
+    cycle_time   = avg_up + avg_dn + 2 x preferred_layover
+    PVR_peak     = ceil(cycle_time / peak_headway)
+    PVR_offpeak  = ceil(cycle_time / offpeak_headway)
+    PVR_charging = ceil(PVR_peak x (1 + CHARGING_FRACTION))
     """
     up_tt, dn_tt = _avg_travel_time(ri)
-    min_break = ri.config.preferred_layover_min
-    cycle_time = up_tt + dn_tt + 2 * min_break
+    layover      = ri.config.preferred_layover_min
+    cycle_time   = up_tt + dn_tt + 2 * layover
 
-    peak_hw = _peak_headway(ri)
+    peak_hw    = _peak_headway(ri)
+    offpeak_hw = _offpeak_headway(ri)
 
-    # PVR = how many buses needed so one departs every peak_hw minutes
-    pvr = math.ceil(cycle_time / peak_hw) if peak_hw > 0 else 1
-    return max(1, pvr)  # at least 1 bus
+    pvr_peak     = max(1, math.ceil(cycle_time / peak_hw))    if peak_hw    > 0 else 1
+    pvr_offpeak  = max(1, math.ceil(cycle_time / offpeak_hw)) if offpeak_hw > 0 else 1
+    pvr_charging = max(pvr_peak, math.ceil(pvr_peak * (1 + CHARGING_FRACTION)))
+
+    return PVRSlices(
+        route_code=ri.config.route_code,
+        pvr_peak=pvr_peak,
+        pvr_offpeak=pvr_offpeak,
+        pvr_charging=pvr_charging,
+        peak_headway_min=peak_hw,
+        offpeak_headway_min=offpeak_hw,
+        cycle_time_min=cycle_time,
+    )
+
+
+# Backward-compatible scalar API used throughout the rest of the codebase.
+
+def compute_pvr(ri: RouteInput) -> int:
+    """Return PVR_peak — primary scalar used throughout the scheduler."""
+    return compute_pvr_slices(ri).pvr_peak
 
 
 def compute_pvr_all(city: CityConfig) -> dict[str, int]:
-    """Compute PVR for every route. Returns {route_code: pvr}."""
+    """PVR_peak per route. Returns {route_code: pvr_peak}."""
     return {code: compute_pvr(ri) for code, ri in city.routes.items()}
 
 
-# ── Surplus / Deficit Detection ──────────────────────────────────────────────
+def compute_pvr_slices_all(city: CityConfig) -> dict[str, PVRSlices]:
+    """Full PVR slice objects per route."""
+    return {code: compute_pvr_slices(ri) for code, ri in city.routes.items()}
+
+
+# ---------------------------------------------------------------------------
+# Fleet balance
+# ---------------------------------------------------------------------------
 
 def compute_fleet_balance(city: CityConfig) -> dict[str, dict]:
     """
-    For each route, compute:
-      - pvr: theoretical minimum
-      - allocated: fleet_size from config
-      - surplus: max(0, allocated - pvr)
-      - deficit: max(0, pvr - allocated)
-      - headroom_pct: (allocated - pvr) / pvr × 100
+    Per-route balance table using PVR_peak as the floor.
 
-    Returns {route_code: {pvr, allocated, surplus, deficit, headroom_pct}}
+    Returns {route_code: {pvr, pvr_offpeak, pvr_charging, allocated,
+                           surplus, deficit, headroom_pct}}
     """
-    pvrs = compute_pvr_all(city)
+    slices = compute_pvr_slices_all(city)
     result = {}
     for code, ri in city.routes.items():
-        pvr = pvrs[code]
-        allocated = ri.config.fleet_size
-        surplus = max(0, allocated - pvr)
-        deficit = max(0, pvr - allocated)
-        headroom = ((allocated - pvr) / pvr * 100) if pvr > 0 else 0.0
+        s          = slices[code]
+        allocated  = ri.config.fleet_size
+        surplus    = max(0, allocated - s.pvr_peak)
+        deficit    = max(0, s.pvr_peak - allocated)
+        headroom   = ((allocated - s.pvr_peak) / s.pvr_peak * 100) if s.pvr_peak > 0 else 0.0
         result[code] = {
-            "pvr": pvr,
-            "allocated": allocated,
-            "surplus": surplus,
-            "deficit": deficit,
-            "headroom_pct": round(headroom, 1),
+            "pvr":           s.pvr_peak,
+            "pvr_offpeak":   s.pvr_offpeak,
+            "pvr_charging":  s.pvr_charging,
+            "allocated":     allocated,
+            "surplus":       surplus,
+            "deficit":       deficit,
+            "headroom_pct":  round(headroom, 1),
         }
     return result
 
 
-# ── Rebalancing Plan ─────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Depot compatibility (Issue 3 fix)
+# ---------------------------------------------------------------------------
+
+def _same_depot(city: CityConfig, code_a: str, code_b: str) -> bool:
+    """
+    Return True only if both routes share the same depot.
+
+    - Single-depot mode (city.depot_name != 'MULTI_DEPOT'): always True.
+    - Multi-depot mode: compare config.depot strings per route.
+    """
+    if city.depot_name != "MULTI_DEPOT":
+        return True
+    depot_a = getattr(city.routes[code_a].config, "depot", None)
+    depot_b = getattr(city.routes[code_b].config, "depot", None)
+    if depot_a is None or depot_b is None:
+        return True  # missing data -> optimistic fallback
+    return str(depot_a).strip().lower() == str(depot_b).strip().lower()
+
+
+# ---------------------------------------------------------------------------
+# Deficit priority scoring
+# ---------------------------------------------------------------------------
 
 def _deficit_priority_score(ri: RouteInput, pvr: int, allocated: int) -> float:
     """
-    Higher score = route needs buses more urgently.
+    Higher score -> route needs buses more urgently.
 
     Factors:
-      1. Raw deficit (pvr - allocated)
-      2. Peak headway tightness (tighter headway = more critical)
-      3. Operating window length (longer = more trips to serve)
+      1. Raw deficit (pvr - allocated) x10
+      2. Headway tightness: 60 / peak_hw  (tighter = more critical)
+      3. Operating window length (longer = more trips at risk)
     """
     deficit = max(0, pvr - allocated)
     if deficit == 0:
         return 0.0
 
-    peak_hw = _peak_headway(ri)
-    # Tighter headway → higher urgency (invert: 1/hw)
+    peak_hw    = _peak_headway(ri)
     hw_urgency = 60.0 / max(peak_hw, 5.0)
 
-    # Longer operating window → more trips at risk
     try:
-        start = _to_minutes(ri.config.operating_start)
-        end = _to_minutes(ri.config.operating_end)
+        start      = _to_minutes(ri.config.operating_start)
+        end        = _to_minutes(ri.config.operating_end)
         window_hrs = (end - start) / 60
     except Exception:
         window_hrs = 15.0
@@ -161,51 +293,107 @@ def _deficit_priority_score(ri: RouteInput, pvr: int, allocated: int) -> float:
     return deficit * 10.0 + hw_urgency * 2.0 + window_hrs * 0.5
 
 
+# ---------------------------------------------------------------------------
+# Post-rebalance stability check (Issue 4 fix)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class StabilityFlag:
+    """Result of the post-rebalance PVR stability check for one route."""
+    route_code:   str
+    pvr_before:   int
+    pvr_after:    int
+    fleet_before: int
+    fleet_after:  int
+    drift:        float   # |pvr_after - pvr_before|
+    is_stable:    bool    # True if drift <= STABILITY_THRESHOLD
+
+    def as_dict(self) -> dict:
+        return {
+            "Route":        self.route_code,
+            "PVR Before":   self.pvr_before,
+            "PVR After":    self.pvr_after,
+            "Fleet Before": self.fleet_before,
+            "Fleet After":  self.fleet_after,
+            "Drift":        round(self.drift, 2),
+            "Status":       "✅ Stable" if self.is_stable else "⚠️ Drifted",
+        }
+
+
+def check_rebalance_stability(
+    city: CityConfig,
+    pre_balance: dict[str, dict],
+    post_fleet:  dict[str, int],
+    post_pvr:    dict[str, int],
+) -> list[StabilityFlag]:
+    """
+    Compare pre- and post-rebalance PVR values to detect instability.
+
+    Args:
+        pre_balance : output of compute_fleet_balance() BEFORE rebalancing
+        post_fleet  : {route_code: new_fleet_size} AFTER rebalancing
+        post_pvr    : {route_code: pvr_peak} recomputed AFTER re-run
+
+    Returns:
+        List of StabilityFlag for all routes, sorted by descending drift.
+        Unstable routes (drift > STABILITY_THRESHOLD) are flagged.
+    """
+    flags = []
+    for code in city.routes:
+        pvr_before   = pre_balance[code]["pvr"]
+        pvr_after    = post_pvr.get(code, pvr_before)
+        fleet_before = pre_balance[code]["allocated"]
+        fleet_after  = post_fleet.get(code, fleet_before)
+        drift        = abs(pvr_after - pvr_before)
+        flags.append(StabilityFlag(
+            route_code=code,
+            pvr_before=pvr_before,
+            pvr_after=pvr_after,
+            fleet_before=fleet_before,
+            fleet_after=fleet_after,
+            drift=drift,
+            is_stable=(drift <= STABILITY_THRESHOLD),
+        ))
+    return sorted(flags, key=lambda f: -f.drift)
+
+
+# ---------------------------------------------------------------------------
+# Rebalancing plan
+# ---------------------------------------------------------------------------
+
 def compute_rebalancing_plan(city: CityConfig) -> list[Transfer]:
     """
-    Phase 1 rebalancing: whole-day bus transfers.
+    Phase 1 rebalancing: whole-day bus transfers driven by PVR_peak.
 
-    Algorithm:
-      1. Compute PVR and surplus/deficit per route
-      2. Pool all surplus buses (from routes where allocated > PVR)
-      3. Rank deficit routes by urgency score
-      4. Assign pooled buses to deficit routes, highest urgency first
-      5. Each transfer moves 1 bus at a time, re-ranking after each
+    Steps:
+      1. Compute surplus / deficit using PVR_peak as floor
+      2. Rank deficit routes by urgency score
+      3. For each deficit route, find a depot-compatible donor
+      4. Greedy one-bus-at-a-time until no surplus or no deficit remains
 
     Returns list of Transfer objects.
-    Does NOT modify city.routes — caller applies transfers by adjusting fleet_size.
+    Does NOT modify city.routes — use apply_transfers() to get adjusted sizes.
     """
-    balance = compute_fleet_balance(city)
+    balance   = compute_fleet_balance(city)
     transfers: list[Transfer] = []
 
-    # Build surplus pool: (route_code, count)
-    surplus_pool: list[tuple[str, int]] = []
-    for code, b in balance.items():
-        if b["surplus"] > 0:
-            surplus_pool.append((code, b["surplus"]))
-
-    # Total available surplus
-    total_surplus = sum(s for _, s in surplus_pool)
-    if total_surplus == 0:
+    surplus_pool: dict[str, int] = {
+        code: b["surplus"] for code, b in balance.items() if b["surplus"] > 0
+    }
+    if not surplus_pool:
         return []
 
-    # Build deficit list with priority
     deficit_routes: list[tuple[str, float]] = []
     for code, b in balance.items():
         if b["deficit"] > 0:
-            ri = city.routes[code]
-            score = _deficit_priority_score(ri, b["pvr"], b["allocated"])
+            score = _deficit_priority_score(city.routes[code], b["pvr"], b["allocated"])
             deficit_routes.append((code, score))
-
     if not deficit_routes:
         return []
 
-    # Sort by priority (highest first)
     deficit_routes.sort(key=lambda x: -x[1])
 
-    # Greedy assignment: give buses one at a time
-    # Track running allocations
-    running_alloc = {code: b["allocated"] for code, b in balance.items()}
+    running_alloc   = {code: b["allocated"]  for code, b in balance.items()}
     running_surplus = dict(surplus_pool)
 
     bus_counter = 0
@@ -215,25 +403,25 @@ def compute_rebalancing_plan(city: CityConfig) -> list[Transfer]:
         for deficit_code, _ in deficit_routes:
             pvr = balance[deficit_code]["pvr"]
             if running_alloc[deficit_code] >= pvr:
-                continue  # no longer in deficit
+                continue
 
-            # Find a donor
             for donor_code in list(running_surplus.keys()):
                 if running_surplus[donor_code] <= 0:
                     continue
+                # Depot constraint: only transfer within same depot cluster
+                if not _same_depot(city, donor_code, deficit_code):
+                    continue
 
                 bus_counter += 1
-                bus_id = f"TRANSFER-{bus_counter:03d}"
                 transfers.append(Transfer(
-                    bus_id=bus_id,
+                    bus_id=f"TRANSFER-{bus_counter:03d}",
                     from_route=donor_code,
                     to_route=deficit_code,
                     reason="surplus_rebalance",
                 ))
-
-                running_surplus[donor_code] -= 1
-                running_alloc[donor_code] -= 1
-                running_alloc[deficit_code] += 1
+                running_surplus[donor_code]  -= 1
+                running_alloc[donor_code]    -= 1
+                running_alloc[deficit_code]  += 1
                 changed = True
                 break
 
@@ -243,22 +431,14 @@ def compute_rebalancing_plan(city: CityConfig) -> list[Transfer]:
 def apply_transfers(city: CityConfig, transfers: list[Transfer]) -> dict[str, int]:
     """
     Compute adjusted fleet sizes after applying transfers.
-    Returns {route_code: new_fleet_size}.
-    Does NOT mutate config objects.
+    Returns {route_code: new_fleet_size}.  Does NOT mutate config objects.
     """
-    adjusted = {
-        code: ri.config.fleet_size
-        for code, ri in city.routes.items()
-    }
-
+    adjusted = {code: ri.config.fleet_size for code, ri in city.routes.items()}
     for t in transfers:
         if t.from_route in adjusted:
             adjusted[t.from_route] -= 1
         if t.to_route in adjusted:
             adjusted[t.to_route] += 1
-
-    # Ensure no route drops below 1
     for code in adjusted:
         adjusted[code] = max(1, adjusted[code])
-
     return adjusted
