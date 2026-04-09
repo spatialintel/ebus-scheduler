@@ -113,7 +113,9 @@ def _build_field_map(ws) -> dict[str, tuple]:
         label = ws.cell(row, label_col).value
         if label is None:
             continue
-        label_clean = str(label).strip()
+        # Strip ★ prefix (used in Excel for visual highlighting of new fields)
+        # and any surrounding whitespace so lookups work without the prefix.
+        label_clean = str(label).strip().lstrip("★").strip()
         field_map[label_clean] = (row, ws.cell(row, value_col).value)
     return field_map
 
