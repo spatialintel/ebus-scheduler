@@ -27,10 +27,19 @@ def _run_schedule(
     headway_df: pd.DataFrame,
     travel_time_df: pd.DataFrame,
 ) -> tuple[list[BusState], ScheduleMetrics]:
-    """Run the full pipeline and return buses + metrics."""
+    """Run the full pipeline and return buses + metrics.
+
+    headway_df and travel_time_df are passed through to schedule_buses so that
+    the headway profile is enforced during every optimizer trial run.  Without
+    this, _hw_bands inside schedule_buses is empty and _min_hw_at() falls back
+    to SAME_DIR_GAP=5, causing the headway profile to be silently ignored for
+    all efficiency-mode schedules.
+    """
     trips = generate_trips(config, headway_df, travel_time_df)
     revenue_count = len([t for t in trips if t.trip_type == "Revenue"])
-    buses = schedule_buses(config, trips)
+    buses = schedule_buses(config, trips,
+                           headway_df=headway_df,
+                           travel_time_df=travel_time_df)
     metrics = compute_metrics(config, buses, total_revenue_trips=revenue_count)
     return buses, metrics
 

@@ -1063,7 +1063,7 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
 
             # ── Global Headway Balancer ───────────────────────────────────────
             # Instead of pure greedy (earliest rt wins), score each candidate bus
-            # by how close its departure produces a gap to target_gap (= min_hw).
+            # by how close its departure produces a gap to target_gap.
             # A bus that departs slightly later but produces a more uniform headway
             # scores better than one that departs earliest but causes bunching.
             #
@@ -1072,7 +1072,14 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
             # HEADWAY_WEIGHT=2.0 means a 1-min headway deviation costs 2 min of
             # rt penalty. rt_minutes breaks ties when deviation is equal.
             # If no prior departure exists (first trip of the day), score = rt only.
-            target_gap = _min_hw_at(rt)   # configured headway at this time
+            #
+            # target_gap = max(configured_band_headway, natural_gap)
+            # ├── configured_band_headway: operator's plan for this time-of-day band
+            # └── natural_gap: cycle_time / fleet — physics floor (can't go tighter)
+            # When fleet is over-provisioned: natural_gap < configured → target = configured ✓
+            # When fleet is under-provisioned: natural_gap > configured → target = natural_gap ✓
+            # This ensures the scoring target is always achievable and uniform within each band.
+            target_gap = max(_min_hw_at(rt), natural_gap)
             if last_same and last_same.actual_departure:
                 actual_gap = (rt - last_same.actual_departure).total_seconds() / 60
                 hw_deviation = abs(actual_gap - target_gap)
