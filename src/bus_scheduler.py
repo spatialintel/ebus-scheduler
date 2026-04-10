@@ -857,32 +857,70 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                           * config.consumption_rate / config.battery_kwh * 100)
         max_cost_home = _soc_cost_to_depot(far_loc, config)  # worst-case (far terminal)
 
+        # ── Emergency rescue: two scenarios, two policies ───────────────────
+        # Scenario 1 (truly stranded): bus cannot reach depot safely NOW.
+        #   → Charge immediately (P3 safety). Only the MOST CRITICAL bus per
+        #     iteration to prevent the entire fleet charging simultaneously.
+        # Scenario 2 (lookahead risk): next trip would leave bus unable to go home.
+        #   → Apply the normal stagger gate. The bus can safely skip one trip
+        #     and be handled by the regular P5 path below.
+        # Without this split, all 10 buses can hit lookahead threshold together
+        # (e.g. at 12:00 in Service Max with identical cycles) and all get sent
+        # to charge in one pass → 95-min service gap.
+        _rescue_candidate = None   # most critical stranded bus (lowest SOC)
+        _rescue_soc       = float("inf")
+
         for stuck_bus in buses:
             if stuck_bus.current_location == config.depot:
                 continue
             if stuck_bus.bus_id in charged_today:
                 continue
             actual_cost_home = _soc_cost_to_depot(stuck_bus.current_location, config)
-            # Scenario 1: already stranded — can't return to depot safely now
+
+            # Scenario 1: truly stranded — can't return to depot safely right now.
             stranded_now = stuck_bus.soc_percent - actual_cost_home < SOC_FLOOR
-            # Scenario 2: lookahead — taking the next revenue trip would leave the
-            # bus unable to return home.
-            # IMPORTANT: use the cost home from the END of the next trip, not the
-            # worst-case far terminal. A bus at the far terminal takes an UP trip
-            # and ends at the near terminal — cost home is much less.
+            if stranded_now:
+                # Track most critical (lowest SOC) for single-bus rescue below.
+                if stuck_bus.soc_percent < _rescue_soc:
+                    _rescue_soc       = stuck_bus.soc_percent
+                    _rescue_candidate = stuck_bus
+                continue  # handled after loop
+
+            # Scenario 2: lookahead — next trip would strand the bus.
+            # Apply stagger gate: only proceed if concurrency cap not reached.
             if stuck_bus.current_location == far_loc:
-                # Next trip is UP → ends at rev_start (near terminal)
                 cost_home_after_trip = _soc_cost_to_depot(rev_start, config)
             else:
-                # Next trip is DN → ends at far terminal (conservative)
                 cost_home_after_trip = max_cost_home
             stuck_after_next = (stuck_bus.soc_percent
                                  - one_trip_drain
                                  - cost_home_after_trip) < SOC_FLOOR + 2.0
-            if stranded_now or stuck_after_next:
-                _charging_detour(stuck_bus, config,
-                                 resume_by=op_end, min_break=min_break)
-                charged_today.add(stuck_bus.bus_id)
+            if stuck_after_next:
+                # Reuse stagger gate logic from P5 section: count active detours.
+                _active_now = sum(
+                    1 for b in buses
+                    if b is not stuck_bus and b.bus_id not in charged_today
+                    and any(t.trip_type == "Charging" for t in b.trips)
+                    and not any(
+                        t.trip_type == "Revenue"
+                        for t in b.trips[
+                            next((i for i, t in enumerate(b.trips)
+                                  if t.trip_type == "Charging"), 0) + 1:]
+                    )
+                )
+                _max_conc = max(1, config.fleet_size // 5)
+                if _active_now < _max_conc:
+                    _charging_detour(stuck_bus, config,
+                                     resume_by=op_end, min_break=min_break)
+                    charged_today.add(stuck_bus.bus_id)
+                # else: stagger gate closed — bus will be caught by P5 path
+                # on the next iteration once a slot opens up.
+
+        # Rescue the single most critical truly-stranded bus (if any).
+        if _rescue_candidate is not None:
+            _charging_detour(_rescue_candidate, config,
+                             resume_by=op_end, min_break=min_break)
+            charged_today.add(_rescue_candidate.bus_id)
 
 
         # Find the bus ready soonest that can make a valid trip
