@@ -974,26 +974,24 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
 
             min_hw = _min_hw_at(rt)
 
-            # Spacing floor: natural_gap normally.
-            # After THIS bus returned from a charging detour, use headway_min only
-            # so it can re-enter service without being blocked by its missed slot.
-            # Only True for the bus that JUST returned from charging
-            # (Charging trip exists and the last few trips include Dead/Charging).
-            recent_types = [t.trip_type for t in bus.trips[-4:]]
-            just_charged = "Charging" in recent_types
-            # just_repositioned: bus re-entering service after a non-revenue leg.
-            # Applies to: (a) reposition via Shuttle, (b) morning arrival via Dead run
-            # (no Revenue trips yet). In both cases the bus has no established phase
-            # slot and should enter at the next available headway gap, not wait for
-            # its natural_gap slot — which causes cascade bumping for late starters.
-            just_repositioned = (not just_charged and
-                                 len(bus.trips) > 0 and
-                                 bus.trips[-1].trip_type in ("Shuttle", "Dead") and
-                                 not any(t.trip_type == "Revenue" for t in bus.trips))
-            # Circular routes: all trips are same direction, natural_gap fills
-            # all slots exactly — use headway floor only so buses aren't blocked.
-            min_spacing = (min_hw if (just_charged or just_repositioned or is_circular)
-                           else max(min_hw, natural_gap))
+            # ── Headway spacing — P6 hard floor only ─────────────────────────
+            # The configured headway profile is a SCORING TARGET, not a hard floor.
+            # Enforcing it as a hard floor causes cascade bumping: buses pile up
+            # waiting for their natural_gap slot, then depart in a burst, creating
+            # the very spikes we want to eliminate.
+            #
+            # The ONLY hard floor is P6 = SAME_DIR_GAP (5 min) — a physical safety
+            # rule. All headway shaping above 5 min is handled by the Global Headway
+            # Balancer scoring below using:
+            #   target_gap = max(configured_band_headway, natural_gap)
+            # This achieves uniform spacing within each time band without blocking
+            # buses that could fill a growing gap sooner.
+            #
+            # Applies equally to Planning-Compliant, Efficiency, and circular routes.
+            # just_charged / just_repositioned flags no longer needed: P6-floor lets
+            # re-entering buses fill the earliest available gap immediately.
+            min_spacing = SAME_DIR_GAP   # P6 only — 5-min safety floor
+
             last_same = None
             for other in buses:
                 cand = _last_revenue_in_direction(other, next_dir, trip_start)
@@ -1004,17 +1002,8 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                 gap = (rt - last_same.actual_departure).total_seconds() / 60
                 if gap < min_spacing:
                     rt = last_same.actual_departure + timedelta(minutes=min_spacing)
-                    # Recompute min_hw at the bumped rt — the bus may now be in a
-                    # different headway band with a different minimum.
-                    min_hw = _min_hw_at(rt)
-                    min_spacing = (min_hw if (just_charged or just_repositioned or is_circular)
-                                   else max(min_hw, natural_gap))
-                    # One more bump check with updated spacing
-                    gap2 = (rt - last_same.actual_departure).total_seconds() / 60
-                    if gap2 < min_spacing:
-                        rt = last_same.actual_departure + timedelta(minutes=min_spacing)
-                    # Persist the bumped rt so this bus is not reset on the next
-                    # outer-loop iteration — preventing cascade over-bumping.
+                    # Persist the P6-bumped rt so this bus is not reset on the
+                    # next outer-loop iteration.
                     headway_hold[hold_key] = rt
 
             # Travel time from profile or segment config
