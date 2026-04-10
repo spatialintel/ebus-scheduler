@@ -866,11 +866,19 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
             # Scenario 1: already stranded — can't return to depot safely now
             stranded_now = stuck_bus.soc_percent - actual_cost_home < SOC_FLOOR
             # Scenario 2: lookahead — taking the next revenue trip would leave the
-            # bus unable to return home (worst-case: trip ends at far terminal).
-            # Use a small buffer (+2%) to trigger slightly early.
+            # bus unable to return home.
+            # IMPORTANT: use the cost home from the END of the next trip, not the
+            # worst-case far terminal. A bus at the far terminal takes an UP trip
+            # and ends at the near terminal — cost home is much less.
+            if stuck_bus.current_location == far_loc:
+                # Next trip is UP → ends at rev_start (near terminal)
+                cost_home_after_trip = _soc_cost_to_depot(rev_start, config)
+            else:
+                # Next trip is DN → ends at far terminal (conservative)
+                cost_home_after_trip = max_cost_home
             stuck_after_next = (stuck_bus.soc_percent
                                  - one_trip_drain
-                                 - max_cost_home) < SOC_FLOOR + 2.0
+                                 - cost_home_after_trip) < SOC_FLOOR + 2.0
             if stranded_now or stuck_after_next:
                 _charging_detour(stuck_bus, config,
                                  resume_by=op_end, min_break=min_break)
@@ -1128,9 +1136,17 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
         # the midday window entirely, especially when the detour from far_loc is long.
         _needs_midday_charge = (best_bus.bus_id not in charged_today and
                                 best_bus.soc_percent < midday_soc)
+
+        # "Serve return trip first" rule: when a bus arrives at the far terminal,
+        # always let it serve the return trip before going for charging.
+        # This prevents large service gaps caused by charging at the far terminal
+        # (which forces a 73-min absence on the return side of the route).
+        # Safety valve: if the P5 window has < 90 min remaining, charge immediately
+        # to avoid missing the window entirely on long routes.
+        _p5_window_remaining = (_charge_window(config)[1] - best_bus.current_time).total_seconds() / 60
         at_far_loc = (not is_circular and
                       best_bus.current_location == far_loc and
-                      not (_in_charge_window(best_bus, config) and _needs_midday_charge))
+                      _p5_window_remaining > 90)
 
         def _latest_charge_return_time(buses):
             """Return the latest time any bus is expected to return from a charge detour."""

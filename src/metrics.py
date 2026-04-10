@@ -9,7 +9,7 @@ Usage:
 """
 
 from __future__ import annotations
-__version__ = "2026-03-24-b1"  # auto-stamped
+__version__ = "2026-04-09-p4"
 
 from dataclasses import dataclass, field
 from src.models import BusState, RouteConfig
@@ -43,12 +43,17 @@ class ScheduleMetrics:
     buses_below_trigger: int = 0        # buses that dropped below trigger SOC
     charging_stops: int = 0
 
+    # Headway evenness (p4 additions)
+    max_headway_gap_min: float = 0.0    # largest single departure gap (UP or DN)
+    headway_cv: float = 0.0             # coefficient of variation of gaps (0=perfect)
+
     # Optimizer weights (configurable)
     WEIGHTS: dict = field(default_factory=lambda: {
-        "dead_km_ratio": 0.25,
-        "km_range_norm": 0.35,          # normalised by avg km
-        "breaks_at_minimum_pct": 0.15,
-        "soc_penalty": 0.25,
+        "dead_km_ratio":          0.25,
+        "km_range_norm":          0.25,   # normalised by avg km
+        "breaks_at_minimum_pct":  0.10,
+        "soc_penalty":            0.20,
+        "headway_cv":             0.20,   # NEW: penalise uneven headways
     }, repr=False)
 
     def weighted_score(self) -> float:
@@ -63,11 +68,13 @@ class ScheduleMetrics:
         # SOC penalty: higher if buses go below min_soc or many below trigger
         soc_penalty = (100 - self.min_soc_seen) / 100 + self.buses_below_trigger * 0.1
 
+        # headway_cv already normalised (0 = perfect even spacing)
         return (
-            w["dead_km_ratio"] * self.dead_km_ratio
-            + w["km_range_norm"] * km_range_norm
+            w["dead_km_ratio"]          * self.dead_km_ratio
+            + w["km_range_norm"]        * km_range_norm
             + w["breaks_at_minimum_pct"] * breaks_pct
-            + w["soc_penalty"] * soc_penalty
+            + w["soc_penalty"]          * soc_penalty
+            + w["headway_cv"]           * min(self.headway_cv, 2.0)  # cap at 2
         )
 
     def summary(self) -> str:
@@ -80,6 +87,8 @@ class ScheduleMetrics:
             f"Breaks at minimum: {self.breaks_at_minimum}",
             f"Min SOC seen: {self.min_soc_seen:.1f}%",
             f"Charging stops: {self.charging_stops}",
+            f"Max headway gap: {self.max_headway_gap_min:.0f} min",
+            f"Headway CV: {self.headway_cv:.3f}",
             f"Weighted score: {self.weighted_score():.4f}",
         ]
         return "\n".join(lines)
@@ -146,5 +155,28 @@ def compute_metrics(
             m.min_soc_seen = min(m.min_soc_seen, soc)
         if soc < config.trigger_soc_percent:
             m.buses_below_trigger += 1
+
+    # ── Headway gap statistics ────────────────────────────────────────────────
+    # Compute over all consecutive same-direction revenue departures.
+    all_gaps: list[float] = []
+    for direction in ("UP", "DN"):
+        deps = sorted([
+            t.actual_departure
+            for b in buses for t in b.trips
+            if t.trip_type == "Revenue" and t.direction == direction
+            and t.actual_departure is not None
+        ])
+        for i in range(1, len(deps)):
+            gap = (deps[i] - deps[i - 1]).total_seconds() / 60
+            if gap > 0:
+                all_gaps.append(gap)
+
+    if all_gaps:
+        m.max_headway_gap_min = max(all_gaps)
+        avg_gap = sum(all_gaps) / len(all_gaps)
+        if avg_gap > 0 and len(all_gaps) > 1:
+            variance = sum((g - avg_gap) ** 2 for g in all_gaps) / len(all_gaps)
+            m.headway_cv = (variance ** 0.5) / avg_gap
+    # ─────────────────────────────────────────────────────────────────────────
 
     return m

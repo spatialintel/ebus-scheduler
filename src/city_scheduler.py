@@ -1,39 +1,45 @@
 """
 city_scheduler.py — Citywide multi-route scheduling orchestrator.
 
-Two modes:
+Three modes:
 
-  Optimizer OFF (headway-driven, planning-compliant):
-    1. Run each route with its config fleet_size
-    2. Compute time-sliced PVR -> detect surplus/deficit
+  Planning-Compliant (mode='planning'):
+    1. Run each route with its config fleet_size + headway profile
+    2. Time-sliced PVR -> detect surplus/deficit
     3. Transfer surplus buses to deficit routes (depot-compatible only)
     4. Re-run only affected routes with adjusted fleet_size
-    5. Post-rebalance stability check (PVR drift > 0.5 flagged)
+    5. Post-rebalance stability check
     6. Return CitySchedule
 
-  Optimizer ON (efficiency-maximising, KPI-driven):
-    1. For each route, binary-search minimum fleet satisfying ALL P1-P6 rules
-       (including the headway floor from the profile — headway is NOT ignored)
-    2. Sum = citywide minimum fleet
-    3. If user fleet > minimum, distribute extras to worst-scoring routes
+  Efficiency-Maximising (mode='efficiency'):
+    1. Binary-search minimum fleet per route satisfying P1-P6 AND headway ceiling
+    2. Distribute extras to worst-scoring routes
+    3. Convergence loop: re-score and re-distribute until stable (max 2 passes)
     4. Return CitySchedule
 
-  Key distinction:
-    Planning-Compliant  -> respects config fleet_size; rebalances surplus
-    Efficiency-Maximising -> overrides fleet_size; headway floor still enforced
-
-Mode labels shown in the UI:
-  Optimizer OFF -> "Planning-Compliant" (follows headway profile strictly)
-  Optimizer ON  -> "Efficiency-Maximising" (finds minimum feasible fleet)
+  Service Maximization (mode='service_max'):
+    1. Use fleet_size from config (no override, no rebalancing)
+    2. Ignore configured headway profile
+    3. Compute natural headway = ceil(max_cycle_time / fleet_size) per route
+    4. Create flat single-band headway profile with constant natural headway
+    5. Run scheduler with flat profile → even spacing at minimum achievable frequency
+    6. Return CitySchedule
 
 Usage:
     from src.city_scheduler import schedule_city
 
-    result = schedule_city(city_config, optimize=False)
+    result = schedule_city(city_config, mode='planning')   # default
+    result = schedule_city(city_config, mode='efficiency')
+    result = schedule_city(city_config, mode='service_max')
 """
 
 from __future__ import annotations
-__version__ = "2026-04-09-p2"
+__version__ = "2026-04-09-p4"
+
+import math
+from datetime import time as _time
+
+import pandas as pd
 
 from src.city_models import (
     CityConfig, CitySchedule, RouteResult, RouteInput, Transfer,
@@ -49,16 +55,66 @@ from src.metrics import compute_metrics
 
 
 # ---------------------------------------------------------------------------
-# Single-route runner (shared by both modes)
+# Service Maximization helpers
+# ---------------------------------------------------------------------------
+
+def _natural_headway(ri: RouteInput) -> float:
+    """
+    Compute minimum achievable constant headway given the configured fleet.
+
+    natural_hw = ceil(max_cycle_time / fleet_size)
+
+    max_cycle_time uses the worst-case (peak) travel band so the resulting
+    headway is feasible at all times of day.
+    """
+    config = ri.config
+    max_cycle = 0.0
+    for _, row in ri.travel_time_df.iterrows():
+        try:
+            up = float(row["up_min"])
+            dn = float(row["dn_min"])
+            layover     = config.preferred_layover_min
+            off_extra   = getattr(config, "off_peak_layover_extra_min", 0)
+            # Use worst-case break (includes off-peak extra) for conservative estimate
+            max_break   = layover + off_extra
+            cycle       = up + dn + layover + max_break
+            max_cycle   = max(max_cycle, cycle)
+        except Exception:
+            continue
+
+    if max_cycle == 0:
+        max_cycle = 2 * 50 + 2 * config.preferred_layover_min  # fallback
+
+    fleet = max(1, config.fleet_size)
+    return max(5.0, math.ceil(max_cycle / fleet))
+
+
+def _flat_headway_df(ri: RouteInput, headway_min: float) -> pd.DataFrame:
+    """
+    Create a single-band headway_df spanning the full operating window.
+    Replaces the configured profile entirely.
+    """
+    return pd.DataFrame([{
+        "time_from":   ri.config.operating_start.strftime("%H:%M"),
+        "time_to":     ri.config.operating_end.strftime("%H:%M"),
+        "headway_min": headway_min,
+    }])
+
+
+# ---------------------------------------------------------------------------
+# Single-route runner
 # ---------------------------------------------------------------------------
 
 def _run_single_route(
     ri: RouteInput,
     fleet_override: int | None = None,
+    headway_df_override: "pd.DataFrame | None" = None,
 ) -> RouteResult:
     """
-    Schedule one route.  If fleet_override is given, temporarily patches
-    config.fleet_size before running (always restored in finally block).
+    Schedule one route.
+    fleet_override: temporarily patches config.fleet_size before running.
+    headway_df_override: replaces ri.headway_df for this run only.
+    Both are restored / not mutated after the call.
     """
     config         = ri.config
     original_fleet = config.fleet_size
@@ -66,12 +122,14 @@ def _run_single_route(
     if fleet_override is not None and fleet_override != config.fleet_size:
         config.fleet_size = fleet_override
 
+    headway_df = headway_df_override if headway_df_override is not None else ri.headway_df
+
     try:
-        trips         = generate_trips(config, ri.headway_df, ri.travel_time_df)
+        trips         = generate_trips(config, headway_df, ri.travel_time_df)
         revenue_count = len([t for t in trips if t.trip_type == "Revenue"])
         buses         = schedule_buses(
             config, trips,
-            headway_df=ri.headway_df,
+            headway_df=headway_df,
             travel_time_df=ri.travel_time_df,
         )
         metrics = compute_metrics(
@@ -101,7 +159,7 @@ def _run_single_route(
         return RouteResult(
             route_code=config.route_code,
             config=config,
-            headway_df=ri.headway_df,
+            headway_df=headway_df,
             travel_time_df=ri.travel_time_df,
             buses=buses,
             metrics=metrics,
@@ -116,42 +174,26 @@ def _run_single_route(
 
 
 # ---------------------------------------------------------------------------
-# Optimizer OFF: Headway-Driven / Planning-Compliant
+# Mode: Planning-Compliant
 # ---------------------------------------------------------------------------
 
 def _schedule_headway_driven(city: CityConfig) -> CitySchedule:
-    """
-    Mode: Optimizer OFF  (Planning-Compliant)
+    """Optimizer OFF — Planning-Compliant."""
 
-    Step 1: Initial run — every route at its configured fleet_size
-    Step 2: Time-sliced PVR balance -> rebalancing plan
-    Step 3: Re-run only routes whose fleet changed
-    Step 4: Post-rebalance stability check
-    Step 5: Assemble CitySchedule
-    """
-
-    # Step 1 — initial run
     results: dict[str, RouteResult] = {}
     for code, ri in city.routes.items():
         results[code] = _run_single_route(ri)
 
-    # Step 2 — rebalancing plan (uses time-sliced PVR internally)
     pre_balance = compute_fleet_balance(city)
     transfers   = compute_rebalancing_plan(city)
 
     if not transfers:
-        # No transfers needed — still attach empty stability flags
-        post_pvr    = {code: r.pvr for code, r in results.items()}
-        post_fleet  = {code: r.fleet_allocated for code, r in results.items()}
-        stability   = check_rebalance_stability(city, pre_balance, post_fleet, post_pvr)
-        return CitySchedule(
-            city_config=city,
-            results=results,
-            transfers=[],
-            stability_flags=stability,
-        )
+        post_pvr   = {code: r.pvr for code, r in results.items()}
+        post_fleet = {code: r.fleet_allocated for code, r in results.items()}
+        stability  = check_rebalance_stability(city, pre_balance, post_fleet, post_pvr)
+        return CitySchedule(city_config=city, results=results,
+                            transfers=[], stability_flags=stability)
 
-    # Step 3 — re-run affected routes
     adjusted_fleet = apply_transfers(city, transfers)
     for code, new_fleet in adjusted_fleet.items():
         if new_fleet != city.routes[code].config.fleet_size:
@@ -159,41 +201,49 @@ def _schedule_headway_driven(city: CityConfig) -> CitySchedule:
             results[code] = _run_single_route(ri, fleet_override=new_fleet)
             results[code].fleet_allocated = new_fleet
 
-    # Step 4 — stability check
     post_pvr   = {code: r.pvr for code, r in results.items()}
     stability  = check_rebalance_stability(city, pre_balance, adjusted_fleet, post_pvr)
 
-    return CitySchedule(
-        city_config=city,
-        results=results,
-        transfers=transfers,
-        stability_flags=stability,
-    )
+    return CitySchedule(city_config=city, results=results,
+                        transfers=transfers, stability_flags=stability)
 
 
 # ---------------------------------------------------------------------------
-# Optimizer ON: KPI-Driven / Efficiency-Maximising
+# Mode: Efficiency-Maximising
 # ---------------------------------------------------------------------------
 
 def _find_min_fleet(ri: RouteInput, max_fleet: int = 20) -> int:
     """
-    Binary search for the minimum fleet_size that produces a valid schedule
-    (P1-P6 satisfied, SOC floor respected, >= 80 % trip coverage).
+    Binary search for minimum fleet satisfying ALL P1-P6 rules
+    AND a headway ceiling of 3× the configured peak headway.
+
+    The headway ceiling prevents the optimizer from declaring a schedule
+    feasible that has unacceptably large service gaps even if all hard
+    rules are technically met.
     """
     lo, hi = 1, max_fleet
     best   = max_fleet
 
+    # Headway ceiling: max acceptable gap = 3 × peak configured headway
+    try:
+        peak_hw = float(ri.headway_df["headway_min"].min())
+        max_acceptable_gap = peak_hw * 3
+    except Exception:
+        max_acceptable_gap = 180.0  # 3 hours fallback
+
     while lo <= hi:
         mid = (lo + hi) // 2
         try:
-            result   = _run_single_route(ri, fleet_override=mid)
-            soc_ok   = result.metrics.min_soc_seen >= ri.config.min_soc_percent
+            result    = _run_single_route(ri, fleet_override=mid)
+            soc_ok    = result.metrics.min_soc_seen >= ri.config.min_soc_percent
             breaks_ok = result.metrics.negative_breaks == 0
-            coverage = (result.metrics.revenue_trips_assigned /
-                        max(1, result.metrics.revenue_trips_total))
-            trips_ok = coverage >= 0.80
+            coverage  = (result.metrics.revenue_trips_assigned /
+                         max(1, result.metrics.revenue_trips_total))
+            trips_ok  = coverage >= 0.80
+            # NEW: headway ceiling — reject schedules with unacceptably large gaps
+            headway_ok = result.metrics.max_headway_gap_min <= max_acceptable_gap
 
-            if soc_ok and breaks_ok and trips_ok:
+            if soc_ok and breaks_ok and trips_ok and headway_ok:
                 best = mid
                 hi   = mid - 1
             else:
@@ -206,14 +256,14 @@ def _find_min_fleet(ri: RouteInput, max_fleet: int = 20) -> int:
 
 def _schedule_kpi_driven(city: CityConfig) -> CitySchedule:
     """
-    Mode: Optimizer ON  (Efficiency-Maximising)
+    Optimizer ON — Efficiency-Maximising with convergence loop.
 
-    Step 1: Binary-search minimum fleet per route
-    Step 2: Distribute any surplus citywide fleet to worst-scoring routes
-    Step 3: Final run with adjusted fleet
+    Pass 1: binary-search minimum fleet per route.
+    Pass 2 (convergence): re-score with adjusted fleet, redistribute extras
+            to routes whose scores worsened (max 1 extra pass).
     """
 
-    # Step 1 — minimum fleet per route
+    # ── Pass 1: minimum fleet ────────────────────────────────────────────────
     min_fleets: dict[str, int] = {}
     for code, ri in city.routes.items():
         min_fleets[code] = _find_min_fleet(ri)
@@ -223,53 +273,81 @@ def _schedule_kpi_driven(city: CityConfig) -> CitySchedule:
     adjusted   = dict(min_fleets)
     transfers: list[Transfer] = []
 
-    # Step 2 — distribute extras (if any)
-    if user_total > total_min:
-        extras = user_total - total_min
-
-        scores: dict[str, float] = {}
-        for code, ri in city.routes.items():
-            try:
-                result      = _run_single_route(ri, fleet_override=min_fleets[code])
-                scores[code] = result.metrics.weighted_score()
-            except Exception:
-                scores[code] = float("inf")
-
+    def _distribute_extras(extras: int, base_alloc: dict[str, int],
+                            scores: dict[str, float]) -> tuple[dict, list[Transfer]]:
+        """Distribute surplus buses to worst-scoring routes, return new alloc + transfers."""
+        alloc = dict(base_alloc)
+        new_tx: list[Transfer] = []
         ranked = sorted(scores, key=lambda c: -scores[c])
-        bus_counter = 0
+        ctr = len(transfers)
         while extras > 0 and ranked:
             for code in ranked:
                 if extras <= 0:
                     break
-                adjusted[code] += 1
+                alloc[code] += 1
                 extras -= 1
-                bus_counter += 1
-                transfers.append(Transfer(
-                    bus_id=f"EXTRA-{bus_counter:03d}",
+                ctr += 1
+                new_tx.append(Transfer(
+                    bus_id=f"EXTRA-{ctr:03d}",
                     from_route="POOL",
                     to_route=code,
                     reason="kpi_improvement",
                 ))
+        return alloc, new_tx
+
+    if user_total > total_min:
+        extras = user_total - total_min
+
+        # Score routes at minimum fleet
+        scores: dict[str, float] = {}
+        for code, ri in city.routes.items():
+            try:
+                r = _run_single_route(ri, fleet_override=min_fleets[code])
+                scores[code] = r.metrics.weighted_score()
+            except Exception:
+                scores[code] = float("inf")
+
+        adjusted, transfers = _distribute_extras(extras, adjusted, scores)
+
+        # ── Pass 2: convergence ──────────────────────────────────────────────
+        # Re-score with adjusted fleet; if any route's score worsened vs Pass 1,
+        # redistribute up to 1 extra bus to it.
+        rescore: dict[str, float] = {}
+        for code, ri in city.routes.items():
+            try:
+                r = _run_single_route(ri, fleet_override=adjusted[code])
+                rescore[code] = r.metrics.weighted_score()
+            except Exception:
+                rescore[code] = scores.get(code, float("inf"))
+
+        # Routes that got worse → redistribute 1 bus each if still extras
+        extra_pool = sum(1 for code in city.routes
+                         if rescore.get(code, 0) > scores.get(code, 0) * 1.05)
+        if extra_pool > 0:
+            adjusted, extra_tx = _distribute_extras(
+                extra_pool,
+                adjusted,
+                {c: rescore[c] for c in rescore if rescore[c] > scores.get(c, 0) * 1.05},
+            )
+            transfers.extend(extra_tx)
 
     elif user_total > 0 and user_total < total_min:
-        # Under-provisioned: proportional allocation with floor of 1
         remaining       = max(0, user_total - len(city.routes))
         total_pvr_weight = sum(min_fleets.values())
         codes            = sorted(min_fleets, key=lambda c: -min_fleets[c])
-        allocated_so_far = 0
+        alloc_so_far     = 0
         adjusted         = {}
         for code in codes:
-            share          = 1 + round(remaining * min_fleets[code] / total_pvr_weight)
+            share          = 1 + round(remaining * min_fleets[code] / max(1, total_pvr_weight))
             adjusted[code] = max(1, share)
-            allocated_so_far += adjusted[code]
-        # Correct rounding drift downward
-        while allocated_so_far > user_total and allocated_so_far > len(city.routes):
+            alloc_so_far  += adjusted[code]
+        while alloc_so_far > user_total and alloc_so_far > len(city.routes):
             for code in reversed(codes):
-                if adjusted[code] > 1 and allocated_so_far > user_total:
-                    adjusted[code]   -= 1
-                    allocated_so_far -= 1
+                if adjusted[code] > 1 and alloc_so_far > user_total:
+                    adjusted[code] -= 1
+                    alloc_so_far   -= 1
 
-    # Step 3 — final run
+    # ── Final run ────────────────────────────────────────────────────────────
     results: dict[str, RouteResult] = {}
     for code, ri in city.routes.items():
         fleet = adjusted.get(code, min_fleets.get(code, ri.config.fleet_size))
@@ -277,12 +355,35 @@ def _schedule_kpi_driven(city: CityConfig) -> CitySchedule:
         results[code].fleet_allocated = fleet
         results[code].fleet_original  = ri.config.fleet_size
 
-    return CitySchedule(
-        city_config=city,
-        results=results,
-        transfers=transfers,
-        stability_flags=[],   # not applicable for KPI mode
-    )
+    return CitySchedule(city_config=city, results=results,
+                        transfers=transfers, stability_flags=[])
+
+
+# ---------------------------------------------------------------------------
+# Mode: Service Maximization
+# ---------------------------------------------------------------------------
+
+def _schedule_service_maximization(city: CityConfig) -> CitySchedule:
+    """
+    Service Maximization — uses config fleet, ignores headway profile,
+    targets constant minimum-achievable headway for even spacing.
+
+    For each route:
+      1. natural_hw = ceil(max_cycle_time / fleet_size)
+      2. Create flat headway_df = {operating_start → operating_end: natural_hw}
+      3. Run scheduler with flat headway_df
+    """
+    results: dict[str, RouteResult] = {}
+    for code, ri in city.routes.items():
+        nat_hw   = _natural_headway(ri)
+        flat_df  = _flat_headway_df(ri, nat_hw)
+        result   = _run_single_route(ri, headway_df_override=flat_df)
+        # Store the computed natural headway in the result for UI display
+        result.headway_df = flat_df
+        results[code] = result
+
+    return CitySchedule(city_config=city, results=results,
+                        transfers=[], stability_flags=[])
 
 
 # ---------------------------------------------------------------------------
@@ -291,19 +392,29 @@ def _schedule_kpi_driven(city: CityConfig) -> CitySchedule:
 
 def schedule_city(
     city: CityConfig,
-    optimize: bool = False,
+    optimize: bool = False,   # kept for backward compat
+    mode: str = "planning",   # "planning" | "efficiency" | "service_max"
 ) -> CitySchedule:
     """
     Main entry point for citywide scheduling.
 
     Args:
         city:     CityConfig with all routes loaded
-        optimize: False -> Planning-Compliant  (Optimizer OFF)
-                  True  -> Efficiency-Maximising (Optimizer ON)
+        optimize: legacy flag — True maps to mode='efficiency'
+        mode:     'planning'    → Planning-Compliant (headway profile respected)
+                  'efficiency'  → Efficiency-Maximising (minimum fleet, KPI-driven)
+                  'service_max' → Service Maximization (fixed fleet, constant headway)
 
     Returns:
         CitySchedule with per-route results + transfer records + stability flags
     """
-    if optimize:
+    # Backward compat: old callers pass optimize=True for efficiency mode
+    if optimize and mode == "planning":
+        mode = "efficiency"
+
+    if mode == "efficiency":
         return _schedule_kpi_driven(city)
-    return _schedule_headway_driven(city)
+    elif mode == "service_max":
+        return _schedule_service_maximization(city)
+    else:
+        return _schedule_headway_driven(city)
