@@ -1175,25 +1175,80 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                         break
             return latest
 
-        # Charge stagger gate — space charge departures evenly across the charge window.
-        # Each bus gets its own slot: window_duration / fleet_size minutes apart.
-        # Example: 6 buses over 300-min window → 50-min slots (11:00, 11:50, 12:40, ...)
-        # This ensures buses are staggered so at most 1 is absent at any time
-        # (assuming detour ≤ slot width), eliminating service gaps during charging.
-        _last_chg = _last_charge_start(buses, best_bus)
+        def _count_active_detours(buses, current_bus):
+            """Count buses currently absent on a charging detour (departed, not yet back in revenue service)."""
+            count = 0
+            for b in buses:
+                if b is current_bus:
+                    continue
+                if not b.trips:
+                    continue
+                # Bus is on detour if its most recent trips are Dead/Charging
+                # with no Revenue trip after the last Charging trip
+                last_chg_idx = None
+                for i, t in enumerate(b.trips):
+                    if t.trip_type == "Charging":
+                        last_chg_idx = i
+                if last_chg_idx is not None:
+                    # Check if any Revenue trip after the charging trip
+                    has_rev_after = any(
+                        t.trip_type == "Revenue"
+                        for t in b.trips[last_chg_idx + 1:]
+                    )
+                    if not has_rev_after:
+                        count += 1
+            return count
+
+        # ── Physics-aware charge stagger gate ───────────────────────────────
+        # Estimate full charging round-trip: dead run to depot + charge time
+        # + dead run back + break. This is used to compute:
+        #   (a) min gap between charge departures
+        #   (b) max concurrent chargers
+        #
+        # With fleet=10, round_trip=170 min, window=360 min:
+        #   ceil(10×170/360) = 5 buses simultaneously absent is unavoidable
+        #   without terminal charging. The gate limits this to max_concurrent
+        #   to prevent worse bunching from poor timing.
+        try:
+            _dead_run_min = config.get_travel_time(nearest_node, config.depot)
+        except Exception:
+            _dead_run_min = 40
+        _soc_delta  = max(10.0, config.target_soc_percent - config.trigger_soc_percent)
+        _kwh_needed = _soc_delta / 100.0 * config.battery_kwh
+        _charge_min = (_kwh_needed /
+                       max(1.0, config.depot_charger_kw * config.depot_charger_efficiency)
+                       * 60.0)
+        _estimated_round_trip = _dead_run_min * 2 + _charge_min + min_break
+
         _cws, _cwe = _charge_window(config)
         _window_min = (_cwe - _cws).total_seconds() / 60
-        _min_charge_gap = _window_min / max(1, config.fleet_size)
+
+        # Max concurrent chargers: fleet // 5, minimum 1.
+        # fleet=5 → 1,  fleet=10 → 2,  fleet=15 → 3
+        # Limits simultaneous absence to avoid clustering of return times.
+        _max_concurrent = max(1, config.fleet_size // 5)
+
+        # Min gap = max(even distribution, round_trip / max_concurrent).
+        # Even distribution alone under-estimates for long routes.
+        # round_trip / max_concurrent ensures buses return before the next wave departs.
+        _min_charge_gap = max(
+            _window_min / max(1, config.fleet_size),
+            _estimated_round_trip / _max_concurrent,
+        )
+
+        _last_chg = _last_charge_start(buses, best_bus)
+        _active_detours = _count_active_detours(buses, best_bus)
+
         charge_stagger_ok = (
-            _last_chg is None or
-            (best_bus.current_time - _last_chg).total_seconds() / 60 >= _min_charge_gap
+            (_last_chg is None or
+             (best_bus.current_time - _last_chg).total_seconds() / 60 >= _min_charge_gap)
+            and _active_detours < _max_concurrent  # concurrent cap
         )
 
         if (_in_charge_window(best_bus, config) and
-                config.fleet_size <= 10 and
                 best_bus.bus_id not in charged_today and
                 best_bus.soc_percent < midday_soc and
-                charge_stagger_ok and          # ← stagger gate: don't overlap charge detours
+                charge_stagger_ok and
                 not at_far_loc):
             _charging_detour(best_bus, config,
                              resume_by=op_end, min_break=min_break)
