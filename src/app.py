@@ -1835,9 +1835,12 @@ elif app_mode == "🏙️ Citywide":
 
     # ── CITY TAB 7: Fleet Config Editor ───────────────────────────────────────
     with tab_fleet_config:
-        st.markdown('<div class="section-title">Adjust Fleet Size per Route</div>',
+
+        # ── Section A: Fleet size overview across all routes ──────────────────
+        st.markdown('<div class="section-title">Fleet Size — All Routes</div>',
                     unsafe_allow_html=True)
-        st.caption("Edit fleet sizes below and click Re-run to regenerate with updated allocation.")
+        st.caption("Edit fleet sizes below and click **Re-run with Updated Fleet** to regenerate "
+                   "the full citywide schedule with new allocations.")
         pvrs = compute_pvr_all(city_cfg)
         edit_rows = []
         for code in sorted(city_cfg.routes.keys()):
@@ -1880,6 +1883,210 @@ elif app_mode == "🏙️ Citywide":
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error: {e}")
+
+        st.divider()
+
+        # ── Section B: Per-route detailed config editor ───────────────────────
+        st.markdown('<div class="section-title">⚙️ Per-Route Config Editor</div>',
+                    unsafe_allow_html=True)
+        st.caption(
+            "Select a route, edit any parameter, and click **Apply & Re-run Route**. "
+            "Only the selected route is re-scheduled — all others remain unchanged."
+        )
+
+        _cfg_route_codes = sorted(city_cfg.routes.keys())
+        _cfg_sel = st.selectbox(
+            "Route to configure",
+            _cfg_route_codes,
+            format_func=lambda c: f"{c} — {city_cfg.routes[c].config.route_name}",
+            key="city_cfg_route_sel",
+        )
+
+        if _cfg_sel:
+            _ri_cfg  = city_cfg.routes[_cfg_sel]
+            _cfg     = _ri_cfg.config
+            _hw_edit = _ri_cfg.headway_df.copy()
+
+            with st.form(key=f"city_route_cfg_form_{_cfg_sel}"):
+                col_a, col_b = st.columns(2)
+
+                with col_a:
+                    st.markdown("#### 🚍 Fleet & Battery")
+                    _new_fleet   = st.number_input("Fleet Size", value=_cfg.fleet_size,
+                                                    min_value=1, max_value=50, step=1,
+                                                    help="Number of buses assigned to this route.")
+                    _new_battery = st.number_input("Battery (kWh)",
+                                                    value=float(_cfg.battery_kwh),
+                                                    min_value=10.0, step=10.0)
+                    _new_cons    = st.number_input("Consumption (kWh/km)",
+                                                    value=float(_cfg.consumption_rate),
+                                                    min_value=0.1, step=0.1, format="%.2f")
+                    _new_init_soc = st.number_input("Initial SOC (%)",
+                                                     value=float(_cfg.initial_soc_percent),
+                                                     min_value=20.0, max_value=100.0, step=5.0)
+                    _new_min_km  = st.number_input("Min KM per Bus (0 = none)",
+                                                    value=float(getattr(_cfg, "min_km_per_bus", 0)),
+                                                    min_value=0.0, step=10.0)
+                    _new_avg_spd = st.number_input("Avg Speed (km/h) — fallback",
+                                                    value=float(getattr(_cfg, "avg_speed_kmph", 30.0)),
+                                                    min_value=5.0, max_value=120.0, step=5.0)
+
+                    st.markdown("#### ⏰ Operating Hours")
+                    _new_op_start = st.text_input("Start (HH:MM)",
+                                                   value=_cfg.operating_start.strftime("%H:%M"),
+                                                   key=f"op_start_{_cfg_sel}")
+                    _new_op_end   = st.text_input("End (HH:MM)",
+                                                   value=_cfg.operating_end.strftime("%H:%M"),
+                                                   key=f"op_end_{_cfg_sel}")
+                    _new_shift    = st.text_input("Shift Split (HH:MM)",
+                                                   value=_cfg.shift_split.strftime("%H:%M"),
+                                                   key=f"shift_{_cfg_sel}")
+
+                with col_b:
+                    st.markdown("#### 🔋 Charging")
+                    _new_depot_kw   = st.number_input("Depot Charger (kW)",
+                                                       value=float(_cfg.depot_charger_kw),
+                                                       min_value=0.0, step=10.0,
+                                                       help="Set > 0 to enable depot charging. "
+                                                            "Set terminal_charger_kw > 0 in Excel to eliminate charging dead runs.")
+                    _new_depot_eff  = st.number_input("Depot Charger Efficiency (0–1)",
+                                                       value=float(_cfg.depot_charger_efficiency),
+                                                       min_value=0.0, max_value=1.0,
+                                                       step=0.05, format="%.2f")
+                    _new_trig_soc   = st.number_input("Charge Trigger SOC (%)",
+                                                       value=float(_cfg.trigger_soc_percent),
+                                                       min_value=20.0, max_value=100.0, step=5.0,
+                                                       help="SOC below which a reactive charge is triggered (P3 guard).")
+                    _new_tgt_soc    = st.number_input("Charge Target SOC (%)",
+                                                       value=float(_cfg.target_soc_percent),
+                                                       min_value=20.0, max_value=100.0, step=5.0)
+                    _new_midday_soc = st.number_input("Midday Charge Trigger SOC (%) — P5",
+                                                       value=float(getattr(_cfg, "midday_charge_soc_percent", 65.0)),
+                                                       min_value=20.0, max_value=100.0, step=5.0,
+                                                       help="Bus must be below this SOC to qualify for P5 midday charging.")
+
+                    st.markdown("#### 🔁 Break & Layover")
+                    _new_pref_lay  = st.number_input("Min Driver Break (min) — P4",
+                                                      value=int(_cfg.preferred_layover_min),
+                                                      min_value=1, step=1,
+                                                      help="Minimum break enforced between every pair of revenue trips.")
+                    _new_max_lay   = st.number_input("Max Layover (min) — P4 upper",
+                                                      value=int(getattr(_cfg, "max_layover_min", 20)),
+                                                      min_value=1, max_value=120, step=1)
+                    _new_opx_lay   = st.number_input("Off-Peak Extra Break (min)",
+                                                      value=int(getattr(_cfg, "off_peak_layover_extra_min", 0)),
+                                                      min_value=0, max_value=60, step=1,
+                                                      help="Added on top of Min Driver Break during 11:00–15:00 to widen off-peak headways.")
+                    _new_min_lay   = st.number_input("Min Terminus Layover (min)",
+                                                      value=int(_cfg.min_layover_min),
+                                                      min_value=0, step=1)
+                    _new_dead_buf  = st.number_input("Dead Run Buffer (min)",
+                                                      value=int(_cfg.dead_run_buffer_min),
+                                                      min_value=0, step=1)
+                    _new_adj_buf   = st.number_input("Break Adjustment Buffer (min)",
+                                                      value=int(_cfg.max_headway_deviation_min),
+                                                      min_value=0, step=1,
+                                                      help="Max minutes the safety-net pass can shift a trip to enforce the driver break.")
+
+                # Headway profile editor
+                st.markdown("#### 🕐 Headway Profile")
+                st.caption("Edit headway_min per time band. Time columns are read-only.")
+                _edited_hw_city = st.data_editor(
+                    _hw_edit[["time_from", "time_to", "headway_min"]].copy(),
+                    column_config={
+                        "time_from":   st.column_config.TextColumn("From", disabled=True),
+                        "time_to":     st.column_config.TextColumn("To",   disabled=True),
+                        "headway_min": st.column_config.NumberColumn(
+                            "Headway (min)", min_value=5, max_value=120, step=1,
+                            help="Target gap between consecutive same-direction departures in this band."),
+                    },
+                    hide_index=True, use_container_width=True, num_rows="fixed",
+                    key=f"city_hw_form_edit_{_cfg_sel}",
+                )
+
+                _apply_city_cfg = st.form_submit_button(
+                    f"🔄 Apply & Re-run {_cfg_sel}", type="primary"
+                )
+
+            if _apply_city_cfg:
+                def _parse_t(s):
+                    try:
+                        h, m = s.strip().split(":")
+                        return dtime(int(h), int(m))
+                    except Exception:
+                        return None
+
+                _overrides = {
+                    "fleet_size":               _new_fleet,
+                    "battery_kwh":              _new_battery,
+                    "consumption_rate":         _new_cons,
+                    "initial_soc_percent":      _new_init_soc,
+                    "min_km_per_bus":           _new_min_km,
+                    "avg_speed_kmph":           _new_avg_spd,
+                    "depot_charger_kw":         _new_depot_kw,
+                    "depot_charger_efficiency": _new_depot_eff,
+                    "trigger_soc_percent":      _new_trig_soc,
+                    "target_soc_percent":       _new_tgt_soc,
+                    "midday_charge_soc_percent":_new_midday_soc,
+                    "preferred_layover_min":    _new_pref_lay,
+                    "max_layover_min":          _new_max_lay,
+                    "off_peak_layover_extra_min": _new_opx_lay,
+                    "min_layover_min":          _new_min_lay,
+                    "dead_run_buffer_min":      _new_dead_buf,
+                    "max_headway_deviation_min": _new_adj_buf,
+                }
+                for _key, _val in [("operating_start", _new_op_start),
+                                    ("operating_end",   _new_op_end),
+                                    ("shift_split",     _new_shift)]:
+                    _t = _parse_t(_val)
+                    if _t:
+                        _overrides[_key] = _t
+
+                _updated_cfg = _apply_config_overrides(_cfg, _overrides)
+                _updated_hw  = _edited_hw_city.copy()
+
+                with st.spinner(f"Re-scheduling {_cfg_sel}…"):
+                    try:
+                        from src.trip_generator  import generate_trips  as _gen
+                        from src.bus_scheduler   import schedule_buses   as _sched
+                        from src.metrics         import compute_metrics  as _metrics
+                        from src.bus_scheduler   import check_compliance as _compliance
+                        from src.distance_engine import enrich_distances as _enrich
+
+                        _enrich(_updated_cfg)
+                        _trips    = _gen(_updated_cfg, _updated_hw, _ri_cfg.travel_time_df)
+                        _rev_ct   = len([t for t in _trips if t.trip_type == "Revenue"])
+                        _buses    = _sched(_updated_cfg, _trips,
+                                           headway_df=_updated_hw,
+                                           travel_time_df=_ri_cfg.travel_time_df)
+                        _met      = _metrics(_updated_cfg, _buses, total_revenue_trips=_rev_ct)
+                        _comp     = _compliance(_updated_cfg, _buses, headway_df=_updated_hw)
+
+                        from src.city_models import RouteResult, RouteInput
+                        _new_ri  = RouteInput(
+                            config=_updated_cfg,
+                            headway_df=_updated_hw,
+                            travel_time_df=_ri_cfg.travel_time_df,
+                        )
+                        _new_rr  = RouteResult(
+                            route_code=_cfg_sel,
+                            config=_updated_cfg,
+                            buses=_buses,
+                            metrics=_met,
+                            compliance=_comp,
+                            headway_df=_updated_hw,
+                            fleet_original=_updated_cfg.fleet_size,
+                            fleet_allocated=_updated_cfg.fleet_size,
+                            pvr=pvrs.get(_cfg_sel, 0),
+                        )
+                        cs.results[_cfg_sel]       = _new_rr
+                        city_cfg.routes[_cfg_sel]  = _new_ri
+                        st.session_state["city_result"] = cs
+                        st.session_state["city_config"] = city_cfg
+                        st.success(f"✅ {_cfg_sel} re-scheduled with updated config.")
+                        st.rerun()
+                    except Exception as _err:
+                        st.error(f"Re-schedule error: {_err}")
 
     # ── CITY TAB 8: Stability ─────────────────────────────────────────────────
     with tab_stability:
