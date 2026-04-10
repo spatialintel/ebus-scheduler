@@ -896,18 +896,29 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                                  - one_trip_drain
                                  - cost_home_after_trip) < SOC_FLOOR + 2.0
             if stuck_after_next:
-                # Reuse stagger gate logic from P5 section: count active detours.
-                _active_now = sum(
-                    1 for b in buses
-                    if b is not stuck_bus and b.bus_id not in charged_today
-                    and any(t.trip_type == "Charging" for t in b.trips)
-                    and not any(
-                        t.trip_type == "Revenue"
-                        for t in b.trips[
-                            next((i for i, t in enumerate(b.trips)
-                                  if t.trip_type == "Charging"), 0) + 1:]
-                    )
-                )
+                # Count buses currently on a charging detour — these are in
+                # charged_today AND have no Revenue trip after their last
+                # Charging trip (i.e. they haven't returned to service yet).
+                # NOTE: must NOT filter by "not in charged_today" — those ARE
+                # the buses we want to count.
+                _active_now = 0
+                for _b in buses:
+                    if _b is stuck_bus:
+                        continue
+                    if _b.bus_id not in charged_today:
+                        continue   # hasn't been sent yet — not an active detour
+                    _last_chg_i = None
+                    for _i, _t in enumerate(_b.trips):
+                        if _t.trip_type == "Charging":
+                            _last_chg_i = _i
+                    if _last_chg_i is not None:
+                        _has_rev_after = any(
+                            _t.trip_type == "Revenue"
+                            for _t in _b.trips[_last_chg_i + 1:]
+                        )
+                        if not _has_rev_after:
+                            _active_now += 1
+
                 _max_conc = max(1, config.fleet_size // 5)
                 if _active_now < _max_conc:
                     _charging_detour(stuck_bus, config,
