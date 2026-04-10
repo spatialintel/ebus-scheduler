@@ -766,7 +766,9 @@ def auto_detect_fleet(raw_config, headway_df, travel_time_df, max_fleet=20):
     for n in range(1, max_fleet + 1):
         cfg = _apply_config_overrides(raw_config, {"fleet_size": n})
         trips = generate_trips(cfg, headway_df, travel_time_df)
-        buses = schedule_buses(cfg, trips)
+        buses = schedule_buses(cfg, trips,
+                               headway_df=headway_df,
+                               travel_time_df=travel_time_df)
         rev_total    = sum(1 for t in trips   if t.trip_type == "Revenue")
         rev_assigned = sum(1 for b in buses for t in b.trips if t.trip_type == "Revenue")
         compliance   = check_compliance(cfg, buses, headway_df=headway_df)
