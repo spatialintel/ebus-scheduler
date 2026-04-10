@@ -565,6 +565,126 @@ def build_headway_chart_data(config, buses):
                              "Departure": trip.actual_departure})
     return pd.DataFrame(rows)
 
+def _configured_hw_at(t, headway_df):
+    """Return configured headway_min for the band containing datetime t."""
+    if headway_df is None or headway_df.empty:
+        return None
+    for _, row in headway_df.iterrows():
+        try:
+            tf = datetime.strptime(str(row["time_from"]), "%H:%M").time()
+            tt = datetime.strptime(str(row["time_to"]),   "%H:%M").time()
+            if tf <= t.time() < tt:
+                return int(row["headway_min"])
+        except Exception:
+            continue
+    # fallback: last band
+    try:
+        return int(headway_df.iloc[-1]["headway_min"])
+    except Exception:
+        return None
+
+
+def build_headway_fig(deps, headway_df, direction, color, route_label):
+    """
+    Build a detailed plotly headway bar chart for one direction.
+
+    Features:
+    - Bars coloured by severity: green (≤ target), amber (≤ 150% target), red (> 150%)
+    - Exact minute value annotated above every bar
+    - Step-line overlay showing the configured headway profile
+    - Anomaly threshold line at 2× configured headway
+    - Gridlines for readability
+    """
+    if len(deps) < 2:
+        return None
+
+    dep_labels, gap_values, cfg_hws = [], [], []
+    for i in range(1, len(deps)):
+        gap   = round((deps[i] - deps[i-1]).total_seconds() / 60)
+        cfg_hw = _configured_hw_at(deps[i], headway_df)
+        dep_labels.append(deps[i].strftime("%H:%M"))
+        gap_values.append(gap)
+        cfg_hws.append(cfg_hw)
+
+    # Colour each bar: green = on-target, amber = moderate deviation, red = anomaly
+    bar_colors = []
+    for gap, cfg in zip(gap_values, cfg_hws):
+        if cfg is None:
+            bar_colors.append(color)
+        elif gap <= cfg * 1.15:
+            bar_colors.append(color)           # on-target
+        elif gap <= cfg * 1.5:
+            bar_colors.append("#f59e0b")       # amber — notable deviation
+        else:
+            bar_colors.append("#ef4444")       # red — anomaly / outlier
+
+    fig = go.Figure()
+
+    # Bars
+    fig.add_trace(go.Bar(
+        x=dep_labels,
+        y=gap_values,
+        marker_color=bar_colors,
+        marker_line_color="rgba(0,0,0,0.15)",
+        marker_line_width=0.5,
+        text=[f"<b>{v}</b>" for v in gap_values],
+        textposition="outside",
+        textfont=dict(size=10),
+        name="Actual headway",
+        hovertemplate="Dep: %{x}<br>Gap: %{y} min<extra></extra>",
+        cliponaxis=False,
+    ))
+
+    # Configured headway step-line
+    if any(c is not None for c in cfg_hws):
+        fig.add_trace(go.Scatter(
+            x=dep_labels,
+            y=cfg_hws,
+            mode="lines",
+            line=dict(color="#f97316", width=2, dash="dash"),
+            name="Configured headway",
+            hovertemplate="Configured: %{y} min<extra></extra>",
+        ))
+
+    # Anomaly threshold line at 2× median configured headway
+    median_cfg = sorted([c for c in cfg_hws if c])[len([c for c in cfg_hws if c])//2] if any(cfg_hws) else None
+    if median_cfg:
+        fig.add_hline(
+            y=median_cfg * 2,
+            line_dash="dot", line_color="#ef4444", line_width=1.5,
+            annotation_text="Anomaly threshold (2× configured)",
+            annotation_position="top right",
+            annotation_font=dict(size=10, color="#ef4444"),
+        )
+
+    fig.update_layout(
+        title=dict(text=f"{direction} headways — {route_label}", font=dict(size=13), x=0),
+        xaxis=dict(
+            title="Departure time",
+            tickangle=-45,
+            tickfont=dict(size=9),
+            showgrid=True,
+            gridcolor="rgba(0,0,0,0.06)",
+            gridwidth=1,
+        ),
+        yaxis=dict(
+            title="Gap (min)",
+            showgrid=True,
+            gridcolor="rgba(0,0,0,0.08)",
+            gridwidth=1,
+            zeroline=False,
+        ),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
+                    font=dict(size=10)),
+        margin=dict(t=60, b=60, l=40, r=20),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        height=300,
+        bargap=0.2,
+    )
+    return fig
+
+
 def _apply_config_overrides(config, overrides):
     from src.models import RouteConfig
     return RouteConfig(
@@ -1055,19 +1175,19 @@ if app_mode == "🚌 Single Route":
                        "Irregular gaps are expected when bus cycle time ≠ fleet × headway — "
                        "see Config tab to tune.")
             hw_data = build_headway_chart_data(config, buses)
+            _hw_df_sr = st.session_state.get("raw_headway_df")
             if not hw_data.empty:
                 col_up, col_dn = st.columns(2)
                 for col, direction, color in [(col_up, "UP", "#4f46e5"), (col_dn, "DN", "#16a34a")]:
                     with col:
                         dir_data = hw_data[hw_data["Direction"]==direction].sort_values("Departure")
-                        if len(dir_data) < 2: continue
                         deps = dir_data["Departure"].tolist()
-                        gaps = [{"Dep": deps[i].strftime("%H:%M"),
-                                 "Headway (min)": round((deps[i]-deps[i-1]).total_seconds()/60)}
-                                for i in range(1, len(deps))]
-                        gdf = pd.DataFrame(gaps).set_index("Dep")
-                        st.markdown(f"**{direction}** headways")
-                        st.bar_chart(gdf, height=220, color=color)
+                        _fig = build_headway_fig(deps, _hw_df_sr, direction, color,
+                                                  config.route_code)
+                        if _fig:
+                            st.plotly_chart(_fig, use_container_width=True)
+                        else:
+                            st.caption(f"**{direction}** — fewer than 2 departures.")
 
         # ════════════════════════════════════════════════════════════════════
         # TAB 3: Full Schedule
@@ -1534,18 +1654,13 @@ elif app_mode == "🏙️ Citywide":
                 ]:
                     with col:
                         dir_data = hw_data[hw_data["Direction"] == direction].sort_values("Departure")
-                        if len(dir_data) < 2:
-                            st.caption(f"**{direction}** — fewer than 2 departures.")
-                            continue
                         deps = dir_data["Departure"].tolist()
-                        gaps = [
-                            {"Dep": deps[i].strftime("%H:%M"),
-                             "Headway (min)": round((deps[i] - deps[i-1]).total_seconds() / 60)}
-                            for i in range(1, len(deps))
-                        ]
-                        gdf = pd.DataFrame(gaps).set_index("Dep")
-                        st.markdown(f"**{direction}** headways — {selected_hw_route}")
-                        st.bar_chart(gdf, height=260, color=color)
+                        _fig = build_headway_fig(deps, rr_hw.headway_df, direction, color,
+                                                  selected_hw_route)
+                        if _fig:
+                            st.plotly_chart(_fig, use_container_width=True)
+                        else:
+                            st.caption(f"**{direction}** — fewer than 2 departures.")
 
                 with st.expander("📋 Configured headway profile"):
                     st.dataframe(rr_hw.headway_df, hide_index=True, use_container_width=True)

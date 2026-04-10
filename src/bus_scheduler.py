@@ -845,12 +845,6 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
     # Key: (bus_id, direction, start_location) → datetime
     headway_hold: dict = {}
 
-    # Slot-based departure targets: the pre-computed time when the NEXT bus
-    # should depart in each direction+OD.  Updated after every departure so
-    # that all gaps within a time band are exactly target_hw apart.
-    # Key: (direction, start_loc, end_loc) → datetime
-    next_slot: dict = {}
-
     MAX_ITER = config.fleet_size * 300
     for _ in range(MAX_ITER):
 
@@ -895,8 +889,8 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
         best_bus = best_rt = best_dir = best_start = best_end = None
         best_dist_km = best_tt_val = best_needs_repo = None
         best_score = None
-        best_target_slot = best_target_hw = None
 
+        avg_km = _fleet_avg_km(buses)
         for bus in buses:
             if bus.current_location == config.depot:
                 continue
@@ -1057,51 +1051,41 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                 if bus.soc_percent > SOC_FLOOR + 5:  # not an emergency
                     continue
 
-            # ── Slot-based bus selection ──────────────────────────────────────
-            # Instead of scoring buses by gap-deviation, we pre-compute WHEN the
-            # next departure in this direction should happen (next_slot), then select
-            # the bus whose ready-time is closest to that target slot.
+            # ── Bus-driven selection with uniform spacing ─────────────────────
+            # target_hw   = headway all buses in this time band should achieve.
+            # target_dep  = when this bus SHOULD depart for perfectly uniform spacing
+            #               (anchored to the last actual departure, not a running dict).
+            # effective_rt = max(rt, target_dep):
+            #   bus ready early → held to target_dep  (uniform spacing preserved)
+            #   bus ready late  → departs when ready   (gap slips, resets from here)
             #
-            # target_hw = uniform headway for this time band:
-            #   max(configured_band_headway, natural_gap)
-            #   → configured headway if fleet is over-provisioned
-            #   → natural_gap if fleet physics can't achieve configured headway
-            #
-            # This makes the scheduler slot-driven, not bus-driven:
-            #   "here is when the next bus should go — which bus best fills that slot?"
-            #
-            # If a bus is ready BEFORE the slot:  it waits (held to slot time).
-            # If a bus is ready AFTER  the slot:  slot slips, resets from actual time.
-            # Result: all gaps within a time band are equal (or as close as physics allows).
-            target_hw   = max(_min_hw_at(rt), natural_gap)
-            slot_key    = (next_dir, trip_start, trip_end)
-            target_slot = next_slot.get(slot_key, rt)   # first trip: slot = bus readiness
-            bus_score   = abs((rt - target_slot).total_seconds() / 60)
+            # Score = effective_rt_minutes + km_deficit × KM_WEIGHT
+            #   Prefer the bus that can hit the target soonest; break ties by km balance
+            #   so buses with fewer km are preferred → minimises fleet km deviation.
+            target_hw = max(_min_hw_at(rt), natural_gap)
+            if last_same and last_same.actual_departure:
+                target_dep   = last_same.actual_departure + timedelta(minutes=target_hw)
+                effective_rt = max(rt, target_dep)
+            else:
+                effective_rt = rt   # first trip: depart when bus is ready
+
+            km_deficit   = bus.total_km - avg_km
+            eff_minutes  = (effective_rt - op_start_dt).total_seconds() / 60
+            bus_score    = eff_minutes + km_deficit * 0.3   # 0.3: 1 km excess = 0.3 min penalty
 
             if best_rt is None or bus_score < best_score:
-                best_bus          = bus
-                best_rt           = rt
-                best_score        = bus_score
-                best_dir          = next_dir
-                best_start        = trip_start
-                best_end          = trip_end
-                best_dist_km      = dist_km
-                best_tt_val       = tt_val
-                best_needs_repo   = needs_reposition
-                best_target_slot  = target_slot
-                best_target_hw    = target_hw
+                best_bus      = bus
+                best_rt       = effective_rt   # use effective_rt, not raw rt
+                best_score    = bus_score
+                best_dir      = next_dir
+                best_start    = trip_start
+                best_end      = trip_end
+                best_dist_km  = dist_km
+                best_tt_val   = tt_val
+                best_needs_repo = needs_reposition
 
         if best_bus is None:
             break  # no bus can move — done
-
-        # ── Slot enforcement: hold early bus to its target slot ──────────────
-        # If the selected bus is ready before the target slot, hold it until
-        # the slot time.  This is what produces uniform spacing — buses that
-        # could depart early are held so every gap equals target_hw exactly.
-        # If the bus is late (rt > slot), we accept the slip; the slot will
-        # reset from the actual departure time below.
-        if best_target_slot is not None and best_rt < best_target_slot:
-            best_rt = best_target_slot
 
         # Apply reposition dead run NOW (after selection, side-effect free)
         if best_needs_repo and best_bus.current_location == nearest_node:
@@ -1124,12 +1108,6 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
         )
         trip.earliest_departure = best_rt
         best_bus.assign(trip)
-        # Advance the slot for this direction by target_hw.
-        # Next bus in this direction should depart at best_rt + target_hw.
-        # This single update drives all uniform spacing — no other headway
-        # logic is needed beyond the P6 safety floor.
-        _slot_key = (best_dir, best_start, best_end)
-        next_slot[_slot_key] = best_rt + timedelta(minutes=best_target_hw)
         # Clear the P6 headway hold for this bus — it has now departed.
         headway_hold.pop((best_bus.bus_id, best_dir, best_start), None)
 
