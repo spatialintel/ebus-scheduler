@@ -26,6 +26,7 @@ class ScheduleMetrics:
     revenue_km: float = 0.0
     dead_km: float = 0.0
     dead_km_ratio: float = 0.0          # dead_km / total_km
+    dead_trips: int = 0                  # number of dead run legs
 
     # Fleet balance
     km_per_bus: list[float] = field(default_factory=list)
@@ -119,6 +120,7 @@ def compute_metrics(
     m.revenue_trips_total = total_revenue_trips or len(rev)
     m.revenue_km = sum(t.distance_km for t in rev)
     m.dead_km = sum(t.distance_km for t in dead)
+    m.dead_trips = len(dead)
     m.total_km = m.revenue_km + m.dead_km
     m.dead_km_ratio = m.dead_km / m.total_km if m.total_km > 0 else 0.0
     m.charging_stops = len(chg)

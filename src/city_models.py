@@ -92,6 +92,14 @@ class CitySchedule:
         return sum(r.metrics.dead_km for r in self.results.values())
 
     @property
+    def total_dead_trips(self) -> int:
+        return sum(r.metrics.dead_trips for r in self.results.values())
+
+    @property
+    def total_km(self) -> float:
+        return sum(r.metrics.total_km for r in self.results.values())
+
+    @property
     def citywide_dead_km_ratio(self) -> float:
         total = self.total_revenue_km + self.total_dead_km
         return self.total_dead_km / total if total > 0 else 0.0

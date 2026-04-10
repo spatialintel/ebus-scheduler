@@ -1486,23 +1486,19 @@ elif app_mode == "🏙️ Citywide":
         kpi("Total Fleet", str(cs.total_buses_used),
             sub=f"configured: {city_cfg.total_configured_fleet}") +
         kpi("Revenue Trips", str(cs.total_revenue_trips)) +
-        kpi("Revenue KM", f"{cs.total_revenue_km:,.0f}") +
-        kpi("Dead KM %", f"{cs.citywide_dead_km_ratio:.1%}",
-            "ok" if cs.citywide_dead_km_ratio < 0.15 else "warn") +
+        kpi("Total KM", f"{cs.total_km:,.0f}",
+            sub=f"revenue: {cs.total_revenue_km:,.0f}") +
+        kpi("Dead KM", f"{cs.total_dead_km:,.0f}",
+            "ok" if cs.citywide_dead_km_ratio < 0.15 else "warn",
+            sub=f"{cs.citywide_dead_km_ratio:.1%} of total · {cs.total_dead_trips} trips") +
         kpi("Min SOC", f"{cs.min_soc_citywide:.1f}%",
             "ok" if cs.min_soc_citywide >= 25 else "warn" if cs.min_soc_citywide >= 20 else "bad") +
         kpi("Utilization", f"{cs.citywide_utilization_pct:.0f}%",
             "ok" if cs.citywide_utilization_pct >= 85 else "warn") +
-        kpi("Transfers", str(len(cs.transfers)),
-            "ok" if len(cs.transfers) == 0 else "warn") +
         kpi("Avg HW Dev", f"{cs.avg_headway_deviation_min:.1f} min",
             "ok" if cs.avg_headway_deviation_min < 5 else "warn"
             if cs.avg_headway_deviation_min < 10 else "bad",
             sub="vs configured") +
-        kpi("Max Gap", f"{cs.max_headway_gap_min:.0f} min",
-            "ok" if cs.max_headway_gap_min < 45 else "warn"
-            if cs.max_headway_gap_min < 60 else "bad",
-            sub="largest departure gap") +
         '</div>', unsafe_allow_html=True,
     )
 
@@ -1545,33 +1541,6 @@ elif app_mode == "🏙️ Citywide":
 
     # ── CITY TAB 2: Fleet Rebalancing ─────────────────────────────────────────
     with tab_rebalance:
-        if not cs.transfers:
-            st.success("✅ No fleet rebalancing needed — all routes adequately staffed.")
-        else:
-            st.markdown(f'<div class="section-title">Fleet Transfers ({len(cs.transfers)})</div>',
-                        unsafe_allow_html=True)
-            for t in cs.transfers:
-                st.markdown(
-                    f'<div class="transfer-card">'
-                    f'<strong>{t.from_route}</strong> '
-                    f'<span class="transfer-arrow">→</span> '
-                    f'<strong>{t.to_route}</strong> '
-                    f'<span style="color:#666; font-size:0.85rem; margin-left:8px;">({t.reason})</span>'
-                    f'</div>', unsafe_allow_html=True)
-
-            st.markdown('<div class="section-title">Before & After</div>', unsafe_allow_html=True)
-            ba_rows = []
-            for code in sorted(cs.results):
-                r = cs.results[code]
-                donated = sum(1 for t in cs.transfers if t.from_route == code)
-                received = sum(1 for t in cs.transfers if t.to_route == code)
-                change = received - donated
-                ba_rows.append({"Route": code, "PVR": r.pvr, "Before": r.fleet_original,
-                                "After": r.fleet_allocated,
-                                "Change": f"+{change}" if change > 0 else str(change) if change < 0 else "—",
-                                "Donated": donated, "Received": received})
-            st.dataframe(pd.DataFrame(ba_rows), use_container_width=True, hide_index=True)
-
         st.markdown('<div class="section-title">Fleet Balance Analysis (PVR-based)</div>',
                     unsafe_allow_html=True)
         balance = compute_fleet_balance(city_cfg)
