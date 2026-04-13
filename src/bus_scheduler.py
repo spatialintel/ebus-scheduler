@@ -45,6 +45,11 @@ KM_BALANCE_MAX    = 20.0
 # Higher = more uniform headways, lower = faster throughput. 2.0 is a good default.
 HEADWAY_WEIGHT    = 2.0
 
+# Planning mode: tolerance for headway deviation before a departure is considered
+# non-compliant. ±3 min is tight enough to flag real spikes but forgiving of
+# integer rounding in travel times. Used in bus scoring and compliance logging.
+PLANNING_HW_TOLERANCE = 3
+
 OFF_PEAK_START = REF_DATE.replace(hour=11, minute=0)
 OFF_PEAK_END   = REF_DATE.replace(hour=15, minute=0)
 
@@ -588,13 +593,26 @@ def _balance_breaks(buses, config):
 
 
 def schedule_buses(config: RouteConfig, trips: list[Trip],
-                   headway_df=None, travel_time_df=None) -> list[BusState]:
+                   headway_df=None, travel_time_df=None,
+                   scheduling_mode: str = "planning") -> list[BusState]:
     """
     Bus-driven scheduler — no pre-generated trip pool slots.
 
-    Each bus departs as soon as its break is served (preferred_layover_min,
-    plus off_peak_layover_extra_min during 11:00–15:00). The headway profile
-    acts as a minimum same-direction spacing floor. No fixed slot clock.
+    scheduling_mode controls how the headway profile is enforced:
+
+    "planning"  (default) — strict service-reliability mode.
+        target_hw = configured band headway (P6=5min is the only hard floor).
+        Buses ready BEFORE target_dep are held until target_dep.
+        Bus scoring strongly weights headway deviation so the bus closest
+        to target_dep always wins. km balance is secondary (weight 0.1).
+        Result: uniform departures within each time band; deviations > ±3min
+        are flagged by compliance checker as headway violations.
+
+    "efficiency" — physics-aware mode used by the optimizer.
+        target_hw = max(configured band headway, natural_gap).
+        This prevents asking the fleet to physically impossible schedules
+        (e.g. headway=10min with natural_gap=30min).
+        km balance weight is higher (0.3) — optimizer is tuning for throughput.
 
     Charging is staggered: buses are sent to charge one at a time so that
     the fleet never all disappear simultaneously (which caused 138-min gaps).
@@ -1082,19 +1100,46 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
             #   bus ready early → held to target_dep  (uniform spacing preserved)
             #   bus ready late  → departs when ready   (gap slips, resets from here)
             #
-            # Score = effective_rt_minutes + km_deficit × KM_WEIGHT
-            #   Prefer the bus that can hit the target soonest; break ties by km balance
-            #   so buses with fewer km are preferred → minimises fleet km deviation.
-            target_hw = max(_min_hw_at(rt), natural_gap)
+            # Planning mode:  target_hw = configured band headway (strict).
+            #   P6 (5 min) is the only hard floor.
+            #   Natural_gap is NOT imposed — this mode trusts the planner's config.
+            #   If natural_gap > configured headway, check_headway_feasibility() will
+            #   have already warned the caller at trip-generation time.
+            #   Bus score weights headway deviation heavily so the bus closest to
+            #   target_dep always wins; km balance is secondary (weight 0.1).
+            #
+            # Efficiency mode: target_hw = max(configured, natural_gap).
+            #   Applies physics floor so the scheduler never asks for an impossible
+            #   headway (e.g. 10 min with a fleet that needs 30 min natural_gap).
+            #   km balance weight 0.3 — optimizer is tuning for throughput.
+            if scheduling_mode == "planning":
+                target_hw = max(_min_hw_at(rt), SAME_DIR_GAP)   # configured headway; P6 floor only
+            else:
+                target_hw = max(_min_hw_at(rt), natural_gap)     # physics floor for efficiency mode
+
             if last_same and last_same.actual_departure:
                 target_dep   = last_same.actual_departure + timedelta(minutes=target_hw)
-                effective_rt = max(rt, target_dep)
+                effective_rt = max(rt, target_dep)               # hold-until-target (both modes)
             else:
+                target_dep   = None
                 effective_rt = rt   # first trip: depart when bus is ready
 
-            km_deficit   = bus.total_km - avg_km
-            eff_minutes  = (effective_rt - op_start_dt).total_seconds() / 60
-            bus_score    = eff_minutes + km_deficit * 0.3   # 0.3: 1 km excess = 0.3 min penalty
+            km_deficit  = bus.total_km - avg_km
+            eff_minutes = (effective_rt - op_start_dt).total_seconds() / 60
+
+            if scheduling_mode == "planning":
+                # Strict mode: penalise any departure that drifts from target_dep.
+                # deviation_min = minutes LATE past target (0 if held or first trip).
+                # Weight HEADWAY_WEIGHT means 1 min headway deviation = HEADWAY_WEIGHT min
+                # scoring penalty — always outranks small km imbalances.
+                deviation_min = (
+                    max(0.0, (effective_rt - target_dep).total_seconds() / 60)
+                    if target_dep is not None else 0.0
+                )
+                bus_score = eff_minutes + deviation_min * HEADWAY_WEIGHT + km_deficit * 0.1
+            else:
+                # Efficiency mode: time-first, km balance as meaningful tiebreaker.
+                bus_score = eff_minutes + km_deficit * 0.3
 
             if best_rt is None or bus_score < best_score:
                 best_bus      = bus

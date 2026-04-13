@@ -140,11 +140,28 @@ def _generate_revenue_trips(config, headway_df, travel_time_df):
 
     def _slot_interval(dep):
         """
-        Effective slot interval = max(user headway, natural fleet gap).
-        During off-peak (11:00-15:00) expand by off_peak_extra so trip density
-        drops and headways widen, matching the extended driver break.
+        Effective slot interval for the trip pool at departure time dep.
+
+        Priority:
+          1. Use the configured headway for dep's time band (planner's intent).
+          2. Only if natural_gap > user_headway does the physics floor kick in.
+             This happens when the fleet is too small to sustain the configured
+             headway — we use natural_gap to prevent generating trips that no
+             bus can physically reach on time.
+          3. During off-peak (11:00–15:00) expand by off_peak_extra to widen
+             service density to match the extended driver break.
+
+        When natural_gap > user_headway, the override is flagged separately
+        via check_headway_feasibility() rather than silently replacing the
+        planner's value.  This keeps generate_trips() side-effect-free.
         """
-        base = max(_get_headway_at(dep, headway_df), natural_gap)
+        user_hw = _get_headway_at(dep, headway_df)
+        if natural_gap > user_hw:
+            # Physics floor: fleet cannot sustain user_hw — use natural_gap.
+            # check_headway_feasibility() will surface a warning to the caller.
+            base = natural_gap
+        else:
+            base = user_hw
         if _OFF_PEAK_START <= dep < _OFF_PEAK_END:
             base += off_peak_extra
         return base
@@ -248,3 +265,50 @@ def generate_trips(config, headway_df, travel_time_df):
     )
     all_trips.sort(key=lambda t: t.earliest_departure)
     return all_trips
+
+
+def check_headway_feasibility(config, headway_df, travel_time_df) -> list[str]:
+    """
+    Check whether the configured headway profile is physically achievable by
+    the fleet.  Returns a list of human-readable warning strings (empty = OK).
+
+    A warning is raised for each time band where:
+        natural_gap = cycle_time / fleet_size  >  configured_headway
+
+    This means the fleet is too small to sustain the configured headway.
+    The scheduler will silently use natural_gap instead — this function makes
+    that substitution visible to the planner so they can either:
+      a) Increase the fleet size, or
+      b) Set the headway to a value >= natural_gap in that band.
+
+    Does NOT modify headway_df or generate_trips output.
+    """
+    warnings = []
+    try:
+        op_start = _time_to_dt(config.operating_start)
+        min_break = config.preferred_layover_min
+        first_dn = _get_travel_time(op_start, "DN", travel_time_df)
+        first_up = _get_travel_time(
+            op_start + timedelta(minutes=first_dn + min_break), "UP", travel_time_df)
+        cycle_time  = first_dn + min_break + first_up + min_break
+        natural_gap = cycle_time / max(1, config.fleet_size)
+
+        for _, row in headway_df.iterrows():
+            try:
+                band_hw   = int(row["headway_min"])
+                time_from = row["time_from"]
+                time_to   = row["time_to"]
+                if natural_gap > band_hw:
+                    warnings.append(
+                        f"⚠ Headway infeasible in band {time_from}–{time_to}: "
+                        f"configured={band_hw} min but natural_gap={natural_gap:.1f} min "
+                        f"(cycle={cycle_time:.0f} min ÷ fleet={config.fleet_size}). "
+                        f"Scheduler will use {natural_gap:.1f} min. "
+                        f"Recommendation: set headway ≥ {int(natural_gap) + 1} min "
+                        f"or increase fleet to ≥ {int(cycle_time / band_hw) + 1} buses."
+                    )
+            except Exception:
+                continue
+    except Exception as e:
+        warnings.append(f"⚠ Feasibility check failed: {e}")
+    return warnings

@@ -219,8 +219,13 @@ def _charging_fraction(ri: RouteInput) -> float:
         fraction        = charge_time_min / charging_window_min
                           clamped to [0.05, 0.50]
 
+    Charging window is read from cfg.p5_charging_start / cfg.p5_charging_end
+    (set per-route in the Excel config).  Falls back to the module-level
+    CHARGING_START_MIN / CHARGING_END_MIN constants (12:00–15:00) if the
+    config fields are absent or produce an invalid window.
+
     All inputs from config — no magic constants.
-    Falls back to 0.25 if any config field is missing or zero.
+    Falls back to 0.25 if any required field is missing or zero.
     """
     try:
         cfg             = ri.config
@@ -228,7 +233,17 @@ def _charging_fraction(ri: RouteInput) -> float:
         battery_kwh     = float(cfg.battery_kwh)
         charger_kw      = float(cfg.depot_charger_kw)
         efficiency      = float(getattr(cfg, "depot_charger_efficiency", 0.92))
-        window_min      = float(CHARGING_END_MIN - CHARGING_START_MIN)  # 180 min
+
+        # ── Charging window from config (p5_charging_start / p5_charging_end) ──
+        # Fall back to hardcoded constants only if config fields are absent.
+        cs = getattr(cfg, 'p5_charging_start', None)
+        ce = getattr(cfg, 'p5_charging_end',   None)
+        if cs is not None and ce is not None:
+            cs_min = cs.hour * 60 + cs.minute
+            ce_min = ce.hour * 60 + ce.minute
+            window_min = float(ce_min - cs_min)
+        else:
+            window_min = float(CHARGING_END_MIN - CHARGING_START_MIN)  # fallback: 12:00-15:00 = 180 min
 
         if charger_kw <= 0 or battery_kwh <= 0 or window_min <= 0:
             return 0.25

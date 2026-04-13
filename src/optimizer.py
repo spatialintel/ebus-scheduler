@@ -26,6 +26,7 @@ def _run_schedule(
     config: RouteConfig,
     headway_df: pd.DataFrame,
     travel_time_df: pd.DataFrame,
+    scheduling_mode: str = "efficiency",
 ) -> tuple[list[BusState], ScheduleMetrics]:
     """Run the full pipeline and return buses + metrics.
 
@@ -34,12 +35,18 @@ def _run_schedule(
     this, _hw_bands inside schedule_buses is empty and _min_hw_at() falls back
     to SAME_DIR_GAP=5, causing the headway profile to be silently ignored for
     all efficiency-mode schedules.
+
+    scheduling_mode defaults to "efficiency" in the optimizer because the
+    hill-climbing loop needs the physics floor (natural_gap) to prevent trying
+    headway values the fleet physically cannot achieve.  Pass "planning" only
+    when validating planning-mode compliance from an optimizer context.
     """
     trips = generate_trips(config, headway_df, travel_time_df)
     revenue_count = len([t for t in trips if t.trip_type == "Revenue"])
     buses = schedule_buses(config, trips,
                            headway_df=headway_df,
-                           travel_time_df=travel_time_df)
+                           travel_time_df=travel_time_df,
+                           scheduling_mode=scheduling_mode)
     metrics = compute_metrics(config, buses, total_revenue_trips=revenue_count)
     return buses, metrics
 
@@ -52,6 +59,7 @@ def _try_headway_variation(
     band_end_idx: int,
     delta: int,
     max_deviation: int,
+    scheduling_mode: str = "efficiency",
 ) -> tuple[pd.DataFrame, list[BusState], ScheduleMetrics] | None:
     """
     Try adjusting headway by `delta` minutes for rows band_start_idx to band_end_idx.
@@ -69,7 +77,8 @@ def _try_headway_variation(
         modified.at[modified.index[i], "headway_min"] = new_val
 
     try:
-        buses, metrics = _run_schedule(config, modified, travel_time_df)
+        buses, metrics = _run_schedule(config, modified, travel_time_df,
+                                       scheduling_mode=scheduling_mode)
         # Reject if we lost revenue trips
         if metrics.revenue_trips_assigned < metrics.revenue_trips_total:
             return None
@@ -84,6 +93,7 @@ def optimize_schedule(
     travel_time_df: pd.DataFrame,
     max_iterations: int = 50,
     verbose: bool = True,
+    scheduling_mode: str = "efficiency",
 ) -> tuple[list[BusState], ScheduleMetrics, pd.DataFrame]:
     """
     Hill-climbing optimizer.
@@ -94,10 +104,15 @@ def optimize_schedule(
        - Keep change if weighted score improves
     3. Return best schedule found
 
+    scheduling_mode is forwarded to schedule_buses for all trial runs.
+    Defaults to "efficiency" (physics-floor mode) since the optimizer is
+    tuning for throughput and km balance, not strict headway compliance.
+
     Returns (best_buses, best_metrics, best_headway_df)
     """
     # ── Baseline ──
-    base_buses, base_metrics = _run_schedule(config, headway_df, travel_time_df)
+    base_buses, base_metrics = _run_schedule(config, headway_df, travel_time_df,
+                                             scheduling_mode=scheduling_mode)
     best_score = base_metrics.weighted_score()
     best_buses = base_buses
     best_metrics = base_metrics
@@ -133,6 +148,7 @@ def optimize_schedule(
                 result = _try_headway_variation(
                     config, best_headway, travel_time_df,
                     band_start, band_end, delta, max_dev,
+                    scheduling_mode=scheduling_mode,
                 )
                 if result is None:
                     continue
