@@ -867,20 +867,25 @@ def _apply_config_overrides(config, overrides):
                                      getattr(config, "avg_speed_kmph", 30.0)),
     )
 
-def _run_core(config, headway_df, travel_time_df, optimize):
+def _run_core(config, headway_df, travel_time_df, optimize,
+              scheduling_mode: str = "planning"):
     enrich_distances(config)
-    trips = generate_trips(config, headway_df, travel_time_df)
+    trips = generate_trips(config, headway_df, travel_time_df,
+                           scheduling_mode=scheduling_mode)
     revenue_trips = [t for t in trips if t.trip_type == "Revenue"]
     if optimize:
         from src.optimizer import optimize_schedule
-        buses, metrics, _ = optimize_schedule(config, headway_df, travel_time_df, verbose=False)
+        buses, metrics, _ = optimize_schedule(config, headway_df, travel_time_df,
+                                              verbose=False,
+                                              scheduling_mode=scheduling_mode)
         assigned_rev = sum(1 for b in buses for t in b.trips if t.trip_type == 'Revenue')
         metrics = compute_metrics(config, buses,
                                   total_revenue_trips=len(revenue_trips),
                                   assigned_revenue_trips=assigned_rev)
     else:
         buses = schedule_buses(config, trips,
-                               headway_df=headway_df, travel_time_df=travel_time_df)
+                               headway_df=headway_df, travel_time_df=travel_time_df,
+                               scheduling_mode=scheduling_mode)
         # Bus-driven scheduler creates new Trip objects (not pool references).
         # Count Revenue trips directly from bus schedules.
         assigned_rev = sum(1 for b in buses for t in b.trips if t.trip_type == 'Revenue')
@@ -907,10 +912,12 @@ def auto_detect_fleet(raw_config, headway_df, travel_time_df, max_fleet=20):
     last_result = None
     for n in range(1, max_fleet + 1):
         cfg = _apply_config_overrides(raw_config, {"fleet_size": n})
-        trips = generate_trips(cfg, headway_df, travel_time_df)
+        trips = generate_trips(cfg, headway_df, travel_time_df,
+                               scheduling_mode="planning")
         buses = schedule_buses(cfg, trips,
                                headway_df=headway_df,
-                               travel_time_df=travel_time_df)
+                               travel_time_df=travel_time_df,
+                               scheduling_mode="planning")
         rev_total    = sum(1 for t in trips   if t.trip_type == "Revenue")
         rev_assigned = sum(1 for b in buses for t in b.trips if t.trip_type == "Revenue")
         compliance   = check_compliance(cfg, buses, headway_df=headway_df)
@@ -961,7 +968,13 @@ def run_pipeline(uploaded_file, optimize, config_overrides=None, headway_overrid
         if nat_hw:
             headway_df = _flat_headway_df(ri, nat_hw)
             st.session_state["service_max_headway"] = nat_hw
-    return _run_core(config, headway_df, travel_time_df, optimize)
+    # Derive scheduling_mode from UI flags:
+    #   service_max → efficiency (flat headway, physics-derived spacing)
+    #   optimize    → efficiency (KPI-driven, throughput-focused)
+    #   otherwise   → planning  (strict headway enforcement)
+    _sched_mode = "efficiency" if (optimize or service_max) else "planning"
+    return _run_core(config, headway_df, travel_time_df, optimize,
+                     scheduling_mode=_sched_mode)
 
 def rerun_from_overrides(config_overrides, headway_overrides=None, optimize=False, service_max=False):
     raw_config = st.session_state.get("raw_config")
@@ -985,7 +998,9 @@ def rerun_from_overrides(config_overrides, headway_overrides=None, optimize=Fals
         nat_hw2 = _natural_headway(ri2)
         headway_df = _flat_headway_df(ri2, nat_hw2)
         st.session_state["service_max_headway"] = nat_hw2
-    return _run_core(config, headway_df, raw_tt, optimize)
+    _sched_mode = "efficiency" if (optimize or service_max) else "planning"
+    return _run_core(config, headway_df, raw_tt, optimize,
+                     scheduling_mode=_sched_mode)
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -1897,10 +1912,13 @@ elif app_mode == "🏙️ Citywide":
                         from src.metrics import compute_metrics as _comp_metrics
                         _ri = city_cfg.routes[selected_route]
                         _rc = _ri.config
-                        _new_trips  = _gen_trips(_rc, _edited_hw, _ri.travel_time_df)
+                        _city_sched_mode = st.session_state.get("city_mode_used", "planning")
+                        _new_trips  = _gen_trips(_rc, _edited_hw, _ri.travel_time_df,
+                                                 scheduling_mode=_city_sched_mode)
                         _new_buses  = _sched_buses(_rc, _new_trips,
                                                    headway_df=_edited_hw,
-                                                   travel_time_df=_ri.travel_time_df)
+                                                   travel_time_df=_ri.travel_time_df,
+                                                   scheduling_mode=_city_sched_mode)
                         _new_rev    = len([t for t in _new_trips if t.trip_type=="Revenue"])
                         _new_metrics = _comp_metrics(_rc, _new_buses, total_revenue_trips=_new_rev)
                         # Relabel buses
@@ -2208,11 +2226,14 @@ elif app_mode == "🏙️ Citywide":
                         from src.distance_engine import enrich_distances as _enrich
 
                         _enrich(_updated_cfg)
-                        _trips    = _gen(_updated_cfg, _updated_hw, _ri_cfg.travel_time_df)
+                        _cfg_sched_mode = st.session_state.get("city_mode_used", "planning")
+                        _trips    = _gen(_updated_cfg, _updated_hw, _ri_cfg.travel_time_df,
+                                         scheduling_mode=_cfg_sched_mode)
                         _rev_ct   = len([t for t in _trips if t.trip_type == "Revenue"])
                         _buses    = _sched(_updated_cfg, _trips,
                                            headway_df=_updated_hw,
-                                           travel_time_df=_ri_cfg.travel_time_df)
+                                           travel_time_df=_ri_cfg.travel_time_df,
+                                           scheduling_mode=_cfg_sched_mode)
                         _met      = _metrics(_updated_cfg, _buses, total_revenue_trips=_rev_ct)
                         _comp     = _compliance(_updated_cfg, _buses, headway_df=_updated_hw)
 

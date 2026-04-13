@@ -1016,23 +1016,21 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
 
             min_hw = _min_hw_at(rt)
 
-            # ── Headway spacing — P6 hard floor only ─────────────────────────
-            # The configured headway profile is a SCORING TARGET, not a hard floor.
-            # Enforcing it as a hard floor causes cascade bumping: buses pile up
-            # waiting for their natural_gap slot, then depart in a burst, creating
-            # the very spikes we want to eliminate.
+            # ── Headway spacing enforcement ───────────────────────────────────
+            # Planning mode: min_spacing = configured band headway (HARD FLOOR).
+            #   No bus may depart within min_spacing minutes of the previous
+            #   same-direction departure. This prevents bunching (08:00, 08:05
+            #   scenario) even when two buses happen to be ready simultaneously.
+            #   P6 (5 min) remains the absolute safety floor inside this value.
             #
-            # The ONLY hard floor is P6 = SAME_DIR_GAP (5 min) — a physical safety
-            # rule. All headway shaping above 5 min is handled by the Global Headway
-            # Balancer scoring below using:
-            #   target_gap = max(configured_band_headway, natural_gap)
-            # This achieves uniform spacing within each time band without blocking
-            # buses that could fill a growing gap sooner.
-            #
-            # Applies equally to Planning-Compliant, Efficiency, and circular routes.
-            # just_charged / just_repositioned flags no longer needed: P6-floor lets
-            # re-entering buses fill the earliest available gap immediately.
-            min_spacing = SAME_DIR_GAP   # P6 only — 5-min safety floor
+            # Efficiency mode: min_spacing = P6 only (5 min).
+            #   Headway shaping is handled entirely through scoring (target_dep
+            #   + deviation penalty), which is sufficient for throughput-focused
+            #   scheduling where exact spacing is secondary to coverage.
+            if scheduling_mode == "planning":
+                min_spacing = max(_min_hw_at(rt), SAME_DIR_GAP)
+            else:
+                min_spacing = SAME_DIR_GAP   # P6 only in efficiency mode
 
             last_same = None
             for other in buses:
@@ -1136,7 +1134,22 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                     max(0.0, (effective_rt - target_dep).total_seconds() / 60)
                     if target_dep is not None else 0.0
                 )
-                bus_score = eff_minutes + deviation_min * HEADWAY_WEIGHT + km_deficit * 0.1
+                # Large-gap penalty: if the gap from last departure would exceed
+                # 1.5× the target headway, add an extra scoring penalty to ensure
+                # any bus that can fill this gap is strongly preferred over one
+                # that would widen it further.
+                if last_same and last_same.actual_departure and target_dep is not None:
+                    current_gap = (effective_rt - last_same.actual_departure).total_seconds() / 60
+                    if current_gap > 1.5 * target_hw:
+                        large_gap_penalty = (current_gap - target_hw) * HEADWAY_WEIGHT
+                    else:
+                        large_gap_penalty = 0.0
+                else:
+                    large_gap_penalty = 0.0
+                bus_score = (eff_minutes
+                             + deviation_min * HEADWAY_WEIGHT
+                             + large_gap_penalty
+                             + km_deficit * 0.1)
             else:
                 # Efficiency mode: time-first, km balance as meaningful tiebreaker.
                 bus_score = eff_minutes + km_deficit * 0.3

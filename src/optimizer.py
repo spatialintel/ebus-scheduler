@@ -41,7 +41,8 @@ def _run_schedule(
     headway values the fleet physically cannot achieve.  Pass "planning" only
     when validating planning-mode compliance from an optimizer context.
     """
-    trips = generate_trips(config, headway_df, travel_time_df)
+    trips = generate_trips(config, headway_df, travel_time_df,
+                           scheduling_mode=scheduling_mode)
     revenue_count = len([t for t in trips if t.trip_type == "Revenue"])
     buses = schedule_buses(config, trips,
                            headway_df=headway_df,

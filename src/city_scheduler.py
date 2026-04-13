@@ -109,11 +109,16 @@ def _run_single_route(
     ri: RouteInput,
     fleet_override: int | None = None,
     headway_df_override: "pd.DataFrame | None" = None,
+    scheduling_mode: str = "planning",
 ) -> RouteResult:
     """
     Schedule one route.
     fleet_override: temporarily patches config.fleet_size before running.
     headway_df_override: replaces ri.headway_df for this run only.
+    scheduling_mode: forwarded to generate_trips() and schedule_buses().
+      "planning"    — strict headway enforcement (hard floor per band)
+      "efficiency"  — physics-floor mode (natural_gap floor, throughput-focused)
+      "service_max" — same as efficiency for the scheduler (flat headway_df passed in)
     Both are restored / not mutated after the call.
     """
     config         = ri.config
@@ -125,12 +130,14 @@ def _run_single_route(
     headway_df = headway_df_override if headway_df_override is not None else ri.headway_df
 
     try:
-        trips         = generate_trips(config, headway_df, ri.travel_time_df)
+        trips         = generate_trips(config, headway_df, ri.travel_time_df,
+                                       scheduling_mode=scheduling_mode)
         revenue_count = len([t for t in trips if t.trip_type == "Revenue"])
         buses         = schedule_buses(
             config, trips,
             headway_df=headway_df,
             travel_time_df=ri.travel_time_df,
+            scheduling_mode=scheduling_mode,
         )
         metrics = compute_metrics(
             config, buses,
@@ -182,7 +189,7 @@ def _schedule_headway_driven(city: CityConfig) -> CitySchedule:
 
     results: dict[str, RouteResult] = {}
     for code, ri in city.routes.items():
-        results[code] = _run_single_route(ri)
+        results[code] = _run_single_route(ri, scheduling_mode="planning")
 
     pre_balance = compute_fleet_balance(city)
     transfers   = compute_rebalancing_plan(city)
@@ -198,7 +205,8 @@ def _schedule_headway_driven(city: CityConfig) -> CitySchedule:
     for code, new_fleet in adjusted_fleet.items():
         if new_fleet != city.routes[code].config.fleet_size:
             ri = city.routes[code]
-            results[code] = _run_single_route(ri, fleet_override=new_fleet)
+            results[code] = _run_single_route(ri, fleet_override=new_fleet,
+                                              scheduling_mode="planning")
             results[code].fleet_allocated = new_fleet
 
     post_pvr   = {code: r.pvr for code, r in results.items()}
@@ -234,7 +242,8 @@ def _find_min_fleet(ri: RouteInput, max_fleet: int = 20) -> int:
     while lo <= hi:
         mid = (lo + hi) // 2
         try:
-            result    = _run_single_route(ri, fleet_override=mid)
+            result    = _run_single_route(ri, fleet_override=mid,
+                                          scheduling_mode="efficiency")
             soc_ok    = result.metrics.min_soc_seen >= ri.config.min_soc_percent
             breaks_ok = result.metrics.negative_breaks == 0
             coverage  = (result.metrics.revenue_trips_assigned /
@@ -302,7 +311,8 @@ def _schedule_kpi_driven(city: CityConfig) -> CitySchedule:
         scores: dict[str, float] = {}
         for code, ri in city.routes.items():
             try:
-                r = _run_single_route(ri, fleet_override=min_fleets[code])
+                r = _run_single_route(ri, fleet_override=min_fleets[code],
+                                      scheduling_mode="efficiency")
                 scores[code] = r.metrics.weighted_score()
             except Exception:
                 scores[code] = float("inf")
@@ -315,7 +325,8 @@ def _schedule_kpi_driven(city: CityConfig) -> CitySchedule:
         rescore: dict[str, float] = {}
         for code, ri in city.routes.items():
             try:
-                r = _run_single_route(ri, fleet_override=adjusted[code])
+                r = _run_single_route(ri, fleet_override=adjusted[code],
+                                      scheduling_mode="efficiency")
                 rescore[code] = r.metrics.weighted_score()
             except Exception:
                 rescore[code] = scores.get(code, float("inf"))
@@ -351,7 +362,8 @@ def _schedule_kpi_driven(city: CityConfig) -> CitySchedule:
     results: dict[str, RouteResult] = {}
     for code, ri in city.routes.items():
         fleet = adjusted.get(code, min_fleets.get(code, ri.config.fleet_size))
-        results[code] = _run_single_route(ri, fleet_override=fleet)
+        results[code] = _run_single_route(ri, fleet_override=fleet,
+                                          scheduling_mode="efficiency")
         results[code].fleet_allocated = fleet
         results[code].fleet_original  = ri.config.fleet_size
 
@@ -377,7 +389,8 @@ def _schedule_service_maximization(city: CityConfig) -> CitySchedule:
     for code, ri in city.routes.items():
         nat_hw   = _natural_headway(ri)
         flat_df  = _flat_headway_df(ri, nat_hw)
-        result   = _run_single_route(ri, headway_df_override=flat_df)
+        result   = _run_single_route(ri, headway_df_override=flat_df,
+                                     scheduling_mode="efficiency")
         # Store the computed natural headway in the result for UI display
         result.headway_df = flat_df
         results[code] = result

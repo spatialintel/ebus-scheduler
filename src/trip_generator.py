@@ -97,7 +97,8 @@ def _get_travel_time(departure, direction, travel_time_df):
     return int(travel_time_df.iloc[-1][col])
 
 
-def _generate_revenue_trips(config, headway_df, travel_time_df):
+def _generate_revenue_trips(config, headway_df, travel_time_df,
+                            scheduling_mode: str = "planning"):
     """
     Generate DN and UP trips as two independent threads.
 
@@ -108,6 +109,12 @@ def _generate_revenue_trips(config, headway_df, travel_time_df):
     Both threads advance by the same headway profile independently.
     This ensures buses serve DN Revenue → UP Revenue → DN Revenue → ...
     without any repositioning dead runs between them.
+
+    scheduling_mode controls slot interval generation:
+      "planning"  — uses configured headway directly; natural_gap is NOT imposed.
+                    check_headway_feasibility() surfaces infeasible configs separately.
+      "efficiency" — uses max(configured, natural_gap) so the pool never asks the
+                    fleet for a headway it physically cannot achieve.
     """
     op_start    = _time_to_dt(config.operating_start)
     op_end      = _time_to_dt(config.operating_end)
@@ -130,8 +137,7 @@ def _generate_revenue_trips(config, headway_df, travel_time_df):
     # ── Natural slot interval ─────────────────────────────────────────────────
     # One bus cycle = DN_travel + break + UP_travel + break.
     # With fleet_size buses, consecutive departures in one direction are spaced
-    # cycle_time / fleet_size apart. We use max(user_headway, natural_interval)
-    # so the trip pool never asks buses to depart faster than physically possible.
+    # cycle_time / fleet_size apart.
     first_dn_travel = _get_travel_time(op_start, "DN", travel_time_df)
     first_up_travel = _get_travel_time(
         op_start + timedelta(minutes=first_dn_travel + min_break), "UP", travel_time_df)
@@ -142,26 +148,23 @@ def _generate_revenue_trips(config, headway_df, travel_time_df):
         """
         Effective slot interval for the trip pool at departure time dep.
 
-        Priority:
-          1. Use the configured headway for dep's time band (planner's intent).
-          2. Only if natural_gap > user_headway does the physics floor kick in.
-             This happens when the fleet is too small to sustain the configured
-             headway — we use natural_gap to prevent generating trips that no
-             bus can physically reach on time.
-          3. During off-peak (11:00–15:00) expand by off_peak_extra to widen
-             service density to match the extended driver break.
+        Planning mode:
+          base = user_hw exactly. Natural_gap is NOT imposed.
+          The scheduler will enforce the hard headway floor per-direction.
+          If config is infeasible, check_headway_feasibility() warns the caller.
 
-        When natural_gap > user_headway, the override is flagged separately
-        via check_headway_feasibility() rather than silently replacing the
-        planner's value.  This keeps generate_trips() side-effect-free.
+        Efficiency mode:
+          base = max(user_hw, natural_gap) — physics floor prevents generating
+          trips faster than the fleet can physically sustain.
+
+        Both modes: during off-peak (11:00–15:00) expand by off_peak_extra to
+          widen service density to match the extended driver break.
         """
         user_hw = _get_headway_at(dep, headway_df)
-        if natural_gap > user_hw:
-            # Physics floor: fleet cannot sustain user_hw — use natural_gap.
-            # check_headway_feasibility() will surface a warning to the caller.
-            base = natural_gap
+        if scheduling_mode == "planning":
+            base = user_hw                              # strict: trust planner's config
         else:
-            base = user_hw
+            base = user_hw if user_hw >= natural_gap else natural_gap  # physics floor
         if _OFF_PEAK_START <= dep < _OFF_PEAK_END:
             base += off_peak_extra
         return base
@@ -251,16 +254,22 @@ def _generate_return_dead_runs(config):
     return trips
 
 
-def generate_trips(config, headway_df, travel_time_df):
+def generate_trips(config, headway_df, travel_time_df,
+                   scheduling_mode: str = "planning"):
     """
     Main entry point. Returns all trips sorted by earliest_departure.
     DN revenue trips start at op_start (buses are at end_point).
     UP revenue trips start after first DN completes + break.
     Actual departure times set by scheduler (bus-driven, P4-first).
+
+    scheduling_mode is forwarded to _generate_revenue_trips() to control
+    whether the trip pool uses the configured headway strictly (planning)
+    or applies a physics floor at natural_gap (efficiency/service_max).
     """
     all_trips = (
         _generate_dead_runs(config, config.fleet_size) +
-        _generate_revenue_trips(config, headway_df, travel_time_df) +
+        _generate_revenue_trips(config, headway_df, travel_time_df,
+                                scheduling_mode=scheduling_mode) +
         _generate_return_dead_runs(config)
     )
     all_trips.sort(key=lambda t: t.earliest_departure)
