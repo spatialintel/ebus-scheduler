@@ -685,6 +685,148 @@ def build_headway_fig(deps, headway_df, direction, color, route_label):
     return fig
 
 
+def _headway_recommendations(config, headway_df, travel_time_df):
+    """
+    Compute physics-based recommended headway_min per time band and return
+    a DataFrame with columns:
+      From, To, Configured, Physics Floor, Recommended, Status, Note
+
+    Logic per band:
+      - Look up travel time for the band midpoint (UP direction)
+      - cycle_time = 2 × travel_time + 2 × preferred_layover_min
+      - natural_gap = cycle_time / fleet_size
+      - recommended  = max(configured, ceil(natural_gap)) + 1 buffer
+      - Also flag if band headway < recommended (needs change)
+
+    Charging impact row added at the end showing expected max gap during P5.
+    """
+    import math
+    from datetime import datetime as _dt
+
+    if headway_df is None or headway_df.empty:
+        return None
+
+    fleet      = max(1, config.fleet_size)
+    min_break  = config.preferred_layover_min
+
+    def _tt_for_band(time_from_str):
+        """Return best travel time for a band, falling back to segment config."""
+        try:
+            t = _dt.strptime(str(time_from_str).strip(), "%H:%M")
+        except Exception:
+            return None
+        # Try travel_time_df first
+        if travel_time_df is not None and not travel_time_df.empty:
+            for _, row in travel_time_df.iterrows():
+                try:
+                    tf = _dt.strptime(str(row["time_from"]).strip(), "%H:%M")
+                    tt = _dt.strptime(str(row["time_to"]).strip(),   "%H:%M")
+                    if tf <= t < tt:
+                        return float(row.get("up_min", row.get("dn_min", 0)))
+                except Exception:
+                    continue
+        # Fallback: segment config
+        try:
+            return float(config.get_travel_time(config.start_point, config.end_point))
+        except Exception:
+            pass
+        try:
+            dist = config.get_distance(config.start_point, config.end_point)
+            spd  = getattr(config, "avg_speed_kmph", 30.0) or 30.0
+            return dist / spd * 60
+        except Exception:
+            return 40.0   # absolute fallback
+
+    # Charging round-trip estimate
+    try:
+        depot_dead = config.get_travel_time(
+            getattr(config, "depot", "DEPOT"),
+            config.start_point
+        )
+    except Exception:
+        depot_dead = 30.0
+    try:
+        cs = config.p5_charging_start
+        ce = config.p5_charging_end
+        from datetime import datetime as _dt2
+        cws = _dt2.strptime(f"{cs.hour:02d}:{cs.minute:02d}", "%H:%M")
+        cwe = _dt2.strptime(f"{ce.hour:02d}:{ce.minute:02d}", "%H:%M")
+        window_min = (cwe - cws).total_seconds() / 60
+    except Exception:
+        window_min = 180
+    trig  = getattr(config, "trigger_soc_percent", 40)
+    tgt   = getattr(config, "target_soc_percent",  90)
+    batt  = getattr(config, "battery_kwh",         210)
+    chkw  = getattr(config, "depot_charger_kw",    60)
+    cheff = getattr(config, "depot_charger_efficiency", 0.85)
+    kwh_needed  = max(0, tgt - trig) / 100 * batt
+    charge_min  = kwh_needed / max(0.1, chkw * cheff) * 60
+    round_trip  = depot_dead * 2 + charge_min + min_break
+    max_conc    = max(1, fleet // 5)
+
+    rows = []
+    for _, hw_row in headway_df.iterrows():
+        try:
+            tf_str  = str(hw_row["time_from"]).strip()
+            tt_str  = str(hw_row["time_to"]).strip()
+            cfg_hw  = int(hw_row["headway_min"])
+        except Exception:
+            continue
+
+        travel   = _tt_for_band(tf_str)
+        if travel is None:
+            continue
+        cycle    = travel * 2 + min_break * 2
+        nat_gap  = cycle / fleet
+        rec_hw   = math.ceil(nat_gap) + 1   # +1 min buffer above floor
+        final    = max(cfg_hw, rec_hw)
+
+        if cfg_hw < rec_hw:
+            status = "⚠️ Below floor"
+            note   = f"Set to {rec_hw} for even {rec_hw}-min spacing"
+        elif cfg_hw == rec_hw or cfg_hw == rec_hw - 1:
+            status = "✅ Optimal"
+            note   = f"Achieves even {cfg_hw}-min spacing"
+        else:
+            # configured is above floor — check if it's achievable
+            status = "✅ Achievable"
+            note   = f"Uniform {cfg_hw}-min spacing. Floor={rec_hw-1}"
+
+        rows.append({
+            "From":        tf_str,
+            "To":          tt_str,
+            "Configured":  cfg_hw,
+            "Physics Floor": math.ceil(nat_gap),
+            "Recommended": rec_hw,
+            "Status":      status,
+            "Note":        note,
+        })
+
+    # Charging impact summary
+    buses_absent  = max_conc
+    buses_remain  = fleet - buses_absent
+    if buses_remain > 0:
+        # Use first band's travel time as representative
+        first_tt = _tt_for_band(str(headway_df.iloc[0]["time_from"]).strip()) or 40
+        chg_cycle = first_tt * 2 + min_break * 2
+        chg_hw    = chg_cycle / buses_remain
+        rows.append({
+            "From":          "P5 window",
+            "To":            "(charging)",
+            "Configured":    "—",
+            "Physics Floor": "—",
+            "Recommended":   "—",
+            "Status":        "ℹ️ Info",
+            "Note":          (
+                f"{buses_absent} bus(es) away charging (~{round_trip:.0f} min round-trip). "
+                f"{buses_remain} buses remain → expected headway ~{chg_hw:.0f} min. "
+                f"Unavoidable without terminal charger."
+            ),
+        })
+
+    return pd.DataFrame(rows) if rows else None
+
+
 def _apply_config_overrides(config, overrides):
     from src.models import RouteConfig
     return RouteConfig(
@@ -1340,6 +1482,29 @@ if app_mode == "🚌 Single Route":
                     "Time columns are read-only. "
                     "Changes take effect when you click Apply & Regenerate."
                 )
+                # Physics-based recommendations
+                _hw_src_rec = st.session_state.get("raw_headway_df", pd.DataFrame())
+                _tt_src_rec = st.session_state.get("raw_travel_time_df")
+                if not _hw_src_rec.empty:
+                    _rec_df = _headway_recommendations(config, _hw_src_rec, _tt_src_rec)
+                    if _rec_df is not None:
+                        with st.expander("💡 Physics-based headway recommendations", expanded=True):
+                            st.caption(
+                                "Recommended values are computed from your fleet size, travel times, "
+                                "and break config. **⚠️ Below floor** means the configured headway "
+                                "is impossible to achieve uniformly — the scheduler will silently "
+                                "widen it to the Physics Floor. Change to Recommended to get "
+                                "perfectly even spacing."
+                            )
+                            st.dataframe(
+                                _rec_df,
+                                hide_index=True,
+                                use_container_width=True,
+                                column_config={
+                                    "Status": st.column_config.TextColumn(width="small"),
+                                    "Note":   st.column_config.TextColumn(width="large"),
+                                },
+                            )
                 _hw_src = st.session_state.get("raw_headway_df", pd.DataFrame())
                 if not _hw_src.empty:
                     edited_hw_df = st.data_editor(
@@ -1962,6 +2127,24 @@ elif app_mode == "🏙️ Citywide":
                 # Headway profile editor
                 st.markdown("#### 🕐 Headway Profile")
                 st.caption("Edit headway_min per time band. Time columns are read-only.")
+                # Physics-based recommendations
+                _rec_df_city = _headway_recommendations(_cfg, _hw_edit, _ri_cfg.travel_time_df)
+                if _rec_df_city is not None:
+                    with st.expander("💡 Physics-based headway recommendations", expanded=True):
+                        st.caption(
+                            "Recommended values are computed from fleet size, travel times, "
+                            "and break config. **⚠️ Below floor** = scheduler will silently widen "
+                            "to Physics Floor. Change to Recommended for perfectly even spacing."
+                        )
+                        st.dataframe(
+                            _rec_df_city,
+                            hide_index=True,
+                            use_container_width=True,
+                            column_config={
+                                "Status": st.column_config.TextColumn(width="small"),
+                                "Note":   st.column_config.TextColumn(width="large"),
+                            },
+                        )
                 _edited_hw_city = st.data_editor(
                     _hw_edit[["time_from", "time_to", "headway_min"]].copy(),
                     column_config={
