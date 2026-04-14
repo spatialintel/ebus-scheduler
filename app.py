@@ -1358,10 +1358,10 @@ if app_mode == "🚌 Single Route":
                 "**Stability Score** = 1 / (1 + headway_std): 1.0 = perfect, < 0.5 = poor."
             )
             _stab_c1, _stab_c2, _stab_c3, _stab_c4, _stab_c5 = st.columns(5)
-            _ot = metrics.pct_trips_on_time
-            _drift_avg = metrics.avg_drift_min
-            _drift_max = metrics.max_drift_min
-            _hw_std = metrics.headway_std_min
+            _ot = getattr(metrics, 'pct_trips_on_time', 0.0)
+            _drift_avg = getattr(metrics, 'avg_drift_min', 0.0)
+            _drift_max = getattr(metrics, 'max_drift_min', 0.0)
+            _hw_std = getattr(metrics, 'headway_std_min', 0.0)
             _stab_score = 1.0 / (1.0 + _hw_std)   # 1.0 = perfect uniform; drops as std grows
             with _stab_c1:
                 _ot_status = "ok" if _ot >= 80 else ("warn" if _ot >= 60 else "fail")
@@ -1751,7 +1751,8 @@ elif app_mode == "🏙️ Citywide":
         _balance        = {}
 
     _max_gap     = cs.max_headway_gap_min
-    _on_time_pct = (sum(r.metrics.pct_trips_on_time for r in cs.results.values())
+    _on_time_pct = (sum(getattr(r.metrics, 'pct_trips_on_time', 0.0)
+                        for r in cs.results.values())
                     / max(1, len(cs.results)))
     _util_pct    = cs.citywide_utilization_pct
     _min_soc     = cs.min_soc_citywide
@@ -1763,7 +1764,7 @@ elif app_mode == "🏙️ Citywide":
     _surplus_routes  = [c for c, b in _balance.items() if b.get("surplus", 0) > 0]
     _large_gap_routes = [
         c for c, r in cs.results.items()
-        if r.metrics.max_headway_gap_min > 30
+        if getattr(r.metrics, 'max_headway_gap_min', 0.0) > 30
     ]
     _low_soc_routes  = [
         c for c, r in cs.results.items()
@@ -1771,7 +1772,7 @@ elif app_mode == "🏙️ Citywide":
     ]
     _poor_hw_routes  = [
         c for c, r in cs.results.items()
-        if r.metrics.pct_trips_on_time < 60
+        if getattr(r.metrics, 'pct_trips_on_time', 100.0) < 60
     ]
 
     # Overall service status — CRITICAL if any hard risk, WARNING if soft, GOOD otherwise
@@ -1897,8 +1898,8 @@ elif app_mode == "🏙️ Citywide":
                 ])) - 1
                 for direction in ("UP", "DN")
             ))
-            _ot  = _sm.pct_trips_on_time
-            _mgap = _sm.max_headway_gap_min
+            _ot  = getattr(_sm, 'pct_trips_on_time', 0.0)
+            _mgap = getattr(_sm, 'max_headway_gap_min', 0.0)
             _svc_rows.append({
                 "Route":               _scode,
                 "Average Frequency":   f"{_avg_gap:.0f} min",
@@ -2143,7 +2144,7 @@ elif app_mode == "🏙️ Citywide":
 
         # Large gaps
         for _lgc in _large_gap_routes:
-            _lg = cs.results[_lgc].metrics.max_headway_gap_min
+            _lg = getattr(cs.results[_lgc].metrics, 'max_headway_gap_min', 0.0)
             st.warning(f"⚠ **{_lgc}**: Large gap detected — {_lg:.0f} min maximum waiting time.")
             _any_alert = True
 
@@ -2155,7 +2156,7 @@ elif app_mode == "🏙️ Citywide":
 
         # Poor headway compliance
         for _phc in _poor_hw_routes:
-            _ph = cs.results[_phc].metrics.pct_trips_on_time
+            _ph = getattr(cs.results[_phc].metrics, 'pct_trips_on_time', 0.0)
             st.warning(
                 f"⚠ **{_phc}**: Irregular spacing — only {_ph:.0f}% of buses on schedule "
                 f"(target: ≥ 80%). Check fleet size or headway config."
@@ -2189,7 +2190,7 @@ elif app_mode == "🏙️ Citywide":
                                   f"from Route **{_src}** to a deficit route.")
         for _lgc in _large_gap_routes:
             _suggestions.append(f"Reduce off-peak headway on Route **{_lgc}** or add a bus "
-                                  f"to cover the {cs.results[_lgc].metrics.max_headway_gap_min:.0f}-min gap.")
+                                  f"to cover the {getattr(cs.results[_lgc].metrics, 'max_headway_gap_min', 0.0):.0f}-min gap.")
         for _phc in _poor_hw_routes:
             if _phc not in _large_gap_routes:
                 _suggestions.append(
