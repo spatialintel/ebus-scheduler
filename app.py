@@ -3,7 +3,7 @@ app.py — eBus Scheduler Dashboard
 """
 from __future__ import annotations
 __version__ = "2026-04-09-p2"
-import sys, tempfile
+import sys, tempfile, math
 from pathlib import Path
 from datetime import datetime, timedelta, time as dtime
 
@@ -996,6 +996,115 @@ def _even_spacing_min(config, headway_df, travel_time_df) -> dict:
         "why":            why,
         "what":           what,
     }
+
+
+def _build_config_excel(config, headway_df, travel_time_df) -> bytes:
+    """
+    Export the current route config as an Excel file in the same format as
+    the input template.  Teal header colour distinguishes dashboard exports.
+    """
+    import io
+    from openpyxl import Workbook
+    from openpyxl.styles import PatternFill, Font, Alignment
+    from datetime import datetime as _dtnow
+
+    TEAL = "0D7377"   # teal = dashboard export marker
+    WHITE_FONT = Font(color="FFFFFF", bold=True)
+    CENTER = Alignment(horizontal="center", vertical="center")
+
+    wb = Workbook()
+
+    # ── Sheet 1: Route_Config ─────────────────────────────────────────────────
+    ws = wb.active
+    ws.title = "Route_Config"
+    ws.column_dimensions["A"].width = 30
+    ws.column_dimensions["B"].width = 25
+    ws.column_dimensions["C"].width = 45
+
+    def _hdr(cell_ref, val):
+        c = ws[cell_ref]
+        c.value = val
+        c.fill  = PatternFill("solid", fgColor=TEAL)
+        c.font  = WHITE_FONT
+
+    _hdr("A1", "Parameter")
+    _hdr("B1", "Value")
+    _hdr("C1", "Notes / Description")
+
+    def _row(row, param, val, note=""):
+        ws.cell(row, 1, param)
+        ws.cell(row, 2, val)
+        ws.cell(row, 3, note)
+
+    r = 2
+    _row(r, "route_code",      config.route_code);                                 r+=1
+    _row(r, "route_name",      config.route_name);                                 r+=1
+    _row(r, "depot",           config.depot);                                      r+=1
+    _row(r, "start_point",     config.start_point);                                r+=1
+    _row(r, "end_point",       config.end_point);                                  r+=1
+    for i, inter in enumerate(getattr(config, "intermediates", []), 1):
+        _row(r, f"intermediate_{i}", inter or "");                                 r+=1
+    _row(r, "fleet_size",              config.fleet_size);                         r+=1
+    _row(r, "battery_kwh",             config.battery_kwh);                       r+=1
+    _row(r, "consumption_rate (kWh/km)", config.consumption_rate);                 r+=1
+    _row(r, "initial_soc_percent",     config.initial_soc_percent);               r+=1
+    _row(r, "avg_speed_kmph",          getattr(config,"avg_speed_kmph",30.0));    r+=1
+    _row(r, "depot_charger_kw",        config.depot_charger_kw);                  r+=1
+    _row(r, "depot_charger_efficiency",config.depot_charger_efficiency);          r+=1
+    _row(r, "terminal_charger_kw",     getattr(config,"terminal_charger_kw",0));  r+=1
+    _row(r, "trigger_soc_percent",     config.trigger_soc_percent);               r+=1
+    _row(r, "target_soc_percent",      config.target_soc_percent);                r+=1
+    _row(r, "min_soc_percent",         config.min_soc_percent);                   r+=1
+    _row(r, "min_charge_duration_min", getattr(config,"min_charge_duration_min",15)); r+=1
+    _row(r, "midday_charge_soc_percent", getattr(config,"midday_charge_soc_percent",65)); r+=1
+    _row(r, "operating_start",         config.operating_start.strftime("%H:%M")); r+=1
+    _row(r, "operating_end",           config.operating_end.strftime("%H:%M"));   r+=1
+    _row(r, "shift_split",             config.shift_split.strftime("%H:%M"));     r+=1
+    _row(r, "preferred_layover_min",   config.preferred_layover_min);             r+=1
+    _row(r, "max_layover_min",         getattr(config,"max_layover_min",20));     r+=1
+    _row(r, "off_peak_layover_extra_min", getattr(config,"off_peak_layover_extra_min",0)); r+=1
+    _row(r, "min_layover_min",         config.min_layover_min);                   r+=1
+    _row(r, "dead_run_buffer_min",     config.dead_run_buffer_min);               r+=1
+    _row(r, "max_headway_deviation_min", config.max_headway_deviation_min);       r+=1
+    _row(r, "max_km_per_bus",          getattr(config,"max_km_per_bus",0));       r+=1
+    _row(r, "min_km_per_bus",          getattr(config,"min_km_per_bus",0));       r+=1
+    try:
+        cs = config.p5_charging_start
+        ce = config.p5_charging_end
+        _row(r, "p5_charging_start",  cs.strftime("%H:%M") if hasattr(cs,"strftime") else str(cs)); r+=1
+        _row(r, "p5_charging_end",    ce.strftime("%H:%M") if hasattr(ce,"strftime") else str(ce)); r+=1
+    except Exception:
+        pass
+    _row(r, "dashboard_export",        _dtnow.now().strftime("%Y-%m-%d %H:%M"),
+         "Teal header = exported from eBus Scheduler dashboard");                  r+=1
+
+    # ── Sheet 2: Headway_Profile ──────────────────────────────────────────────
+    ws_hw = wb.create_sheet("Headway_Profile")
+    for col, hdr in enumerate(["Time From", "Time To", "headway_min", "Notes"], 1):
+        c = ws_hw.cell(1, col, hdr)
+        c.fill = PatternFill("solid", fgColor=TEAL)
+        c.font = WHITE_FONT
+    for i, (_, row) in enumerate(headway_df.iterrows(), 2):
+        ws_hw.cell(i, 1, str(row.get("time_from", "")))
+        ws_hw.cell(i, 2, str(row.get("time_to", "")))
+        ws_hw.cell(i, 3, int(row.get("headway_min", 20)))
+
+    # ── Sheet 3: TravelTime_Profile ───────────────────────────────────────────
+    ws_tt = wb.create_sheet("TravelTime_Profile")
+    for col, hdr in enumerate(["Time From", "Time To", "up_min", "dn_min", "Notes"], 1):
+        c = ws_tt.cell(1, col, hdr)
+        c.fill = PatternFill("solid", fgColor=TEAL)
+        c.font = WHITE_FONT
+    for i, (_, row) in enumerate(travel_time_df.iterrows(), 2):
+        ws_tt.cell(i, 1, str(row.get("time_from", "")))
+        ws_tt.cell(i, 2, str(row.get("time_to", "")))
+        ws_tt.cell(i, 3, row.get("up_min", ""))
+        ws_tt.cell(i, 4, row.get("dn_min", ""))
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.read()
 
 
 def _build_full_schedule_excel(config, buses) -> bytes:
@@ -2130,54 +2239,57 @@ elif app_mode == "🏙️ Citywide":
 
     # ── CITY TAB 1: Overview ──────────────────────────────────────────────────
     with tab_overview:
-        # ── Min feasible headway KPI (per route, worst-case across city) ─────
+        # ── Min feasible headway table (compact, no per-route error boxes) ────
         _city_mode_used = st.session_state.get("city_mode_used", "planning")
-        _min_feas_rows  = []
-        for _code in sorted(cs.results):
-            _ri_ov = city_cfg.routes[_code]
-            _es    = _even_spacing_min(_ri_ov.config, _ri_ov.headway_df, _ri_ov.travel_time_df)
-            if _es:
-                _peak_cfg = int(_ri_ov.headway_df["headway_min"].min()) if len(_ri_ov.headway_df) else 20
-                _ok = _peak_cfg >= _es.get("peak_even_min", 0)
-                _min_feas_rows.append({
-                    "code": _code,
-                    "peak_min": _es.get("peak_even_min", "—"),
-                    "offpeak_min": _es.get("offpeak_even_min", "—"),
-                    "rec_k10_peak": _es.get("peak_k10", "—"),
-                    "rec_k10_offp": _es.get("offpeak_k10", "—"),
-                    "cfg_peak": _peak_cfg,
-                    "ok": _ok,
-                    "why": _es.get("why", ""),
-                    "what": _es.get("what", ""),
-                })
+        _mf_display     = []
+        _problem_count  = 0
 
-        if _min_feas_rows:
-            _problem_routes = [r for r in _min_feas_rows if not r["ok"]]
-            if _problem_routes:
-                for _pr in _problem_routes:
-                    st.error(
-                        f"🔴 **{_pr['code']}**: Configured peak headway = {_pr['cfg_peak']} min, "
-                        f"but minimum for even spacing = {_pr['peak_min']} min.  \n"
-                        f"⚠ **Why:** {_pr['why']}  \n"
-                        f"💡 **What to do:** {_pr['what']}"
-                    )
+        for _code in sorted(cs.results):
+            _ri_ov   = city_cfg.routes[_code]
+            # In service_max mode the scheduled headway IS the result headway, not
+            # the original input config headway — use the result's headway_df
+            _hw_for_check = cs.results[_code].headway_df if _city_mode_used == "service_max" else _ri_ov.headway_df
+            _es = _even_spacing_min(_ri_ov.config, _hw_for_check, _ri_ov.travel_time_df)
+            if not _es:
+                continue
+            _peak_cfg = int(_hw_for_check["headway_min"].min()) if len(_hw_for_check) else 20
+            _ok       = _peak_cfg >= _es.get("peak_even_min", 0)
+            if not _ok:
+                _problem_count += 1
+            _mf_display.append({
+                "Route":              _code,
+                "Peak HW (min)":      _peak_cfg,
+                "Min Feasible (min)": _es.get("peak_even_min", "—"),
+                "Rec k=1.0 Peak":     _es.get("peak_k10", "—"),
+                "Rec k=1.0 Off-Peak": _es.get("offpeak_k10", "—"),
+                "Charging RT (min)":  _es.get("charging_rt", "—"),
+                "Status":             "✅ OK" if _ok else f"⚠ Need ≥{_es.get('peak_even_min', '?')}",
+            })
+
+        if _mf_display:
+            if _problem_count > 0:
+                st.warning(
+                    f"⚠ **{_problem_count} route(s)** have configured headways below the even-spacing minimum. "
+                    f"Large charging gaps are expected on these routes. See table below.",
+                    icon="⚠️"
+                )
             else:
                 st.success("✅ All routes: configured headways meet even-spacing minimums.")
 
-            # Min Feasible HW summary table
-            with st.expander("📐 Minimum Feasible Headway by Route", expanded=False):
-                _mf_display = []
-                for r in _min_feas_rows:
-                    _mf_display.append({
-                        "Route":               r["code"],
-                        "Configured Peak (min)": r["cfg_peak"],
-                        "Min (Even Spacing)":  r["peak_min"],
-                        "Min Off-Peak":        r["offpeak_min"],
-                        "Rec k=1.0 Peak":      r["rec_k10_peak"],
-                        "Rec k=1.0 Off-Peak":  r["rec_k10_offp"],
-                        "Status":              "✅ OK" if r["ok"] else f"⚠ Need ≥{r['peak_min']}",
-                    })
-                st.dataframe(pd.DataFrame(_mf_display), hide_index=True, use_container_width=True)
+            with st.expander(
+                f"📐 Minimum Feasible Headway — {_problem_count} issue(s)" if _problem_count
+                else "📐 Minimum Feasible Headway — All OK",
+                expanded=(_problem_count > 0)
+            ):
+                st.caption(
+                    "**Min Feasible** = (cycle + charging_RT) ÷ fleet + 3 buffer. "
+                    "**Rec k=1.0** = minimum stable. "
+                    "Peak bands are those with the lowest configured headway (tighter service intent). "
+                    "Off-peak = Peak + Δ (Δ = max(2, 15% of peak))."
+                )
+                _mf_df = pd.DataFrame(_mf_display)
+                st.dataframe(_mf_df, hide_index=True, use_container_width=True,
+                             column_config={"Status": st.column_config.TextColumn(width="small")})
 
         st.markdown('<div class="section-title">Route Summary</div>', unsafe_allow_html=True)
         summary_df = pd.DataFrame(cs.route_summary_rows())
@@ -2429,7 +2541,10 @@ elif app_mode == "🏙️ Citywide":
                     "ok" if m.dead_km_ratio < 0.15 else "warn") +
                 kpi("Min SOC", f"{m.min_soc_seen:.1f}%",
                     "ok" if m.min_soc_seen >= 25 else "warn") +
-                kpi("KM Range", f"{m.km_range:.1f}") +
+                kpi("Min Feasible HW",
+                    f"{r.physics_min_headway} min" if r.physics_min_headway else "—",
+                    "ok" if r.rec_peak_headway and int(r.headway_df['headway_min'].min()) >= r.physics_min_headway else "warn",
+                    sub=f"rec peak: {r.rec_peak_headway} · off-peak: {r.rec_offpeak_headway}") +
                 '</div>', unsafe_allow_html=True)
 
             # Download full schedule
@@ -2751,6 +2866,48 @@ elif app_mode == "🏙️ Citywide":
             _cfg     = _ri_cfg.config
             _hw_edit = _ri_cfg.headway_df.copy()
 
+            # ── k / Δ scaling controls (OUTSIDE form — sliders can't be inside st.form) ─
+            st.markdown("#### 📐 Even-Spacing Headway Calculator")
+            _es_scl   = _even_spacing_min(_cfg, _hw_edit, _ri_cfg.travel_time_df)
+            _phys_min = _es_scl.get("peak_even_min", 0) if _es_scl else 0
+            if _phys_min:
+                st.caption(
+                    f"**Physics Min:** {_phys_min} min peak · "
+                    f"{_es_scl.get('offpeak_even_min','—')} min off-peak  ·  "
+                    f"Charging RT ≈ {_es_scl.get('charging_rt','—')} min"
+                )
+            _col_k, _col_d = st.columns(2)
+            with _col_k:
+                _k_val = st.slider(
+                    "Scaling factor k",
+                    1.0, 2.0, 1.1, 0.05,
+                    help="k=1.0 = minimum stable headway. k=1.1 = +10% margin. Applies to peak bands.",
+                    key=f"k_slider_{_cfg_sel}"
+                )
+            with _col_d:
+                _delta_val = st.slider(
+                    "Peak/Off-peak spread Δ (min)",
+                    1, 15,
+                    max(2, round(0.15 * max(_phys_min, 10))),
+                    help="Off-peak headway = Peak × k + Δ.",
+                    key=f"delta_slider_{_cfg_sel}"
+                )
+            if _phys_min:
+                _rec_k_peak = math.ceil(_k_val * _phys_min)
+                _rec_k_offp = _rec_k_peak + _delta_val
+                st.info(
+                    f"k={_k_val:.2f}, Δ={_delta_val} → **Peak = {_rec_k_peak} min · Off-peak = {_rec_k_offp} min**"
+                )
+                if st.button(f"⚡ Auto-fill k={_k_val:.2f} headways into editor below",
+                             key=f"autofill_{_cfg_sel}"):
+                    _min_cfg_hw = int(_hw_edit["headway_min"].min()) if len(_hw_edit) else 20
+                    for _idx in _hw_edit.index:
+                        _is_pk = int(_hw_edit.at[_idx, "headway_min"]) <= _min_cfg_hw
+                        _hw_edit.at[_idx, "headway_min"] = _rec_k_peak if _is_pk else _rec_k_offp
+                    st.session_state[f"city_hw_form_edit_{_cfg_sel}"] = \
+                        _hw_edit[["time_from", "time_to", "headway_min"]].copy()
+                    st.rerun()
+
             with st.form(key=f"city_route_cfg_form_{_cfg_sel}"):
                 col_a, col_b = st.columns(2)
 
@@ -2960,8 +3117,28 @@ elif app_mode == "🏙️ Citywide":
                         st.session_state["city_result"] = cs
                         st.session_state["city_config"] = city_cfg
                         st.success(f"✅ {_cfg_sel} re-scheduled with updated config.")
+                        # Store updated cfg for download
+                        st.session_state[f"cfg_download_{_cfg_sel}"] = (
+                            _updated_cfg, _updated_hw, _ri_cfg.travel_time_df)
                         st.rerun()
                     except Exception as _err:
                         st.error(f"Re-schedule error: {_err}")
+
+            # ── Download updated config Excel (teal header = dashboard export) ─
+            _dl_key = f"cfg_download_{_cfg_sel}"
+            if st.session_state.get(_dl_key):
+                _dl_cfg, _dl_hw, _dl_tt = st.session_state[_dl_key]
+                try:
+                    _cfg_bytes = _build_config_excel(_dl_cfg, _dl_hw, _dl_tt)
+                    st.download_button(
+                        label=f"⬇ Download Updated Config — {_cfg_sel}.xlsx",
+                        data=_cfg_bytes,
+                        file_name=f"ebus_config_dashboard_{_cfg_sel}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        help="Teal header colour identifies this as a dashboard-exported config. "
+                             "Upload directly on next run.",
+                    )
+                except Exception as _dle:
+                    st.caption(f"Config download unavailable: {_dle}")
 
 

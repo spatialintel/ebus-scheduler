@@ -36,6 +36,9 @@ class RouteResult:
     fleet_original: int         # fleet_size from config Excel
     surplus: int = 0            # positive = excess buses available to donate
     deficit: int = 0            # positive = route needs more buses
+    physics_min_headway: int = 0    # ceil((cycle+RT)/fleet)+3 — even-spacing minimum
+    rec_peak_headway: int = 0       # recommended peak headway (k=1.0)
+    rec_offpeak_headway: int = 0    # recommended off-peak headway (k=1.0)
 
 
 @dataclass

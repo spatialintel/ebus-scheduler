@@ -53,6 +53,21 @@ from src.trip_generator import generate_trips
 from src.bus_scheduler import schedule_buses
 from src.metrics import compute_metrics
 
+# ---------------------------------------------------------------------------
+# Tunable constants — change here to affect all modes globally
+# ---------------------------------------------------------------------------
+
+# Safety buffer added on top of the coverage formula result:
+#   H_min = ceil((cycle + RT) / fleet) + SPIKE_SAFETY_BUFFER
+# Increase if you still see occasional spikes at the theoretical minimum.
+SPIKE_SAFETY_BUFFER: int = 3
+
+# Maximum number of spikes (gaps > 2×H) allowed per direction per day
+# in non-peak hours before the binary search increments H.
+# 1 = at most one charging gap per direction (recommended for planning).
+# 2 = more permissive (useful when charging window is very wide).
+MAX_SPIKES_ALLOWED: int = 1
+
 
 # ---------------------------------------------------------------------------
 # Service Maximization helpers
@@ -95,26 +110,64 @@ def _charging_rt(ri: RouteInput) -> float:
     return nearest_tt * 2 + chg_min   # to depot + charge + back
 
 
-def _count_spikes(buses, headway_min: float) -> dict:
+def _detect_peak_windows(headway_df) -> list:
+    """
+    Detect peak time windows from the headway profile.
+    Peak bands = rows where headway_min equals the minimum across all bands.
+    Returns list of (start_hour_float, end_hour_float) tuples.
+
+    Example: headway_df with 15 min at 08-11 and 16-20, 20 min elsewhere
+    → returns [(8.0, 11.0), (16.0, 20.0)]
+
+    Falls back to empty list (no peak windows excluded) if headway_df is empty.
+    """
+    try:
+        if headway_df is None or len(headway_df) == 0:
+            return []
+        min_hw = float(headway_df["headway_min"].min())
+        windows = []
+        for _, row in headway_df.iterrows():
+            if float(row["headway_min"]) == min_hw:
+                try:
+                    from datetime import datetime as _dt_p
+                    tf = _dt_p.strptime(str(row["time_from"]).strip(), "%H:%M")
+                    tt = _dt_p.strptime(str(row["time_to"]).strip(),   "%H:%M")
+                    windows.append((tf.hour + tf.minute / 60,
+                                    tt.hour + tt.minute / 60))
+                except Exception:
+                    pass
+        return windows
+    except Exception:
+        return []
+
+
+def _count_spikes(buses, headway_min: float, headway_df=None,
+                  max_allowed: int = MAX_SPIKES_ALLOWED) -> dict:
     """
     Count spikes > 2×headway_min per direction, restricted to non-peak hours.
-    Peak = 08:00–11:00 and 16:00–20:00. Spikes during peak are not counted.
-    Returns {"UP": n, "DN": n}.
+
+    Peak windows are derived from headway_df (bands with the minimum headway).
+    Falls back to hardcoded 08:00–11:00 and 16:00–20:00 if headway_df is None.
+
+    Returns {"UP": n, "DN": n, "exceeds_limit": bool}.
     """
     from datetime import datetime as _dt2
     REF = _dt2(2025, 1, 1)
-    peak_ranges = [
-        (REF.replace(hour=8), REF.replace(hour=11)),
-        (REF.replace(hour=16), REF.replace(hour=20)),
-    ]
+
+    # Detect peak windows from headway profile
+    if headway_df is not None:
+        _peak_windows = _detect_peak_windows(headway_df)
+    else:
+        _peak_windows = [(8.0, 11.0), (16.0, 20.0)]   # fallback
 
     def _is_peak(t):
         if t is None:
             return False
-        return any(s <= t < e for s, e in peak_ranges)
+        h = t.hour + t.minute / 60
+        return any(s <= h < e for s, e in _peak_windows)
 
     threshold = headway_min * 2
-    result = {"UP": 0, "DN": 0}
+    result    = {"UP": 0, "DN": 0}
     for direction in ("UP", "DN"):
         deps = sorted([
             t.actual_departure for b in buses for t in b.trips
@@ -123,10 +176,11 @@ def _count_spikes(buses, headway_min: float) -> dict:
         ])
         for i in range(1, len(deps)):
             gap = (deps[i] - deps[i - 1]).total_seconds() / 60
-            if gap > threshold:
-                # Only count if the gap starts outside peak
-                if not _is_peak(deps[i - 1]):
-                    result[direction] += 1
+            if gap > threshold and not _is_peak(deps[i - 1]):
+                result[direction] += 1
+
+    result["exceeds_limit"] = (result["UP"] > max_allowed or
+                                result["DN"] > max_allowed)
     return result
 
 
@@ -164,8 +218,8 @@ def _natural_headway(ri: RouteInput) -> float:
     # Charging RT
     rt = _charging_rt(ri)
 
-    # Physics minimum (coverage formula) + 3-min safety buffer
-    h_physics = math.ceil((max_cycle + rt) / fleet) + 3
+    # Physics minimum (coverage formula) + configurable safety buffer
+    h_physics = math.ceil((max_cycle + rt) / fleet) + SPIKE_SAFETY_BUFFER
     h_start   = max(5, h_physics)
 
     # Binary search / increment: try H from h_start, increment until spike rule satisfied
@@ -178,8 +232,10 @@ def _natural_headway(ri: RouteInput) -> float:
                                          headway_df=flat_df,
                                          travel_time_df=ri.travel_time_df,
                                          scheduling_mode="efficiency")
-            spikes = _count_spikes(trial_buses, float(h_try))
-            if spikes["UP"] <= 1 and spikes["DN"] <= 1:
+            spikes = _count_spikes(trial_buses, float(h_try),
+                                   headway_df=ri.headway_df,
+                                   max_allowed=MAX_SPIKES_ALLOWED)
+            if not spikes["exceeds_limit"]:
                 return float(h_try)
         except Exception:
             continue
@@ -262,6 +318,22 @@ def _run_single_route(
 
         pvr_slices = compute_pvr_slices(ri)
 
+        # Compute physics_min_headway and recommended headways (k=1.0)
+        _rt        = _charging_rt(ri)
+        _max_cycle = 0.0
+        for _, _row in ri.travel_time_df.iterrows():
+            try:
+                _up = float(_row["up_min"]); _dn = float(_row["dn_min"])
+                _max_cycle = max(_max_cycle, _up + _dn + config.preferred_layover_min * 2)
+            except Exception:
+                pass
+        if _max_cycle == 0:
+            _max_cycle = 2 * 50 + 2 * config.preferred_layover_min
+        _h_phys   = math.ceil((_max_cycle + _rt) / max(1, config.fleet_size)) + 3
+        _delta    = max(2, round(0.15 * _h_phys))
+        _rec_peak = _h_phys
+        _rec_offp = _h_phys + _delta
+
         return RouteResult(
             route_code=config.route_code,
             config=config,
@@ -274,6 +346,9 @@ def _run_single_route(
             fleet_original=original_fleet,
             surplus=max(0, config.fleet_size - pvr_slices.pvr_peak),
             deficit=max(0, pvr_slices.pvr_peak - config.fleet_size),
+            physics_min_headway=_h_phys,
+            rec_peak_headway=_rec_peak,
+            rec_offpeak_headway=_rec_offp,
         )
     finally:
         config.fleet_size = original_fleet
