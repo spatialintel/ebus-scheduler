@@ -1734,168 +1734,119 @@ elif app_mode == "🏙️ Citywide":
         st.info("📋 **Planning-Compliant**: headway profile respected. "
                 "Surplus buses redistributed to deficit routes based on time-sliced PVR.", icon="📋")
 
-    # Citywide KPIs
+    # ── Citywide dashboard header ─────────────────────────────────────────────
+    # Compute all signals once so every section can reuse them without re-querying.
+    _city_mode_used = st.session_state.get("city_mode_used", "planning")
+
+    # Fleet need (Buses Needed = total PVR_peak across all routes)
+    try:
+        _pvr_slices_all = compute_pvr_slices_all(city_cfg)
+        _total_pvr_peak = sum(s.pvr_peak for s in _pvr_slices_all.values())
+        _total_pvr_chg  = sum(s.pvr_charging for s in _pvr_slices_all.values())
+        _balance        = compute_fleet_balance(city_cfg)
+    except Exception:
+        _pvr_slices_all = {}
+        _total_pvr_peak = cs.total_buses_used
+        _total_pvr_chg  = cs.total_buses_used
+        _balance        = {}
+
+    _max_gap     = cs.max_headway_gap_min
+    _on_time_pct = (sum(r.metrics.pct_trips_on_time for r in cs.results.values())
+                    / max(1, len(cs.results)))
+    _util_pct    = cs.citywide_utilization_pct
+    _min_soc     = cs.min_soc_citywide
+    _buses_in    = cs.total_buses_used
+    _buses_need  = _total_pvr_peak
+
+    # Route-level risk signals (for alerts and action suggestions)
+    _deficit_routes  = [c for c, b in _balance.items() if b.get("deficit", 0) > 0]
+    _surplus_routes  = [c for c, b in _balance.items() if b.get("surplus", 0) > 0]
+    _large_gap_routes = [
+        c for c, r in cs.results.items()
+        if r.metrics.max_headway_gap_min > 30
+    ]
+    _low_soc_routes  = [
+        c for c, r in cs.results.items()
+        if r.metrics.min_soc_seen < 22
+    ]
+    _poor_hw_routes  = [
+        c for c, r in cs.results.items()
+        if r.metrics.pct_trips_on_time < 60
+    ]
+
+    # Overall service status — CRITICAL if any hard risk, WARNING if soft, GOOD otherwise
+    if _deficit_routes or _low_soc_routes or _min_soc < 20:
+        _svc_status = "🔴 CRITICAL"
+        _svc_color  = "#dc2626"
+    elif _large_gap_routes or _poor_hw_routes or _max_gap > 45:
+        _svc_status = "🟡 WARNING"
+        _svc_color  = "#d97706"
+    else:
+        _svc_status = "🟢 GOOD"
+        _svc_color  = "#16a34a"
+
+    # ── A. TOP SUMMARY — always visible ──────────────────────────────────────
+    st.markdown(f"## 🏙️ Citywide Schedule — {len(cs.results)} Routes")
+    st.caption(f"Mode: **{mode_label}** · Depot: **{city_cfg.depot_name}**")
+
+    # Status badge
+    st.markdown(
+        f'<div style="background:{_svc_color};color:white;padding:10px 20px;border-radius:8px;'
+        f'font-size:1.1rem;font-weight:700;margin-bottom:1rem;display:inline-block;">'
+        f'Service Status: {_svc_status}</div>',
+        unsafe_allow_html=True,
+    )
+
+    # 6 plain-language KPI cards
+    _gap_status   = "ok" if _max_gap <= 20 else ("warn" if _max_gap <= 40 else "bad")
+    _ot_status    = "ok" if _on_time_pct >= 80 else ("warn" if _on_time_pct >= 60 else "bad")
+    _util_status  = "ok" if _util_pct >= 85 else "warn"
+    _soc_status   = "ok" if _min_soc >= 25 else ("warn" if _min_soc >= 20 else "bad")
+    _fleet_status = "ok" if _buses_in >= _buses_need else "bad"
+
     st.markdown(
         '<div class="kpi-grid">' +
-        kpi("Routes", str(len(cs.results))) +
-        kpi("Total Fleet", str(cs.total_buses_used),
-            sub=f"configured: {city_cfg.total_configured_fleet}") +
-        kpi("Revenue Trips", str(cs.total_revenue_trips)) +
-        kpi("Total KM", f"{cs.total_km:,.0f}",
-            sub=f"revenue: {cs.total_revenue_km:,.0f}") +
-        kpi("Dead KM", f"{cs.total_dead_km:,.0f}",
-            "ok" if cs.citywide_dead_km_ratio < 0.15 else "warn",
-            sub=f"{cs.citywide_dead_km_ratio:.1%} of total · {cs.total_dead_trips} trips") +
-        kpi("Min SOC", f"{cs.min_soc_citywide:.1f}%",
-            "ok" if cs.min_soc_citywide >= 25 else "warn" if cs.min_soc_citywide >= 20 else "bad") +
-        kpi("Utilization", f"{cs.citywide_utilization_pct:.0f}%",
-            "ok" if cs.citywide_utilization_pct >= 85 else "warn") +
-        kpi("Avg HW Dev", f"{cs.avg_headway_deviation_min:.1f} min",
-            "ok" if cs.avg_headway_deviation_min < 5 else "warn"
-            if cs.avg_headway_deviation_min < 10 else "bad",
-            sub="vs configured") +
+        kpi("Buses in Service", str(_buses_in),
+            _fleet_status,
+            sub=f"config: {city_cfg.total_configured_fleet}") +
+        kpi("Buses Needed", str(_buses_need),
+            "ok" if _buses_in >= _buses_need else "bad",
+            sub="min required for service") +
+        kpi("Max Waiting Time", f"{_max_gap:.0f} min",
+            _gap_status,
+            sub="longest gap between buses") +
+        kpi("On-Time Spacing", f"{_on_time_pct:.0f}%",
+            _ot_status,
+            sub="buses within ±3 min of target") +
+        kpi("Bus Usage", f"{_util_pct:.0f}%",
+            _util_status,
+            sub="buses with revenue trips") +
+        kpi("Lowest Battery", f"{_min_soc:.1f}%",
+            _soc_status,
+            sub="across all buses") +
         '</div>', unsafe_allow_html=True,
     )
 
-    tab_overview, tab_rebalance, tab_pvr, tab_headways, tab_route_detail, tab_fleet_config, tab_stability = st.tabs([
-        "📊 Overview", "🔄 Fleet Rebalancing", "📐 PVR Analysis",
-        "📈 Headways", "🗺 Route Detail", "⚙️ Fleet Config", "🔍 Stability",
+    # ── B–E. TABS ─────────────────────────────────────────────────────────────
+    tab_service, tab_fleet, tab_efficiency, tab_alerts, tab_route_detail, tab_fleet_config = st.tabs([
+        "📈 Service Quality",
+        "🚌 Fleet & Allocation",
+        "⚙️ Efficiency",
+        "🚨 Risks & Alerts",
+        "🗺 Route Detail",
+        "🛠 Config Editor",
     ])
 
-    # ── CITY TAB 1: Overview ──────────────────────────────────────────────────
-    with tab_overview:
-        st.markdown('<div class="section-title">Route Summary</div>', unsafe_allow_html=True)
-        summary_df = pd.DataFrame(cs.route_summary_rows())
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
-
-        if _PLOTLY_OK and len(cs.results) > 1:
-            st.markdown('<div class="section-title">Fleet Allocation: PVR vs Allocated</div>',
-                        unsafe_allow_html=True)
-            codes = sorted(cs.results.keys())
-            fig = go.Figure()
-            fig.add_trace(go.Bar(name="PVR (minimum)", x=codes,
-                                 y=[cs.results[c].pvr for c in codes], marker_color="#94a3b8"))
-            fig.add_trace(go.Bar(name="Config Fleet", x=codes,
-                                 y=[cs.results[c].fleet_original for c in codes], marker_color="#c7d2fe"))
-            fig.add_trace(go.Bar(name="Final Allocated", x=codes,
-                                 y=[cs.results[c].fleet_allocated for c in codes], marker_color="#4f46e5"))
-            fig.update_layout(barmode="group", height=350,
-                              legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.5, xanchor="center"),
-                              margin=dict(l=40, r=20, t=20, b=40), plot_bgcolor="white")
-            st.plotly_chart(fig, use_container_width=True)
-
-        if _PLOTLY_OK and len(cs.results) > 1:
-            st.markdown('<div class="section-title">Dead KM % by Route</div>', unsafe_allow_html=True)
-            codes = sorted(cs.results.keys())
-            dead_pcts = [cs.results[c].metrics.dead_km_ratio * 100 for c in codes]
-            fig2 = go.Figure(go.Bar(x=codes, y=dead_pcts, marker_color=[
-                "#16a34a" if d < 15 else "#d97706" if d < 25 else "#dc2626" for d in dead_pcts]))
-            fig2.update_layout(height=280, yaxis_title="Dead KM %",
-                               margin=dict(l=40, r=20, t=20, b=40), plot_bgcolor="white")
-            st.plotly_chart(fig2, use_container_width=True)
-
-    # ── CITY TAB 2: Fleet Rebalancing ─────────────────────────────────────────
-    with tab_rebalance:
-        st.markdown('<div class="section-title">Fleet Balance Analysis (PVR-based)</div>',
-                    unsafe_allow_html=True)
-        # Mode-specific headroom denominator:
-        #   Planning    → PVR_peak   (service headway drives the floor)
-        #   Efficiency  → PVR_charging (charging downtime must be covered)
-        #   Service Max → PVR_peak   (no headway constraint, flat spacing)
-        _city_mode_used = st.session_state.get("city_mode_used", "planning")
-        balance = compute_fleet_balance(city_cfg)
-        try:
-            _pvr_slices_bal = compute_pvr_slices_all(city_cfg)
-        except Exception:
-            _pvr_slices_bal = {}
-
-        bal_rows = []
-        for code, b in sorted(balance.items()):
-            if _city_mode_used == "efficiency" and code in _pvr_slices_bal:
-                _pvr_denom = _pvr_slices_bal[code].pvr_charging
-                _hr_label  = "Headroom % (vs PVR_chg)"
-            else:
-                _pvr_denom = b["pvr"]
-                _hr_label  = "Headroom % (vs PVR_peak)"
-            _hr = (b["allocated"] - _pvr_denom) / _pvr_denom * 100 if _pvr_denom > 0 else 0.0
-            bal_rows.append({
-                "Route":    code,
-                "PVR Peak": b["pvr"],
-                "PVR Chg":  b.get("pvr_charging", b["pvr"]),
-                "Allocated": b["allocated"],
-                "Surplus":  b["surplus"] if b["surplus"] > 0 else "",
-                "Deficit":  b["deficit"] if b["deficit"] > 0 else "",
-                _hr_label:  f"{_hr:+.0f}%",
-            })
-        bal_df = pd.DataFrame(bal_rows)
-        st.dataframe(bal_df, use_container_width=True, hide_index=True)
+    # ── TAB 1: SERVICE QUALITY ────────────────────────────────────────────────
+    with tab_service:
+        st.markdown('<div class="section-title">Headway Charts</div>', unsafe_allow_html=True)
         st.caption(
-            f"**Headroom %** uses {'PVR_charging' if _city_mode_used == 'efficiency' else 'PVR_peak'} "
-            f"as denominator in **{_city_mode_used}** mode. "
-            "Positive = spare capacity; negative = under-resourced."
-        )
-
-    # ── CITY TAB 3: PVR Analysis ──────────────────────────────────────────────
-    with tab_pvr:
-        st.caption(
-            "**PVR (Peak)** — minimum buses needed at the tightest headway band. "
-            "Formula: `ceil(cycle_time_peak / peak_headway)`. Drives fleet rebalancing.  \n"
-            "**PVR (Off-Peak)** — minimum buses during 11:00–15:00 (reduced demand).  \n"
-            "**PVR (Charging)** — realistic fleet requirement including charging downtime. "
-            "Formula: `ceil(PVR_peak × (1 + charging_fraction))`.  \n"
-            "**Charging Fraction** = charging_time / charging_window. "
-            "Charging time = kWh needed ÷ charger kW. "
-            "Charging window = p5_end − p5_start from config. "
-            "A fraction of 0.30 means 30% of the fleet is unavailable at any moment during P5.  \n"
-            "**Off-Peak Slack** = PVR_peak − PVR_offpeak — buses freed during midday that can be used for interlining (Phase 2)."
-        )
-        try:
-            slices_all = compute_pvr_slices_all(city_cfg)
-            pvr_rows   = [s.as_dict() for s in slices_all.values()]
-            pvr_df     = pd.DataFrame(pvr_rows)
-            alloc_map  = {code: r.fleet_allocated for code, r in cs.results.items()}
-            pvr_df["Allocated"] = pvr_df["Route"].map(alloc_map)
-            pvr_df["vs PVR Peak"] = pvr_df.apply(
-                lambda row: (
-                    f"+{row['Allocated'] - row['PVR (Peak)']} surplus"
-                    if row["Allocated"] > row["PVR (Peak)"]
-                    else (f"{row['Allocated'] - row['PVR (Peak)']} deficit"
-                          if row["Allocated"] < row["PVR (Peak)"] else "✅ exact")
-                ), axis=1
-            )
-            st.dataframe(pvr_df, hide_index=True, use_container_width=True)
-
-            if _PLOTLY_OK and len(cs.results) > 1:
-                st.markdown('<div class="section-title">Fleet vs PVR Slices</div>',
-                            unsafe_allow_html=True)
-                codes = sorted(cs.results.keys())
-                fig_pvr = go.Figure()
-                fig_pvr.add_trace(go.Bar(name="PVR (Peak)",     x=codes,
-                    y=[slices_all[c].pvr_peak     for c in codes], marker_color="#dc2626"))
-                fig_pvr.add_trace(go.Bar(name="PVR (Off-Peak)", x=codes,
-                    y=[slices_all[c].pvr_offpeak  for c in codes], marker_color="#f97316"))
-                fig_pvr.add_trace(go.Bar(name="PVR (Charging)", x=codes,
-                    y=[slices_all[c].pvr_charging for c in codes], marker_color="#fbbf24"))
-                fig_pvr.add_trace(go.Bar(name="Allocated",      x=codes,
-                    y=[alloc_map.get(c, 0)        for c in codes], marker_color="#4f46e5"))
-                fig_pvr.update_layout(
-                    barmode="group", height=350,
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.5, xanchor="center"),
-                    margin=dict(l=40, r=20, t=20, b=40), plot_bgcolor="white",
-                )
-                st.plotly_chart(fig_pvr, use_container_width=True)
-        except Exception as e:
-            st.warning(f"PVR analysis unavailable: {e}")
-
-    # ── CITY TAB 4: Headways (per-route selector) ─────────────────────────────
-    with tab_headways:
-        st.caption(
-            "Departure gaps between consecutive same-direction buses. "
-            "Select a route to inspect actual vs configured headways."
+            "Departure gaps between consecutive same-direction buses per route. "
+            "🟢 Green = within configured target · 🔴 Red = large gap (>1.5× target)."
         )
         hw_route_codes = sorted(cs.results.keys())
         selected_hw_route = st.selectbox(
-            "Route", hw_route_codes,
+            "Select Route", hw_route_codes,
             format_func=lambda c: f"{c} — {cs.results[c].config.route_name}",
             key="city_hw_route",
         )
@@ -1922,6 +1873,335 @@ elif app_mode == "🏙️ Citywide":
 
                 with st.expander("📋 Configured headway profile"):
                     st.dataframe(rr_hw.headway_df, hide_index=True, use_container_width=True)
+
+        # Simple service metrics (plain language)
+        st.markdown('<div class="section-title">Service Metrics by Route</div>', unsafe_allow_html=True)
+        _svc_rows = []
+        for _scode in sorted(cs.results):
+            _sr = cs.results[_scode]
+            _sm = _sr.metrics
+            _avg_gap = sum(
+                (deps[i] - deps[i-1]).total_seconds() / 60
+                for direction in ("UP", "DN")
+                for deps in [sorted([
+                    t.actual_departure for b in _sr.buses for t in b.trips
+                    if t.trip_type == "Revenue" and t.direction == direction
+                    and t.actual_departure is not None
+                ])]
+                for i in range(1, len(deps))
+            ) / max(1, sum(
+                len(sorted([
+                    t.actual_departure for b in _sr.buses for t in b.trips
+                    if t.trip_type == "Revenue" and t.direction == direction
+                    and t.actual_departure is not None
+                ])) - 1
+                for direction in ("UP", "DN")
+            ))
+            _ot  = _sm.pct_trips_on_time
+            _mgap = _sm.max_headway_gap_min
+            _svc_rows.append({
+                "Route":               _scode,
+                "Average Frequency":   f"{_avg_gap:.0f} min",
+                "Longest Wait":        f"{_mgap:.0f} min",
+                "Reliable Trips %":    f"{_ot:.0f}%",
+                "Interpretation":      (
+                    "✅ Service is regular"
+                    if _ot >= 80 and _mgap <= 30
+                    else ("⚠ Large gaps observed" if _mgap > 30
+                          else "⚠ Irregular spacing")
+                ),
+            })
+        st.dataframe(pd.DataFrame(_svc_rows), hide_index=True, use_container_width=True)
+
+        # Advanced: stability details (collapsed)
+        with st.expander("🔬 Advanced — Schedule Stability Details", expanded=False):
+            st.caption(
+                "**Headway Std Dev** = standard deviation of all departure gaps (0 = perfectly uniform). "
+                "**Stability Score** = 1 / (1 + std). "
+                "**Avg Drift** = mean |actual − ideal departure|. "
+                "**Max Drift** = worst single trip deviation."
+            )
+            _adv_stab_rows = []
+            for _scode in sorted(cs.results):
+                _sm = cs.results[_scode].metrics
+                _std  = getattr(_sm, "headway_std_min", 0.0)
+                _adv_stab_rows.append({
+                    "Route":            _scode,
+                    "On-Time %":        f"{getattr(_sm, 'pct_trips_on_time', 0):.0f}%",
+                    "HW Std Dev (min)": round(_std, 1),
+                    "Stability Score":  round(1.0 / (1.0 + _std), 3),
+                    "HW CV":            round(getattr(_sm, "headway_cv", 0.0), 3),
+                    "Avg Drift (min)":  round(getattr(_sm, "avg_drift_min", 0.0), 1),
+                    "Max Drift (min)":  round(getattr(_sm, "max_drift_min", 0.0), 1),
+                    "Max Gap (min)":    round(getattr(_sm, "max_headway_gap_min", 0.0), 0),
+                })
+            if _adv_stab_rows:
+                st.dataframe(
+                    pd.DataFrame(_adv_stab_rows), hide_index=True, use_container_width=True,
+                    column_config={
+                        "Stability Score": st.column_config.NumberColumn(
+                            format="%.3f",
+                            help="1/(1+std_dev). 1.0 = perfect uniform spacing."),
+                    },
+                )
+            # PVR Drift flags (rebalancing stability)
+            stability_flags = getattr(cs, "stability_flags", [])
+            if stability_flags:
+                st.markdown("**PVR Drift (post-rebalance):**")
+                flag_df = pd.DataFrame([f.as_dict() for f in stability_flags])
+                unstable = flag_df[flag_df["Status"] == "⚠️ Drifted"]
+                if not unstable.empty:
+                    st.warning(
+                        f"⚠ {len(unstable)} route(s) show PVR drift > 0.5 after rebalancing. "
+                        "Re-run the citywide schedule to stabilise.")
+                st.dataframe(flag_df, hide_index=True, use_container_width=True)
+
+    # ── TAB 2: FLEET & ALLOCATION ─────────────────────────────────────────────
+    with tab_fleet:
+        # Plain-language allocation table
+        st.markdown('<div class="section-title">Fleet Allocation by Route</div>', unsafe_allow_html=True)
+        _fleet_rows = []
+        for _fc in sorted(cs.results):
+            _fr = cs.results[_fc]
+            _fb = _balance.get(_fc, {})
+            _surplus = _fb.get("surplus", 0)
+            _deficit = _fb.get("deficit", 0)
+            _fleet_rows.append({
+                "Route":           _fc,
+                "Name":            _fr.config.route_name,
+                "Buses Assigned":  _fr.fleet_allocated,
+                "Buses Needed":    _fr.pvr,
+                "Status":          ("🟢 Surplus" if _surplus > 0
+                                    else ("🔴 Shortage" if _deficit > 0
+                                          else "✅ Exact match")),
+                "Gap":             (f"+{_surplus}" if _surplus > 0
+                                    else (f"−{_deficit}" if _deficit > 0 else "0")),
+            })
+        st.dataframe(pd.DataFrame(_fleet_rows), hide_index=True, use_container_width=True)
+
+        # Transfers summary
+        if cs.transfers:
+            _n_transfers = len(cs.transfers)
+            _donor_routes = list({t.from_route for t in cs.transfers if t.from_route != "POOL"})
+            _recv_routes  = list({t.to_route   for t in cs.transfers})
+            st.info(
+                f"🔄 **{_n_transfers} bus{'es' if _n_transfers > 1 else ''} moved** "
+                f"to balance routes. "
+                f"Donors: {', '.join(_donor_routes) or 'none'} → "
+                f"Recipients: {', '.join(_recv_routes)}."
+            )
+
+        # Bar chart: Buses Assigned vs Buses Needed
+        if _PLOTLY_OK and len(cs.results) > 1:
+            _fc_codes = sorted(cs.results.keys())
+            _fig_fleet = go.Figure()
+            _fig_fleet.add_trace(go.Bar(
+                name="Buses Needed", x=_fc_codes,
+                y=[cs.results[c].pvr for c in _fc_codes],
+                marker_color="#94a3b8",
+            ))
+            _fig_fleet.add_trace(go.Bar(
+                name="Buses Assigned", x=_fc_codes,
+                y=[cs.results[c].fleet_allocated for c in _fc_codes],
+                marker_color="#4f46e5",
+            ))
+            _fig_fleet.update_layout(
+                barmode="group", height=320,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+                margin=dict(l=40, r=20, t=20, b=40), plot_bgcolor="white",
+            )
+            st.plotly_chart(_fig_fleet, use_container_width=True)
+
+        # Mode comparison (if session state has multiple mode runs)
+        _mode_hist = st.session_state.get("mode_comparison_history", {})
+        _mode_hist[_city_mode_used] = {
+            "Fleet":    cs.total_buses_used,
+            "Avg Wait": f"{cs.avg_headway_deviation_min + 10:.0f} min",
+            "Usage %":  f"{cs.citywide_utilization_pct:.0f}%",
+        }
+        st.session_state["mode_comparison_history"] = _mode_hist
+        if len(_mode_hist) > 1:
+            st.markdown('<div class="section-title">Mode Comparison</div>', unsafe_allow_html=True)
+            _mc_rows = []
+            for _mode_k, _mode_v in _mode_hist.items():
+                _mc_rows.append({
+                    "Mode":     _mode_map.get(_mode_k, _mode_k),
+                    "Fleet":    _mode_v["Fleet"],
+                    "Avg Wait": _mode_v["Avg Wait"],
+                    "Usage %":  _mode_v["Usage %"],
+                })
+            st.dataframe(pd.DataFrame(_mc_rows), hide_index=True, use_container_width=True)
+            st.caption("Run different modes to populate this comparison. Values update each run.")
+
+        # Advanced: PVR details (collapsed)
+        with st.expander("🔬 Advanced — Fleet Requirement Details (PVR)", expanded=False):
+            st.caption(
+                "**Buses Needed (Peak)** = ceil(cycle_time_peak / peak_headway). "
+                "**Buses Needed (Charging)** = Buses Needed × (1 + charging_fraction). "
+                "**Charging Load** = fraction of fleet unavailable during P5 window. "
+                "**Off-Peak Slack** = buses freed during 11:00–15:00 (Phase 2 interlining pool)."
+            )
+            if _pvr_slices_all:
+                _pvr_adv_rows = []
+                for _pcode, _ps in sorted(_pvr_slices_all.items()):
+                    _alloc = cs.results[_pcode].fleet_allocated if _pcode in cs.results else 0
+                    _pvr_adv_rows.append({
+                        "Route":                  _pcode,
+                        "Buses Needed (Peak)":    _ps.pvr_peak,
+                        "Buses Needed (Charging)":_ps.pvr_charging,
+                        "Buses Assigned":          _alloc,
+                        "Headroom %":             (
+                            f"{(_alloc - _ps.pvr_peak) / _ps.pvr_peak * 100:+.0f}%"
+                            if _ps.pvr_peak > 0 else "—"
+                        ),
+                        "Charging Load":          f"{_ps.charging_fraction:.0%}",
+                        "Off-Peak Slack":         _ps.slack_buses,
+                        "Cycle (Peak, min)":      round(_ps.cycle_time_peak_min, 1),
+                    })
+                st.dataframe(pd.DataFrame(_pvr_adv_rows), hide_index=True, use_container_width=True)
+
+                if _PLOTLY_OK and len(cs.results) > 1:
+                    _pv_codes = sorted(_pvr_slices_all.keys())
+                    _fig_pvr2 = go.Figure()
+                    _fig_pvr2.add_trace(go.Bar(name="Buses Needed (Peak)",
+                        x=_pv_codes, y=[_pvr_slices_all[c].pvr_peak for c in _pv_codes],
+                        marker_color="#dc2626"))
+                    _fig_pvr2.add_trace(go.Bar(name="Buses Needed (Charging)",
+                        x=_pv_codes, y=[_pvr_slices_all[c].pvr_charging for c in _pv_codes],
+                        marker_color="#fbbf24"))
+                    _fig_pvr2.add_trace(go.Bar(name="Buses Assigned",
+                        x=_pv_codes, y=[cs.results[c].fleet_allocated
+                                         if c in cs.results else 0 for c in _pv_codes],
+                        marker_color="#4f46e5"))
+                    _fig_pvr2.update_layout(
+                        barmode="group", height=320,
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                    xanchor="center", x=0.5),
+                        margin=dict(l=40, r=20, t=20, b=40), plot_bgcolor="white",
+                    )
+                    st.plotly_chart(_fig_pvr2, use_container_width=True)
+
+    # ── TAB 3: EFFICIENCY ─────────────────────────────────────────────────────
+    with tab_efficiency:
+        st.markdown('<div class="section-title">Operational Efficiency by Route</div>',
+                    unsafe_allow_html=True)
+        _eff_rows = []
+        for _ec in sorted(cs.results):
+            _em = cs.results[_ec].metrics
+            _eff_rows.append({
+                "Route":                 _ec,
+                "Service Distance (km)": round(_em.revenue_km, 1),
+                "Non-Service Dist (km)": round(_em.dead_km, 1),
+                "Non-Service %":         f"{_em.dead_km_ratio:.1%}",
+                "Bus Usage %":           f"{_em.revenue_km / max(1, _em.total_km) * 100:.0f}%",
+                "Insight":               (
+                    "✅ Good utilization"
+                    if _em.dead_km_ratio < 0.15
+                    else ("⚠ High non-service distance" if _em.dead_km_ratio < 0.25
+                          else "🔴 Excessive non-service distance")
+                ),
+            })
+        st.dataframe(pd.DataFrame(_eff_rows), hide_index=True, use_container_width=True)
+
+        if _PLOTLY_OK and len(cs.results) > 1:
+            _eff_codes = sorted(cs.results.keys())
+            _dead_pcts = [cs.results[c].metrics.dead_km_ratio * 100 for c in _eff_codes]
+            _fig_eff = go.Figure(go.Bar(
+                x=_eff_codes, y=_dead_pcts,
+                marker_color=["#16a34a" if d < 15 else "#d97706" if d < 25 else "#dc2626"
+                               for d in _dead_pcts],
+                hovertemplate="%{x}: %{y:.1f}% non-service<extra></extra>",
+            ))
+            _fig_eff.update_layout(
+                height=280, yaxis_title="Non-Service Distance %",
+                margin=dict(l=40, r=20, t=10, b=40), plot_bgcolor="white",
+            )
+            st.plotly_chart(_fig_eff, use_container_width=True)
+
+        # Citywide totals
+        st.markdown(
+            f"**Citywide:** Service distance = {cs.total_revenue_km:,.0f} km · "
+            f"Non-service = {cs.total_dead_km:,.0f} km ({cs.citywide_dead_km_ratio:.1%}) · "
+            f"Total = {cs.total_km:,.0f} km · "
+            f"Bus Usage = {cs.citywide_utilization_pct:.0f}%"
+        )
+
+    # ── TAB 4: RISKS & ALERTS ─────────────────────────────────────────────────
+    with tab_alerts:
+        st.markdown('<div class="section-title">Active Alerts</div>', unsafe_allow_html=True)
+        _any_alert = False
+
+        # Fleet shortage
+        for _arc in _deficit_routes:
+            _ad = _balance[_arc]["deficit"]
+            st.error(
+                f"🔴 **{_arc}**: Not enough buses — needs {_ad} more "
+                f"(assigned {cs.results[_arc].fleet_allocated}, "
+                f"required {cs.results[_arc].pvr})."
+            )
+            _any_alert = True
+
+        # Large gaps
+        for _lgc in _large_gap_routes:
+            _lg = cs.results[_lgc].metrics.max_headway_gap_min
+            st.warning(f"⚠ **{_lgc}**: Large gap detected — {_lg:.0f} min maximum waiting time.")
+            _any_alert = True
+
+        # Low battery
+        for _lsc in _low_soc_routes:
+            _ls = cs.results[_lsc].metrics.min_soc_seen
+            st.warning(f"⚠ **{_lsc}**: Low battery risk — minimum SOC {_ls:.1f}% (floor: 20%).")
+            _any_alert = True
+
+        # Poor headway compliance
+        for _phc in _poor_hw_routes:
+            _ph = cs.results[_phc].metrics.pct_trips_on_time
+            st.warning(
+                f"⚠ **{_phc}**: Irregular spacing — only {_ph:.0f}% of buses on schedule "
+                f"(target: ≥ 80%). Check fleet size or headway config."
+            )
+            _any_alert = True
+
+        # Charging congestion: routes where charging_fraction > 0.35
+        for _cc, _cs2 in _pvr_slices_all.items():
+            if _cs2.charging_fraction > 0.35:
+                _cw_start = getattr(city_cfg.routes[_cc].config, "p5_charging_start", None)
+                _cw_label = _cw_start.strftime("%H:%M") if _cw_start else "midday"
+                st.warning(
+                    f"⚠ **{_cc}**: High charging load ({_cs2.charging_fraction:.0%} of fleet "
+                    f"unavailable during charging window starting {_cw_label})."
+                )
+                _any_alert = True
+
+        if not _any_alert:
+            st.success("✅ No active alerts — all routes are operating within acceptable parameters.")
+
+        # Action suggestions
+        st.markdown('<div class="section-title">💡 Suggestions</div>', unsafe_allow_html=True)
+        _suggestions = []
+        for _arc in _deficit_routes:
+            _ad = _balance[_arc]["deficit"]
+            _suggestions.append(f"Add **{_ad} bus{'es' if _ad > 1 else ''}** to Route **{_arc}** "
+                                  f"(currently {_ad} bus{'es' if _ad > 1 else ''} short of minimum).")
+        for _src in _surplus_routes:
+            _as = _balance[_src]["surplus"]
+            _suggestions.append(f"Consider moving **{_as} surplus bus{'es' if _as > 1 else ''}** "
+                                  f"from Route **{_src}** to a deficit route.")
+        for _lgc in _large_gap_routes:
+            _suggestions.append(f"Reduce off-peak headway on Route **{_lgc}** or add a bus "
+                                  f"to cover the {cs.results[_lgc].metrics.max_headway_gap_min:.0f}-min gap.")
+        for _phc in _poor_hw_routes:
+            if _phc not in _large_gap_routes:
+                _suggestions.append(
+                    f"Check headway config for Route **{_phc}** — spacing is irregular. "
+                    "Run feasibility check in Config Editor."
+                )
+        if not _suggestions:
+            _suggestions.append("No changes needed — fleet allocation and service quality look good.")
+        for _sug in _suggestions:
+            st.markdown(f"- {_sug}")
+
+    # ── TAB 5: ROUTE DETAIL (unchanged) ──────────────────────────────────────
 
     # ── CITY TAB 6: Route Detail (drill-down with full Gantt) ─────────────────
     with tab_route_detail:
@@ -2391,99 +2671,4 @@ elif app_mode == "🏙️ Citywide":
                     except Exception as _err:
                         st.error(f"Re-schedule error: {_err}")
 
-    # ── CITY TAB 8: Stability ─────────────────────────────────────────────────
-    with tab_stability:
-        st.caption(
-            "**PVR Stability** checks whether fleet rebalancing caused cycle-time drift. "
-            "**Headway Stability** measures passenger-facing service quality: "
-            "on-time departures, spacing consistency, and cumulative schedule drift."
-        )
 
-        # ── Section 1: PVR drift (rebalancing stability) ──────────────────────
-        st.markdown('<div class="section-title">PVR Drift (Post-Rebalance)</div>',
-                    unsafe_allow_html=True)
-        st.caption(
-            "A **drift > 0.5** means the re-run shifted cycle time enough to change the PVR, "
-            "making the transfer plan potentially stale. Re-running the citywide scheduler resolves this."
-        )
-        stability_flags = getattr(cs, "stability_flags", [])
-        if not stability_flags:
-            st.info("PVR drift check not applicable in Efficiency-Maximising mode, "
-                    "or no transfers were needed.")
-        else:
-            flag_rows = [f.as_dict() for f in stability_flags]
-            flag_df   = pd.DataFrame(flag_rows)
-            unstable  = flag_df[flag_df["Status"] == "⚠️ Drifted"]
-            if unstable.empty:
-                st.success("✅ All routes stable — no PVR drift detected after rebalancing.")
-            else:
-                st.warning(
-                    f"⚠️ {len(unstable)} route(s) show PVR drift > 0.5. "
-                    "Consider re-running the citywide schedule to stabilise."
-                )
-            st.dataframe(flag_df, hide_index=True, use_container_width=True)
-
-        st.divider()
-
-        # ── Section 2: Headway stability per route ────────────────────────────
-        st.markdown('<div class="section-title">Headway Stability by Route</div>',
-                    unsafe_allow_html=True)
-        st.caption(
-            "**On-Time %** = departures within ±3 min of ideal uniform spacing. "
-            "**Headway Std** = standard deviation of inter-departure gaps. "
-            "**Stability Score** = 1 / (1 + headway_std): 1.0 = perfect, < 0.5 = poor. "
-            "**Avg Drift** = mean |actual − ideal departure| — detects cumulative slippage. "
-            "**Max Drift** = worst single trip deviation."
-        )
-        _stab_rows = []
-        for _scode, _sr in cs.results.items():
-            _sm = _sr.metrics
-            _ot = getattr(_sm, "pct_trips_on_time", 0.0)
-            _std = getattr(_sm, "headway_std_min", 0.0)
-            _adrift = getattr(_sm, "avg_drift_min", 0.0)
-            _mdrift = getattr(_sm, "max_drift_min", 0.0)
-            _cv = getattr(_sm, "headway_cv", 0.0)
-            _maxgap = getattr(_sm, "max_headway_gap_min", 0.0)
-            _ss = round(1.0 / (1.0 + _std), 3)   # Stability Score: 1.0 = perfect uniform
-            _stab_rows.append({
-                "Route":           _scode,
-                "On-Time %":       f"{_ot:.0f}%",
-                "HW Std (min)":    round(_std, 1),
-                "Stability Score": _ss,
-                "HW CV":           round(_cv, 3),
-                "Max Gap (min)":   round(_maxgap, 0),
-                "Avg Drift (min)": round(_adrift, 1),
-                "Max Drift (min)": round(_mdrift, 1),
-                "Quality":         ("✅ Good" if _ot >= 80 and _std <= 5
-                                    else ("⚠️ Fair" if _ot >= 60 or _std <= 10
-                                          else "❌ Poor")),
-            })
-        if _stab_rows:
-            _stab_df = pd.DataFrame(_stab_rows)
-            st.dataframe(
-                _stab_df,
-                hide_index=True,
-                use_container_width=True,
-                column_config={
-                    "On-Time %":        st.column_config.TextColumn(width="small"),
-                    "HW Std (min)":     st.column_config.NumberColumn(format="%.1f"),
-                    "Stability Score":  st.column_config.NumberColumn(
-                        format="%.3f",
-                        help="1 / (1 + headway_std). Range 0–1: 1.0 = perfect uniform spacing, "
-                             "< 0.5 = poor (std > 1 min). Passenger-facing service quality index."
-                    ),
-                    "Avg Drift (min)":  st.column_config.NumberColumn(format="%.1f"),
-                    "Max Drift (min)":  st.column_config.NumberColumn(format="%.1f"),
-                    "Quality":          st.column_config.TextColumn(width="small"),
-                },
-            )
-            _poor = [r["Route"] for r in _stab_rows if r["Quality"] == "❌ Poor"]
-            _fair = [r["Route"] for r in _stab_rows if r["Quality"] == "⚠️ Fair"]
-            if _poor:
-                st.error(f"❌ Poor headway stability: {', '.join(_poor)} — "
-                         "consider increasing fleet size or adjusting headway config.")
-            elif _fair:
-                st.warning(f"⚠️ Fair headway stability: {', '.join(_fair)} — "
-                           "check Physics Recommendations in Fleet Config tab.")
-            else:
-                st.success("✅ All routes show good headway stability (On-Time ≥ 80%, Std ≤ 5 min).")
