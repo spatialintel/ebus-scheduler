@@ -58,34 +58,133 @@ from src.metrics import compute_metrics
 # Service Maximization helpers
 # ---------------------------------------------------------------------------
 
+def _charging_rt(ri: RouteInput) -> float:
+    """
+    Estimate charging round-trip time (minutes) for this route.
+    RT = travel_to_depot + charge_time + travel_back_to_nearest_node.
+    Uses config values; falls back to conservative 60 min if any field is missing.
+    """
+    cfg = ri.config
+    try:
+        # Nearest node from depot = shortest travel time
+        nodes = [cfg.start_point, cfg.end_point]
+        nodes += [n.strip() for n in getattr(cfg, "intermediates", []) if n and n.strip()]
+        min_tt = float("inf")
+        for node in nodes:
+            try:
+                tt = cfg.get_travel_time(cfg.depot, node)
+                min_tt = min(min_tt, tt)
+            except (KeyError, Exception):
+                pass
+        nearest_tt = min_tt if min_tt < float("inf") else 30.0
+    except Exception:
+        nearest_tt = 30.0
+
+    try:
+        trig    = getattr(cfg, "trigger_soc_percent", 40)
+        tgt     = getattr(cfg, "target_soc_percent",  90)
+        batt    = getattr(cfg, "battery_kwh",         210)
+        chkw    = getattr(cfg, "depot_charger_kw",    60)
+        cheff   = getattr(cfg, "depot_charger_efficiency", 0.85)
+        min_chg = getattr(cfg, "min_charge_duration_min", 15)
+        kwh     = max(0, tgt - trig) / 100 * batt
+        chg_min = max(min_chg, kwh / max(0.1, chkw * cheff) * 60)
+    except Exception:
+        chg_min = 20.0
+
+    return nearest_tt * 2 + chg_min   # to depot + charge + back
+
+
+def _count_spikes(buses, headway_min: float) -> dict:
+    """
+    Count spikes > 2×headway_min per direction, restricted to non-peak hours.
+    Peak = 08:00–11:00 and 16:00–20:00. Spikes during peak are not counted.
+    Returns {"UP": n, "DN": n}.
+    """
+    from datetime import datetime as _dt2
+    REF = _dt2(2025, 1, 1)
+    peak_ranges = [
+        (REF.replace(hour=8), REF.replace(hour=11)),
+        (REF.replace(hour=16), REF.replace(hour=20)),
+    ]
+
+    def _is_peak(t):
+        if t is None:
+            return False
+        return any(s <= t < e for s, e in peak_ranges)
+
+    threshold = headway_min * 2
+    result = {"UP": 0, "DN": 0}
+    for direction in ("UP", "DN"):
+        deps = sorted([
+            t.actual_departure for b in buses for t in b.trips
+            if t.trip_type == "Revenue" and t.direction == direction
+            and t.actual_departure is not None
+        ])
+        for i in range(1, len(deps)):
+            gap = (deps[i] - deps[i - 1]).total_seconds() / 60
+            if gap > threshold:
+                # Only count if the gap starts outside peak
+                if not _is_peak(deps[i - 1]):
+                    result[direction] += 1
+    return result
+
+
 def _natural_headway(ri: RouteInput) -> float:
     """
-    Compute minimum achievable constant headway given the configured fleet.
+    Compute minimum constant headway that satisfies the spike-tolerance rule:
+      At most 1 spike > 2×H per direction per day, during non-peak hours only.
 
-    natural_hw = ceil(max_cycle_time / fleet_size)
+    Algorithm:
+      1. Start at physics minimum: H = ceil((max_cycle + charging_RT) / fleet)
+      2. Run scheduler with flat H headway
+      3. Count spikes (>2H, non-peak, per direction)
+      4. If any direction has > 1 spike: H += 1 and retry (max 20 iterations)
+      5. Return the first H that satisfies the condition
 
-    max_cycle_time uses the worst-case (peak) travel band so the resulting
-    headway is feasible at all times of day.
+    Falls back to ceil(max_cycle/fleet) if scheduler fails.
     """
     config = ri.config
+    fleet  = max(1, config.fleet_size)
+
+    # Compute max cycle time from travel time profile
     max_cycle = 0.0
     for _, row in ri.travel_time_df.iterrows():
         try:
-            up = float(row["up_min"])
-            dn = float(row["dn_min"])
-            layover     = config.preferred_layover_min
-            off_extra   = getattr(config, "off_peak_layover_extra_min", 0)
-            # Use worst-case break (includes off-peak extra) for conservative estimate
-            max_break   = layover + off_extra
-            cycle       = up + dn + layover + max_break
-            max_cycle   = max(max_cycle, cycle)
+            up  = float(row["up_min"])
+            dn  = float(row["dn_min"])
+            brk = config.preferred_layover_min
+            cycle = up + dn + brk * 2
+            max_cycle = max(max_cycle, cycle)
+        except Exception:
+            continue
+    if max_cycle == 0:
+        max_cycle = 2 * 50 + 2 * config.preferred_layover_min
+
+    # Charging RT
+    rt = _charging_rt(ri)
+
+    # Physics minimum (coverage formula) + 3-min safety buffer
+    h_physics = math.ceil((max_cycle + rt) / fleet) + 3
+    h_start   = max(5, h_physics)
+
+    # Binary search / increment: try H from h_start, increment until spike rule satisfied
+    for h_try in range(h_start, h_start + 25):
+        try:
+            flat_df = _flat_headway_df(ri, float(h_try))
+            trial_trips = generate_trips(config, flat_df, ri.travel_time_df,
+                                         scheduling_mode="efficiency")
+            trial_buses = schedule_buses(config, trial_trips,
+                                         headway_df=flat_df,
+                                         travel_time_df=ri.travel_time_df,
+                                         scheduling_mode="efficiency")
+            spikes = _count_spikes(trial_buses, float(h_try))
+            if spikes["UP"] <= 1 and spikes["DN"] <= 1:
+                return float(h_try)
         except Exception:
             continue
 
-    if max_cycle == 0:
-        max_cycle = 2 * 50 + 2 * config.preferred_layover_min  # fallback
-
-    fleet = max(1, config.fleet_size)
+    # Fallback if all trials failed
     return max(5.0, math.ceil(max_cycle / fleet))
 
 
