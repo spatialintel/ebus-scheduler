@@ -2167,6 +2167,11 @@ elif app_mode == "🏙️ Citywide":
         st.session_state["has_city_results"] = True
         st.session_state["city_mode_used"] = city_mode
 
+        # ── Store scenario for comparison ─────────────────────────────────────
+        _scen = st.session_state.get("scenario_results", {})
+        _scen[city_mode] = city_result     # overwrites previous run of same mode
+        st.session_state["scenario_results"] = _scen
+
     if not st.session_state.get("has_city_results"):
         if uploaded_files:
             st.info("Click **▶ Generate Citywide Schedule** in the sidebar to run.")
@@ -2227,9 +2232,9 @@ elif app_mode == "🏙️ Citywide":
         '</div>', unsafe_allow_html=True,
     )
 
-    tab_overview, tab_rebalance, tab_hw_routes, tab_depot, tab_fleet_config, tab_advanced = st.tabs([
+    tab_overview, tab_rebalance, tab_hw_routes, tab_depot, tab_fleet_config, tab_compare, tab_advanced = st.tabs([
         "📊 Overview", "🔄 Fleet & Rebalancing", "📈 Headways & Routes",
-        "🏭 Depot", "⚙️ Config Editor", "🔬 Advanced ▾",
+        "🏭 Depot", "⚙️ Config Editor", "⚖️ Compare Modes", "🔬 Advanced ▾",
     ])
     # Bind legacy variable names so existing content blocks still work
     tab_headways      = tab_hw_routes
@@ -2379,8 +2384,14 @@ elif app_mode == "🏙️ Citywide":
             st.caption(
                 "Fleet is fixed in Planning mode. Surplus/Deficit shows whether the "
                 "configured headway is achievable with the current fleet. "
+                "**Indicative only — fleet is not changed in planning mode.** "
                 "A deficit means gaps are structurally unavoidable — either increase headway "
                 "or add buses. See **Minimum Feasible Headway** table in Overview for specifics."
+            )
+        elif _city_mode_used == "service_max":
+            st.caption(
+                "Service Maximization uses the configured fleet as-is with a computed constant headway. "
+                "Surplus/Deficit shown for reference only — no transfers are made in this mode."
             )
 
         bal_rows = []
@@ -2549,46 +2560,77 @@ elif app_mode == "🏙️ Citywide":
                         "**Rec k=1.0** = minimum stable headway preserving peak < off-peak ordering. "
                         "Use Config Editor → k slider to scale up."
                     )
-                    # One-click apply button (outside form — uses session state)
-                    if _rec_profile and st.button(
-                        f"⚡ Apply Recommended (k=1.0) to {selected_hw_route}",
-                        key=f"apply_rec_{selected_hw_route}"
-                    ):
-                        _new_hw = pd.DataFrame([
-                            {"time_from": b["time_from"], "time_to": b["time_to"],
-                             "headway_min": b["headway_min"]}
-                            for b in _rec_profile
-                        ])
-                        from src.trip_generator import generate_trips as _gtr
-                        from src.bus_scheduler  import schedule_buses as _sbr
-                        from src.metrics        import compute_metrics as _cmr
+                    # One-click apply button with k/alpha from Config Editor sliders
+                    _apply_k     = st.session_state.get(f"k_slider_{selected_hw_route}", 1.0)
+                    _apply_alpha = st.session_state.get(f"alpha_slider_{selected_hw_route}", 0.15)
+                    _btn_label   = (f"⚡ Apply Recommended (k={_apply_k:.2f}, α={_apply_alpha:.2f}) "
+                                    f"to {selected_hw_route}")
+                    if _rec_profile and st.button(_btn_label, key=f"apply_rec_{selected_hw_route}"):
+                        from src.city_scheduler import _run_single_route as _rsr
+                        from src.city_models import RouteInput as _RI
                         _ri_apply  = city_cfg.routes[selected_hw_route]
                         _smode     = st.session_state.get("city_mode_used", "planning")
-                        with st.spinner(f"Applying recommended headways to {selected_hw_route}…"):
+                        with st.spinner(f"Applying recommended headways (k={_apply_k:.2f}) "
+                                        f"to {selected_hw_route}…"):
                             try:
-                                _trips_r  = _gtr(_ri_apply.config, _new_hw, _ri_apply.travel_time_df,
-                                                  scheduling_mode=_smode)
-                                _buses_r  = _sbr(_ri_apply.config, _trips_r, headway_df=_new_hw,
-                                                  travel_time_df=_ri_apply.travel_time_df,
-                                                  scheduling_mode=_smode)
-                                _met_r    = _cmr(_ri_apply.config, _buses_r,
-                                                  total_revenue_trips=len([t for t in _trips_r if t.trip_type=="Revenue"]))
-                                from src.city_models import RouteResult as _RR, RouteInput as _RI
+                                _new_rr = _rsr(
+                                    _ri_apply,
+                                    scheduling_mode=_smode,
+                                    rec_k=_apply_k,
+                                    rec_alpha=_apply_alpha,
+                                )
+                                # Apply the recommended profile as the live headway_df
+                                _new_hw = pd.DataFrame([
+                                    {"time_from": b["time_from"], "time_to": b["time_to"],
+                                     "headway_min": b["headway_min"]}
+                                    for b in _new_rr.recommended_headway_profile
+                                ])
+                                # Re-run schedule with the recommended headways
+                                from src.trip_generator import generate_trips as _gtr
+                                from src.bus_scheduler  import schedule_buses as _sbr
+                                from src.metrics        import compute_metrics as _cmr
+                                _trips_r = _gtr(_ri_apply.config, _new_hw, _ri_apply.travel_time_df,
+                                                 scheduling_mode=_smode)
+                                _buses_r = _sbr(_ri_apply.config, _trips_r, headway_df=_new_hw,
+                                                 travel_time_df=_ri_apply.travel_time_df,
+                                                 scheduling_mode=_smode)
+                                _met_r   = _cmr(_ri_apply.config, _buses_r,
+                                                 total_revenue_trips=len([t for t in _trips_r
+                                                                           if t.trip_type == "Revenue"]))
                                 _new_ri_r = _RI(config=_ri_apply.config, headway_df=_new_hw,
                                                  travel_time_df=_ri_apply.travel_time_df)
                                 from src.fleet_analyzer import compute_pvr_slices as _cpvr2
-                                _pvr_r    = _cpvr2(_new_ri_r).pvr_peak
-                                cs.results[selected_hw_route] = _RR(
-                                    route_code=selected_hw_route, config=_ri_apply.config,
-                                    headway_df=_new_hw, travel_time_df=_ri_apply.travel_time_df,
+                                _pvr_r = _cpvr2(_new_ri_r).pvr_peak
+                                # Rebuild RouteResult with updated fields
+                                from src.city_models import RouteResult as _RR2
+                                _applied_rr = _RR2(
+                                    route_code=selected_hw_route,
+                                    config=_ri_apply.config,
+                                    headway_df=_new_hw,
+                                    travel_time_df=_ri_apply.travel_time_df,
                                     buses=_buses_r, metrics=_met_r, pvr=_pvr_r,
                                     fleet_allocated=cs.results[selected_hw_route].fleet_allocated,
                                     fleet_original=cs.results[selected_hw_route].fleet_original,
+                                    physics_min_headway=_new_rr.physics_min_headway,
+                                    rec_peak_headway=_new_rr.rec_peak_headway,
+                                    rec_offpeak_headway=_new_rr.rec_offpeak_headway,
+                                    recommended_headway_profile=_new_rr.recommended_headway_profile,
+                                    headway_feasibility_status=_new_rr.headway_feasibility_status,
+                                    headway_feasibility_details=_new_rr.headway_feasibility_details,
+                                    headway_source=(f"recommended" if _apply_k == 1.0
+                                                    else f"scaled:k{_apply_k:.2f}"),
+                                    headway_k=_apply_k,
+                                    headway_alpha=_apply_alpha,
                                 )
+                                cs.results[selected_hw_route] = _applied_rr
                                 city_cfg.routes[selected_hw_route] = _new_ri_r
                                 st.session_state["city_result"] = cs
                                 st.session_state["city_config"] = city_cfg
-                                st.success(f"✅ {selected_hw_route} rescheduled with recommended headways.")
+                                st.success(
+                                    f"✅ {selected_hw_route} rescheduled with "
+                                    f"k={_apply_k:.2f} headways · "
+                                    f"source: {_applied_rr.headway_source}"
+                                )
                                 st.rerun()
                             except Exception as _ae:
                                 st.error(f"Apply error: {_ae}")
@@ -2750,9 +2792,22 @@ elif app_mode == "🏙️ Citywide":
 
                 if _bins:
                     _bin_df = pd.DataFrame(sorted(_bins.items()), columns=["Time", "Buses Charging"])
+                    _peak_queue = int(_bin_df["Buses Charging"].max()) if not _bin_df.empty else 0
+                    # Charger utilization: % of operating hours where ≥1 bus is charging
+                    _total_slots    = len(_bin_df)
+                    _active_slots   = int((_bin_df["Buses Charging"] > 0).sum())
+                    _utilization_pct = round(_active_slots / _total_slots * 100) if _total_slots else 0
+                    _col_qu, _col_ut = st.columns(2)
+                    with _col_qu:
+                        st.metric("Peak Charging Queue", f"{_peak_queue} buses",
+                                  help="Max buses simultaneously at the depot charger (30-min bins).")
+                    with _col_ut:
+                        st.metric("Charger Utilization",  f"{_utilization_pct}%",
+                                  help="% of operating hours where at least one bus is charging.")
                     fig_depot = go.Figure(go.Bar(
                         x=_bin_df["Time"], y=_bin_df["Buses Charging"],
                         marker_color="#f97316",
+                        hovertemplate="%{x}: %{y} bus(es) charging<extra></extra>",
                     ))
                     fig_depot.update_layout(
                         height=260, xaxis_title="Time", yaxis_title="Concurrent Buses Charging",
@@ -2782,7 +2837,241 @@ elif app_mode == "🏙️ Citywide":
                 st.dataframe(_idle_df, hide_index=True, use_container_width=True)
         else:
             st.info("No depot activity found. Buses may not have charging trips in this schedule.")
-    # ── CITY TAB 6: Advanced (PVR + Stability) — collapsed expanders ──────────
+    # ── CITY TAB 6: Compare Modes ─────────────────────────────────────────────
+    with tab_compare:
+        _scenario_results = st.session_state.get("scenario_results", {})
+        _mode_labels = {
+            "planning":    "📋 Planning",
+            "efficiency":  "⚡ Efficiency",
+            "service_max": "🎯 Service Max",
+        }
+
+        if len(_scenario_results) < 2:
+            st.info(
+                "Run **at least 2 different scheduling modes** to unlock the comparison. "
+                "Currently stored: " +
+                (", ".join(_mode_labels.get(m, m) for m in _scenario_results)
+                 if _scenario_results else "none") +
+                ".  \n\n"
+                "Switch mode in the sidebar and click **▶ Generate Citywide Schedule** again."
+            )
+        else:
+            _avail_modes = [m for m in ("planning", "efficiency", "service_max")
+                            if m in _scenario_results]
+
+            # ── 1. Citywide Summary Table ─────────────────────────────────────
+            st.markdown('<div class="section-title">Citywide Summary</div>',
+                        unsafe_allow_html=True)
+
+            def _scen_row(mode: str, cs_s: "CitySchedule") -> dict:
+                _max_gap_s    = cs_s.max_headway_gap_min
+                _on_time_s    = (sum(getattr(r.metrics, 'pct_trips_on_time', 0.0)
+                                     for r in cs_s.results.values())
+                                 / max(1, len(cs_s.results)))
+                _infeas_count = sum(1 for r in cs_s.results.values()
+                                    if getattr(r, 'headway_feasibility_status', 'UNKNOWN') == 'INFEASIBLE')
+                return {
+                    "Mode":               _mode_labels.get(mode, mode),
+                    "Fleet Used":         cs_s.total_buses_used,
+                    "Revenue Trips":      cs_s.total_revenue_trips,
+                    "Max Waiting (min)":  round(_max_gap_s, 0),
+                    "On-Time %":          f"{_on_time_s:.0f}%",
+                    "Dead KM %":          f"{cs_s.citywide_dead_km_ratio:.1%}",
+                    "Bus Utilization %":  f"{cs_s.citywide_utilization_pct:.0f}%",
+                    "Min SOC %":          f"{cs_s.min_soc_citywide:.1f}%",
+                    "HW Infeasible Routes": _infeas_count,
+                }
+
+            _sum_rows = [_scen_row(m, _scenario_results[m]) for m in _avail_modes]
+            _sum_df   = pd.DataFrame(_sum_rows)
+
+            # Highlight best value per metric
+            _numeric_cols = ["Fleet Used", "Revenue Trips", "Max Waiting (min)",
+                             "HW Infeasible Routes"]
+            st.dataframe(_sum_df, hide_index=True, use_container_width=True,
+                         column_config={
+                             "Mode": st.column_config.TextColumn(width="medium"),
+                             "Max Waiting (min)": st.column_config.NumberColumn(format="%.0f"),
+                         })
+
+            # Best/worst callouts
+            _best_fleet  = min(_sum_rows, key=lambda r: r["Fleet Used"])["Mode"]
+            _best_trips  = max(_sum_rows, key=lambda r: r["Revenue Trips"])["Mode"]
+            _best_gap    = min(_sum_rows, key=lambda r: r["Max Waiting (min)"])["Mode"]
+            _best_util   = max(_sum_rows, key=lambda r: float(r["Bus Utilization %"].rstrip('%')))["Mode"]
+            _best_dead   = min(_sum_rows, key=lambda r: float(r["Dead KM %"].rstrip('%')))["Mode"]
+            st.caption(
+                f"🏆 **Smallest fleet:** {_best_fleet} · "
+                f"**Most trips:** {_best_trips} · "
+                f"**Shortest max wait:** {_best_gap} · "
+                f"**Best utilization:** {_best_util} · "
+                f"**Least dead KM:** {_best_dead}"
+            )
+
+            # ── 2. Visual Comparison ──────────────────────────────────────────
+            if _PLOTLY_OK:
+                st.markdown('<div class="section-title">Visual Comparison</div>',
+                            unsafe_allow_html=True)
+                _col_a, _col_b = st.columns(2)
+
+                with _col_a:
+                    # Bar: Fleet vs Revenue Trips
+                    _fig_sc1 = go.Figure()
+                    for _m in _avail_modes:
+                        _cs_v = _scenario_results[_m]
+                        _fig_sc1.add_trace(go.Bar(
+                            name=_mode_labels.get(_m, _m),
+                            x=["Fleet Used", "Revenue Trips"],
+                            y=[_cs_v.total_buses_used, _cs_v.total_revenue_trips],
+                        ))
+                    _fig_sc1.update_layout(
+                        barmode="group", height=280, title="Fleet vs Revenue Trips",
+                        legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center"),
+                        margin=dict(l=40, r=20, t=40, b=40), plot_bgcolor="white",
+                    )
+                    st.plotly_chart(_fig_sc1, use_container_width=True)
+
+                with _col_b:
+                    # Bar: Max Waiting Time
+                    _fig_sc2 = go.Figure()
+                    _gap_vals  = [_scenario_results[m].max_headway_gap_min for m in _avail_modes]
+                    _gap_cols  = ["#16a34a" if g <= 30 else "#d97706" if g <= 60 else "#dc2626"
+                                  for g in _gap_vals]
+                    _fig_sc2.add_trace(go.Bar(
+                        x=[_mode_labels.get(m, m) for m in _avail_modes],
+                        y=_gap_vals,
+                        marker_color=_gap_cols,
+                        text=[f"{g:.0f} min" for g in _gap_vals],
+                        textposition="outside",
+                    ))
+                    _fig_sc2.update_layout(
+                        height=280, title="Max Waiting Time (min)",
+                        margin=dict(l=40, r=20, t=40, b=40), plot_bgcolor="white",
+                        yaxis_title="minutes",
+                    )
+                    st.plotly_chart(_fig_sc2, use_container_width=True)
+
+                # Radar / spider chart for normalised multi-metric comparison
+                _col_c, _col_d = st.columns(2)
+                with _col_c:
+                    # Utilization + on-time + dead-KM bar cluster
+                    _fig_sc3 = go.Figure()
+                    for _m in _avail_modes:
+                        _cs_v = _scenario_results[_m]
+                        _ot_v = (sum(getattr(r.metrics, 'pct_trips_on_time', 0.0)
+                                     for r in _cs_v.results.values())
+                                 / max(1, len(_cs_v.results)))
+                        _fig_sc3.add_trace(go.Bar(
+                            name=_mode_labels.get(_m, _m),
+                            x=["Utilization %", "On-Time %", "100 - Dead KM %"],
+                            y=[
+                                _cs_v.citywide_utilization_pct,
+                                _ot_v,
+                                100 - _cs_v.citywide_dead_km_ratio * 100,
+                            ],
+                        ))
+                    _fig_sc3.update_layout(
+                        barmode="group", height=280, title="Efficiency Metrics (higher = better)",
+                        legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center"),
+                        yaxis=dict(range=[0, 110]),
+                        margin=dict(l=40, r=20, t=40, b=40), plot_bgcolor="white",
+                    )
+                    st.plotly_chart(_fig_sc3, use_container_width=True)
+
+                with _col_d:
+                    # HW infeasible routes count
+                    _fig_sc4 = go.Figure()
+                    _infeas_vals = [
+                        sum(1 for r in _scenario_results[m].results.values()
+                            if getattr(r, 'headway_feasibility_status', 'OK') == 'INFEASIBLE')
+                        for m in _avail_modes
+                    ]
+                    _fig_sc4.add_trace(go.Bar(
+                        x=[_mode_labels.get(m, m) for m in _avail_modes],
+                        y=_infeas_vals,
+                        marker_color=["#dc2626" if v > 0 else "#16a34a" for v in _infeas_vals],
+                        text=[f"{v} route(s)" for v in _infeas_vals],
+                        textposition="outside",
+                    ))
+                    _fig_sc4.update_layout(
+                        height=280, title="Infeasible Headway Routes",
+                        margin=dict(l=40, r=20, t=40, b=40), plot_bgcolor="white",
+                        yaxis_title="routes",
+                    )
+                    st.plotly_chart(_fig_sc4, use_container_width=True)
+
+            # ── 3. Per-Route Breakdown ────────────────────────────────────────
+            st.markdown('<div class="section-title">Per-Route Breakdown</div>',
+                        unsafe_allow_html=True)
+
+            _all_routes = sorted(set(
+                code for cs_s in _scenario_results.values()
+                for code in cs_s.results.keys()
+            ))
+
+            _pr_rows = []
+            for _rc in _all_routes:
+                _row = {"Route": _rc}
+                for _m in _avail_modes:
+                    _cs_s = _scenario_results[_m]
+                    if _rc not in _cs_s.results:
+                        _row[f"{_mode_labels.get(_m,'')[:3]} Fleet"] = "—"
+                        _row[f"{_mode_labels.get(_m,'')[:3]} Peak HW"] = "—"
+                        _row[f"{_mode_labels.get(_m,'')[:3]} Max Gap"] = "—"
+                        continue
+                    _rr  = _cs_s.results[_rc]
+                    _mshort = _mode_labels.get(_m, _m)[:3]
+                    _row[f"{_mshort} Fleet"]   = _rr.fleet_allocated
+                    _row[f"{_mshort} Peak HW"] = (
+                        f"{int(_rr.headway_df['headway_min'].min())} min"
+                        if len(_rr.headway_df) else "—"
+                    )
+                    _mgap = round(getattr(_rr.metrics, 'max_headway_gap_min', 0.0))
+                    _row[f"{_mshort} Max Gap"] = f"{_mgap} min"
+                _pr_rows.append(_row)
+
+            with st.expander("📋 Per-Route Detail (all modes)", expanded=False):
+                st.dataframe(pd.DataFrame(_pr_rows), hide_index=True, use_container_width=True)
+
+            # ── 4. Recommendation ─────────────────────────────────────────────
+            st.markdown('<div class="section-title">💡 Recommendation</div>',
+                        unsafe_allow_html=True)
+            _recs = []
+            if "planning" in _scenario_results and "efficiency" in _scenario_results:
+                _p = _scenario_results["planning"]
+                _e = _scenario_results["efficiency"]
+                _fleet_saving = _p.total_buses_used - _e.total_buses_used
+                _gap_diff     = _e.max_headway_gap_min - _p.max_headway_gap_min
+                if _fleet_saving > 0:
+                    _recs.append(
+                        f"⚡ **Efficiency mode saves {_fleet_saving} bus(es)** vs Planning "
+                        f"({_e.total_buses_used} vs {_p.total_buses_used} fleet)."
+                    )
+                if _gap_diff > 15:
+                    _recs.append(
+                        f"📋 **Planning mode gives better service** — max waiting time is "
+                        f"{_gap_diff:.0f} min shorter than Efficiency."
+                    )
+            if "service_max" in _scenario_results:
+                _sm = _scenario_results["service_max"]
+                _infeas_sm = sum(1 for r in _sm.results.values()
+                                 if getattr(r, 'headway_feasibility_status', 'OK') != 'INFEASIBLE')
+                if _infeas_sm == len(_sm.results):
+                    _recs.append(
+                        "🎯 **Service Max** achieved even spacing on all routes — "
+                        "consider it if passenger experience is the primary goal."
+                    )
+            if not _recs:
+                _recs.append("Run all three modes to get a full recommendation.")
+            for _rec in _recs:
+                st.markdown(f"- {_rec}")
+
+            # Clear button
+            if st.button("🗑 Clear scenario comparison history", key="clear_scenarios"):
+                st.session_state["scenario_results"] = {}
+                st.rerun()
+
+    # ── CITY TAB 7: Advanced (PVR + Stability) — collapsed expanders ──────────
     with tab_advanced:
         with st.expander("📐 PVR Analysis", expanded=False):
             st.caption(
@@ -2960,25 +3249,28 @@ elif app_mode == "🏙️ Citywide":
                     key=f"k_slider_{_cfg_sel}"
                 )
             with _col_d:
-                _delta_val = st.slider(
-                    "Peak/Off-peak spread Δ (min)",
-                    1, 15,
-                    max(2, round(0.15 * max(_phys_min, 10))),
-                    help="Off-peak headway = Peak × k + Δ.",
-                    key=f"delta_slider_{_cfg_sel}"
+                _alpha_val = st.slider(
+                    "Off-peak spread α",
+                    0.05, 0.50, 0.15, 0.05,
+                    help="H_offpeak = H_peak × (1 + α). α=0.15 = small gap; α=0.30 = strong gap.",
+                    key=f"alpha_slider_{_cfg_sel}"
                 )
             if _phys_min:
                 _rec_k_peak = math.ceil(_k_val * _phys_min)
-                _rec_k_offp = _rec_k_peak + _delta_val
+                _rec_k_offp = math.ceil(_rec_k_peak * (1.0 + _alpha_val))
                 st.info(
-                    f"k={_k_val:.2f}, Δ={_delta_val} → **Peak = {_rec_k_peak} min · Off-peak = {_rec_k_offp} min**"
+                    f"k={_k_val:.2f}, α={_alpha_val:.2f} → "
+                    f"**Peak = {_rec_k_peak} min · Off-peak = {_rec_k_offp} min** "
+                    f"(diff = {_rec_k_offp - _rec_k_peak} min)"
                 )
                 if st.button(f"⚡ Auto-fill k={_k_val:.2f} headways into editor below",
                              key=f"autofill_{_cfg_sel}"):
                     _min_cfg_hw = int(_hw_edit["headway_min"].min()) if len(_hw_edit) else 20
                     for _idx in _hw_edit.index:
                         _is_pk = int(_hw_edit.at[_idx, "headway_min"]) <= _min_cfg_hw
-                        _hw_edit.at[_idx, "headway_min"] = _rec_k_peak if _is_pk else _rec_k_offp
+                        _hw_edit.at[_idx, "headway_min"] = (
+                            _rec_k_peak if _is_pk else _rec_k_offp
+                        )
                     st.session_state[f"city_hw_form_edit_{_cfg_sel}"] = \
                         _hw_edit[["time_from", "time_to", "headway_min"]].copy()
                     st.rerun()

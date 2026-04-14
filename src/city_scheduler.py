@@ -265,16 +265,20 @@ def _run_single_route(
     fleet_override: int | None = None,
     headway_df_override: "pd.DataFrame | None" = None,
     scheduling_mode: str = "planning",
+    rec_k: float = 1.0,
+    rec_alpha: float = 0.15,
 ) -> RouteResult:
     """
     Schedule one route.
-    fleet_override: temporarily patches config.fleet_size before running.
+    fleet_override:      temporarily patches config.fleet_size before running.
     headway_df_override: replaces ri.headway_df for this run only.
-    scheduling_mode: forwarded to generate_trips() and schedule_buses().
-      "planning"    — strict headway enforcement (hard floor per band)
-      "efficiency"  — physics-floor mode (natural_gap floor, throughput-focused)
-      "service_max" — same as efficiency for the scheduler (flat headway_df passed in)
-    Both are restored / not mutated after the call.
+    scheduling_mode:     forwarded to generate_trips() and schedule_buses().
+    rec_k:               scaling factor for recommended headway (H_base = k × H_phys).
+                         k=1.0 = minimum stable; k=1.1 = +10% margin.
+    rec_alpha:           multiplicative off-peak spread.
+                         H_offpeak = H_peak × (1 + alpha).
+                         alpha=0.15 ≈ small difference; 0.30 = strong difference.
+    Both rec_k and rec_alpha are stored on RouteResult for audit/UI display.
     """
     config         = ri.config
     original_fleet = config.fleet_size
@@ -336,9 +340,9 @@ def _run_single_route(
         if _max_cycle == 0:
             _max_cycle = 2 * 50 + 2 * _min_break
         _h_phys   = math.ceil((_max_cycle + _rt) / _fleet) + SPIKE_SAFETY_BUFFER
-        _delta    = max(2, round(0.15 * _h_phys))
-        _rec_peak = _h_phys
-        _rec_offp = _h_phys + _delta
+        # Multiplicative formula: H_peak = k × H_phys, H_offpeak = H_peak × (1 + alpha)
+        _rec_peak = math.ceil(rec_k * _h_phys)
+        _rec_offp = math.ceil(_rec_peak * (1.0 + rec_alpha))
 
         # Identify peak bands (those with the minimum configured headway)
         _peak_windows = _detect_peak_windows(headway_df)
@@ -429,6 +433,9 @@ def _run_single_route(
             recommended_headway_profile=_rec_profile,
             headway_feasibility_status=_feas_status,
             headway_feasibility_details=_feas_details,
+            headway_source="user",          # set to "recommended" or "scaled:kX.X" by UI
+            headway_k=rec_k,
+            headway_alpha=rec_alpha,
         )
     finally:
         config.fleet_size = original_fleet
