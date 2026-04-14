@@ -318,21 +318,98 @@ def _run_single_route(
 
         pvr_slices = compute_pvr_slices(ri)
 
-        # Compute physics_min_headway and recommended headways (k=1.0)
-        _rt        = _charging_rt(ri)
+        # ── Per-band physics minimum + recommended headway profile ────────────
+        # Uses time-of-day cycle variation: each band looks up its own travel
+        # time from travel_time_df rather than using the global worst-case.
+        _rt         = _charging_rt(ri)
+        _fleet      = max(1, config.fleet_size)
+        _min_break  = config.preferred_layover_min
+
+        # Global worst-case for the scalar physics_min_headway (peak bands)
         _max_cycle = 0.0
         for _, _row in ri.travel_time_df.iterrows():
             try:
                 _up = float(_row["up_min"]); _dn = float(_row["dn_min"])
-                _max_cycle = max(_max_cycle, _up + _dn + config.preferred_layover_min * 2)
+                _max_cycle = max(_max_cycle, _up + _dn + _min_break * 2)
             except Exception:
                 pass
         if _max_cycle == 0:
-            _max_cycle = 2 * 50 + 2 * config.preferred_layover_min
-        _h_phys   = math.ceil((_max_cycle + _rt) / max(1, config.fleet_size)) + 3
+            _max_cycle = 2 * 50 + 2 * _min_break
+        _h_phys   = math.ceil((_max_cycle + _rt) / _fleet) + SPIKE_SAFETY_BUFFER
         _delta    = max(2, round(0.15 * _h_phys))
         _rec_peak = _h_phys
         _rec_offp = _h_phys + _delta
+
+        # Identify peak bands (those with the minimum configured headway)
+        _peak_windows = _detect_peak_windows(headway_df)
+
+        # Per-band recommendations and feasibility
+        _rec_profile  = []
+        _feas_details = []
+        _any_infeas   = False
+
+        from datetime import datetime as _dt_band
+
+        def _band_tt(time_from_str) -> float:
+            """Fetch travel time for this band from travel_time_df."""
+            try:
+                t = _dt_band.strptime(str(time_from_str).strip(), "%H:%M")
+            except Exception:
+                return 50.0
+            for _, _trow in ri.travel_time_df.iterrows():
+                try:
+                    tf = _dt_band.strptime(str(_trow["time_from"]).strip(), "%H:%M")
+                    tt = _dt_band.strptime(str(_trow["time_to"]).strip(),   "%H:%M")
+                    if tf <= t < tt:
+                        return float(_trow.get("up_min", _trow.get("dn_min", 50)))
+                except Exception:
+                    continue
+            return 50.0
+
+        for _, _hw_row in headway_df.iterrows():
+            try:
+                _tf_str  = str(_hw_row["time_from"]).strip()
+                _tt_str  = str(_hw_row["time_to"]).strip()
+                _cfg_hw  = int(_hw_row["headway_min"])
+            except Exception:
+                continue
+            # Time-of-day cycle for this band
+            _band_travel  = _band_tt(_tf_str)
+            _band_cycle   = _band_travel * 2 + _min_break * 2
+            _band_h_phys  = math.ceil((_band_cycle + _rt) / _fleet) + SPIKE_SAFETY_BUFFER
+
+            # Is this band a peak band?
+            try:
+                _bh = _dt_band.strptime(_tf_str, "%H:%M")
+                _band_h_float = _bh.hour + _bh.minute / 60
+                _is_peak = any(s <= _band_h_float < e for s, e in _peak_windows)
+            except Exception:
+                _is_peak = False
+
+            _band_rec    = _rec_peak if _is_peak else _rec_offp
+            _band_rec    = max(_band_rec, _band_h_phys)  # never below band's own minimum
+            _infeasible  = _cfg_hw < _band_h_phys
+
+            if _infeasible:
+                _any_infeas = True
+
+            _rec_profile.append({
+                "time_from":   _tf_str,
+                "time_to":     _tt_str,
+                "headway_min": _band_rec,
+                "is_peak":     _is_peak,
+                "physics_min": _band_h_phys,
+                "cfg_hw":      _cfg_hw,
+            })
+            _feas_details.append({
+                "band":        f"{_tf_str}–{_tt_str}",
+                "cfg_hw":      _cfg_hw,
+                "physics_min": _band_h_phys,
+                "rec":         _band_rec,
+                "status":      "❌ INFEASIBLE" if _infeasible else "✅ OK",
+            })
+
+        _feas_status = "INFEASIBLE" if _any_infeas else "OK"
 
         return RouteResult(
             route_code=config.route_code,
@@ -349,6 +426,9 @@ def _run_single_route(
             physics_min_headway=_h_phys,
             rec_peak_headway=_rec_peak,
             rec_offpeak_headway=_rec_offp,
+            recommended_headway_profile=_rec_profile,
+            headway_feasibility_status=_feas_status,
+            headway_feasibility_details=_feas_details,
         )
     finally:
         config.fleet_size = original_fleet

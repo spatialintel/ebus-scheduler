@@ -2489,37 +2489,109 @@ elif app_mode == "🏙️ Citywide":
                         else:
                             st.caption(f"**{direction}** — fewer than 2 departures.")
 
-            # ── Unified headway table (read-only here; edit in Config Editor) ─
-            _es_hw = _even_spacing_min(rr_hw.config, rr_hw.headway_df, rr_hw.travel_time_df)
-            if _es_hw and not rr_hw.headway_df.empty:
+            # ── Unified headway table using pre-computed RouteResult data ─────
+            _rec_profile  = getattr(rr_hw, "recommended_headway_profile",  None)
+            _feas_details = getattr(rr_hw, "headway_feasibility_details",   None)
+            _feas_status  = getattr(rr_hw, "headway_feasibility_status", "UNKNOWN")
+            _h_phys       = getattr(rr_hw, "physics_min_headway", 0)
+            _rec_peak     = getattr(rr_hw, "rec_peak_headway",    0)
+            _rec_offpeak  = getattr(rr_hw, "rec_offpeak_headway", 0)
+
+            if _rec_profile or _feas_details:
                 st.markdown('<div class="section-title">Headway Profile & Recommendations</div>',
                             unsafe_allow_html=True)
-                st.caption("Edit headways in the **Config Editor** tab. This table is read-only.")
-                _unified_rows = []
-                for _bres in _es_hw.get("by_band", []):
-                    _cfg_val = next(
-                        (int(r["headway_min"]) for _, r in rr_hw.headway_df.iterrows()
-                         if str(r["time_from"]).strip() == _bres["tf"]),
-                        _bres["cfg"]
+
+                # Feasibility banner
+                if _feas_status == "INFEASIBLE":
+                    st.error(
+                        f"❌ **Headway infeasible** — one or more bands are below the physics minimum. "
+                        f"Large charging gaps (80–95 min) will appear in the schedule. "
+                        f"Minimum feasible peak headway: **{_h_phys} min** · "
+                        f"Recommended: **{_rec_peak} min** peak · **{_rec_offpeak} min** off-peak."
                     )
-                    _unified_rows.append({
-                        "Band":                  _bres["band"],
-                        "Input (min)":           _bres["cfg"],
-                        "Physics Floor (min)":   math.ceil(_bres["cycle"] / rr_hw.config.fleet_size),
-                        "Even-Spacing Min (min)": _bres["even_min"],
-                        "Rec k=1.0 (min)":       _bres["rec_k10"],
-                        "Rec k=1.1 (min)":       _bres["rec_k11"],
-                        "Status": ("✅ OK" if _bres["cfg"] >= _bres["even_min"]
-                                   else f"⚠ Need ≥{_bres['even_min']}"),
-                    })
-                st.dataframe(pd.DataFrame(_unified_rows), hide_index=True, use_container_width=True)
-                st.caption(
-                    f"**Even-Spacing Min** = (cycle + charging_RT) ÷ fleet + 3 buffer. "
-                    f"Charging RT ≈ {_es_hw.get('charging_rt', '—')} min for this route.  \n"
-                    f"**k=1.0** = minimum stable · **k=1.1** = comfortable margin (+10%).  \n"
-                    f"**Why:** {_es_hw.get('why', '')}  \n"
-                    f"**What to do:** {_es_hw.get('what', '')}"
-                )
+                elif _feas_status == "OK":
+                    st.success(
+                        f"✅ All headway bands meet the physics minimum. "
+                        f"Min feasible: {_h_phys} min · Rec peak: {_rec_peak} min · "
+                        f"Off-peak: {_rec_offpeak} min"
+                    )
+
+                # Unified per-band table
+                _unified_rows = []
+                if _feas_details and _rec_profile:
+                    for _fd, _rp in zip(_feas_details, _rec_profile):
+                        _unified_rows.append({
+                            "Band":                    _fd["band"],
+                            "Input (min)":             _fd["cfg_hw"],
+                            "Physics Min (min)":       _fd["physics_min"],
+                            "Rec k=1.0 (min)":         _rp["headway_min"],
+                            "Peak band?":              "🔵 Peak" if _rp["is_peak"] else "○ Off-peak",
+                            "Status":                  _fd["status"],
+                        })
+                elif _feas_details:
+                    for _fd in _feas_details:
+                        _unified_rows.append({
+                            "Band":          _fd["band"],
+                            "Input (min)":   _fd["cfg_hw"],
+                            "Physics Min":   _fd["physics_min"],
+                            "Rec (min)":     _fd["rec"],
+                            "Status":        _fd["status"],
+                        })
+
+                if _unified_rows:
+                    st.dataframe(pd.DataFrame(_unified_rows), hide_index=True,
+                                 use_container_width=True,
+                                 column_config={"Status": st.column_config.TextColumn(width="small"),
+                                                "Peak band?": st.column_config.TextColumn(width="small")})
+                    st.caption(
+                        "**Physics Min** = (cycle_time_for_this_band + charging_RT) ÷ fleet + "
+                        f"{3} buffer (time-of-day variation applied per band).  \n"
+                        "**Rec k=1.0** = minimum stable headway preserving peak < off-peak ordering. "
+                        "Use Config Editor → k slider to scale up."
+                    )
+                    # One-click apply button (outside form — uses session state)
+                    if _rec_profile and st.button(
+                        f"⚡ Apply Recommended (k=1.0) to {selected_hw_route}",
+                        key=f"apply_rec_{selected_hw_route}"
+                    ):
+                        _new_hw = pd.DataFrame([
+                            {"time_from": b["time_from"], "time_to": b["time_to"],
+                             "headway_min": b["headway_min"]}
+                            for b in _rec_profile
+                        ])
+                        from src.trip_generator import generate_trips as _gtr
+                        from src.bus_scheduler  import schedule_buses as _sbr
+                        from src.metrics        import compute_metrics as _cmr
+                        _ri_apply  = city_cfg.routes[selected_hw_route]
+                        _smode     = st.session_state.get("city_mode_used", "planning")
+                        with st.spinner(f"Applying recommended headways to {selected_hw_route}…"):
+                            try:
+                                _trips_r  = _gtr(_ri_apply.config, _new_hw, _ri_apply.travel_time_df,
+                                                  scheduling_mode=_smode)
+                                _buses_r  = _sbr(_ri_apply.config, _trips_r, headway_df=_new_hw,
+                                                  travel_time_df=_ri_apply.travel_time_df,
+                                                  scheduling_mode=_smode)
+                                _met_r    = _cmr(_ri_apply.config, _buses_r,
+                                                  total_revenue_trips=len([t for t in _trips_r if t.trip_type=="Revenue"]))
+                                from src.city_models import RouteResult as _RR, RouteInput as _RI
+                                _new_ri_r = _RI(config=_ri_apply.config, headway_df=_new_hw,
+                                                 travel_time_df=_ri_apply.travel_time_df)
+                                from src.fleet_analyzer import compute_pvr_slices as _cpvr2
+                                _pvr_r    = _cpvr2(_new_ri_r).pvr_peak
+                                cs.results[selected_hw_route] = _RR(
+                                    route_code=selected_hw_route, config=_ri_apply.config,
+                                    headway_df=_new_hw, travel_time_df=_ri_apply.travel_time_df,
+                                    buses=_buses_r, metrics=_met_r, pvr=_pvr_r,
+                                    fleet_allocated=cs.results[selected_hw_route].fleet_allocated,
+                                    fleet_original=cs.results[selected_hw_route].fleet_original,
+                                )
+                                city_cfg.routes[selected_hw_route] = _new_ri_r
+                                st.session_state["city_result"] = cs
+                                st.session_state["city_config"] = city_cfg
+                                st.success(f"✅ {selected_hw_route} rescheduled with recommended headways.")
+                                st.rerun()
+                            except Exception as _ae:
+                                st.error(f"Apply error: {_ae}")
 
             # ── Route Detail ──────────────────────────────────────────────────
             st.divider()
@@ -2543,8 +2615,11 @@ elif app_mode == "🏙️ Citywide":
                     "ok" if m.min_soc_seen >= 25 else "warn") +
                 kpi("Min Feasible HW",
                     f"{r.physics_min_headway} min" if r.physics_min_headway else "—",
-                    "ok" if r.rec_peak_headway and int(r.headway_df['headway_min'].min()) >= r.physics_min_headway else "warn",
-                    sub=f"rec peak: {r.rec_peak_headway} · off-peak: {r.rec_offpeak_headway}") +
+                    ("ok" if (r.physics_min_headway and len(r.headway_df) > 0 and
+                              int(r.headway_df['headway_min'].min()) >= r.physics_min_headway)
+                     else "warn"),
+                    sub=(f"rec peak: {r.rec_peak_headway} · off-pk: {r.rec_offpeak_headway}"
+                         if r.rec_peak_headway else "")) +
                 '</div>', unsafe_allow_html=True)
 
             # Download full schedule

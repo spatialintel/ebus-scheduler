@@ -36,9 +36,18 @@ class RouteResult:
     fleet_original: int         # fleet_size from config Excel
     surplus: int = 0            # positive = excess buses available to donate
     deficit: int = 0            # positive = route needs more buses
-    physics_min_headway: int = 0    # ceil((cycle+RT)/fleet)+3 — even-spacing minimum
+    physics_min_headway: int = 0    # ceil((cycle+RT)/fleet)+buffer — even-spacing minimum (peak)
     rec_peak_headway: int = 0       # recommended peak headway (k=1.0)
     rec_offpeak_headway: int = 0    # recommended off-peak headway (k=1.0)
+    # Per-band recommended headway profile (list of dicts):
+    #   [{"time_from":"08:00","time_to":"11:00","headway_min":27,"is_peak":True,"physics_min":27}, ...]
+    # Populated by _run_single_route; usable directly as headway_df after user confirms.
+    recommended_headway_profile: list = None
+    # Planning-mode feasibility: "OK" | "INFEASIBLE" | "UNKNOWN"
+    headway_feasibility_status: str = "UNKNOWN"
+    # Per-band feasibility details for UI:
+    #   [{"band":"08:00–11:00","cfg_hw":15,"physics_min":27,"status":"INFEASIBLE"}, ...]
+    headway_feasibility_details: list = None
 
 
 @dataclass
