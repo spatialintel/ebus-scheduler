@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src.config_loader import load_config, ConfigError
 from src.distance_engine import enrich_distances
-from src.trip_generator import generate_trips
+from src.trip_generator import generate_trips, check_headway_feasibility
 from src.bus_scheduler import schedule_buses, check_compliance
 from src.output_formatter import write_schedule
 from src.metrics import compute_metrics
@@ -1348,6 +1348,62 @@ if app_mode == "🚌 Single Route":
                         else:
                             st.caption(f"**{direction}** — fewer than 2 departures.")
 
+            # ── Headway stability metrics ─────────────────────────────────────
+            st.markdown('<div class="section-title">Schedule Stability</div>',
+                        unsafe_allow_html=True)
+            st.caption(
+                "**On-time %** = departures within ±3 min of ideal uniform spacing. "
+                "**Avg drift** = mean deviation from ideal departure (lower = more reliable). "
+                "**Headway std** = standard deviation of all gaps (0 = perfectly uniform). "
+                "**Stability Score** = 1 / (1 + headway_std): 1.0 = perfect, < 0.5 = poor."
+            )
+            _stab_c1, _stab_c2, _stab_c3, _stab_c4, _stab_c5 = st.columns(5)
+            _ot = metrics.pct_trips_on_time
+            _drift_avg = metrics.avg_drift_min
+            _drift_max = metrics.max_drift_min
+            _hw_std = metrics.headway_std_min
+            _stab_score = 1.0 / (1.0 + _hw_std)   # 1.0 = perfect uniform; drops as std grows
+            with _stab_c1:
+                _ot_status = "ok" if _ot >= 80 else ("warn" if _ot >= 60 else "fail")
+                st.markdown(
+                    f'<div class="kpi-card kpi-{_ot_status}">'
+                    f'<div class="kpi-label">On-Time Departures</div>'
+                    f'<div class="kpi-value">{_ot:.0f}%</div>'
+                    f'<div class="kpi-sub">±3 min tolerance</div></div>',
+                    unsafe_allow_html=True)
+            with _stab_c2:
+                _std_status = "ok" if _hw_std <= 3 else ("warn" if _hw_std <= 8 else "fail")
+                st.markdown(
+                    f'<div class="kpi-card kpi-{_std_status}">'
+                    f'<div class="kpi-label">Headway Std Dev</div>'
+                    f'<div class="kpi-value">{_hw_std:.1f} min</div>'
+                    f'<div class="kpi-sub">0 = perfectly uniform</div></div>',
+                    unsafe_allow_html=True)
+            with _stab_c3:
+                _davg_status = "ok" if _drift_avg <= 3 else ("warn" if _drift_avg <= 8 else "fail")
+                st.markdown(
+                    f'<div class="kpi-card kpi-{_davg_status}">'
+                    f'<div class="kpi-label">Avg Schedule Drift</div>'
+                    f'<div class="kpi-value">{_drift_avg:.1f} min</div>'
+                    f'<div class="kpi-sub">actual vs ideal departure</div></div>',
+                    unsafe_allow_html=True)
+            with _stab_c4:
+                _dmax_status = "ok" if _drift_max <= 5 else ("warn" if _drift_max <= 15 else "fail")
+                st.markdown(
+                    f'<div class="kpi-card kpi-{_dmax_status}">'
+                    f'<div class="kpi-label">Max Schedule Drift</div>'
+                    f'<div class="kpi-value">{_drift_max:.1f} min</div>'
+                    f'<div class="kpi-sub">worst trip deviation</div></div>',
+                    unsafe_allow_html=True)
+            with _stab_c5:
+                _ss_status = "ok" if _stab_score >= 0.5 else ("warn" if _stab_score >= 0.25 else "fail")
+                st.markdown(
+                    f'<div class="kpi-card kpi-{_ss_status}">'
+                    f'<div class="kpi-label">Stability Score</div>'
+                    f'<div class="kpi-value">{_stab_score:.2f}</div>'
+                    f'<div class="kpi-sub">1/(1+std) · 1.0 = perfect</div></div>',
+                    unsafe_allow_html=True)
+
         # ════════════════════════════════════════════════════════════════════
         # TAB 3: Full Schedule
         # ════════════════════════════════════════════════════════════════════
@@ -1545,6 +1601,23 @@ if app_mode == "🚌 Single Route":
                     edited_hw_df = None
                     st.caption("Run a schedule first to enable headway editing.")
 
+                # ── Headway feasibility check ─────────────────────────────────
+                # Warn immediately (before re-run) when a configured headway band
+                # is physically impossible for the current fleet and cycle time.
+                # Uses the edited headway if available, otherwise the stored one.
+                _hw_for_check = edited_hw_df if edited_hw_df is not None else _hw_src
+                _cfg_for_check = st.session_state.get("raw_config")
+                _tt_for_check  = st.session_state.get("raw_travel_time_df")
+                if (_hw_for_check is not None and not _hw_for_check.empty
+                        and _cfg_for_check is not None and _tt_for_check is not None):
+                    try:
+                        _hw_warnings = check_headway_feasibility(
+                            _cfg_for_check, _hw_for_check, _tt_for_check)
+                        for _w in _hw_warnings:
+                            st.warning(_w)
+                    except Exception:
+                        pass
+
                 apply_btn = st.form_submit_button("🔄 Apply & Regenerate", type="primary")
 
             if apply_btn:
@@ -1725,22 +1798,56 @@ elif app_mode == "🏙️ Citywide":
     with tab_rebalance:
         st.markdown('<div class="section-title">Fleet Balance Analysis (PVR-based)</div>',
                     unsafe_allow_html=True)
+        # Mode-specific headroom denominator:
+        #   Planning    → PVR_peak   (service headway drives the floor)
+        #   Efficiency  → PVR_charging (charging downtime must be covered)
+        #   Service Max → PVR_peak   (no headway constraint, flat spacing)
+        _city_mode_used = st.session_state.get("city_mode_used", "planning")
         balance = compute_fleet_balance(city_cfg)
-        bal_df = pd.DataFrame([
-            {"Route": code, "PVR": b["pvr"], "Allocated": b["allocated"],
-             "Surplus": b["surplus"] if b["surplus"] > 0 else "",
-             "Deficit": b["deficit"] if b["deficit"] > 0 else "",
-             "Headroom %": f"{b['headroom_pct']:+.0f}%"}
-            for code, b in sorted(balance.items())
-        ])
+        try:
+            _pvr_slices_bal = compute_pvr_slices_all(city_cfg)
+        except Exception:
+            _pvr_slices_bal = {}
+
+        bal_rows = []
+        for code, b in sorted(balance.items()):
+            if _city_mode_used == "efficiency" and code in _pvr_slices_bal:
+                _pvr_denom = _pvr_slices_bal[code].pvr_charging
+                _hr_label  = "Headroom % (vs PVR_chg)"
+            else:
+                _pvr_denom = b["pvr"]
+                _hr_label  = "Headroom % (vs PVR_peak)"
+            _hr = (b["allocated"] - _pvr_denom) / _pvr_denom * 100 if _pvr_denom > 0 else 0.0
+            bal_rows.append({
+                "Route":    code,
+                "PVR Peak": b["pvr"],
+                "PVR Chg":  b.get("pvr_charging", b["pvr"]),
+                "Allocated": b["allocated"],
+                "Surplus":  b["surplus"] if b["surplus"] > 0 else "",
+                "Deficit":  b["deficit"] if b["deficit"] > 0 else "",
+                _hr_label:  f"{_hr:+.0f}%",
+            })
+        bal_df = pd.DataFrame(bal_rows)
         st.dataframe(bal_df, use_container_width=True, hide_index=True)
+        st.caption(
+            f"**Headroom %** uses {'PVR_charging' if _city_mode_used == 'efficiency' else 'PVR_peak'} "
+            f"as denominator in **{_city_mode_used}** mode. "
+            "Positive = spare capacity; negative = under-resourced."
+        )
 
     # ── CITY TAB 3: PVR Analysis ──────────────────────────────────────────────
     with tab_pvr:
         st.caption(
-            "**PVR (Peak)** — minimum buses at tightest headway band, drives rebalancing.  "
-            "**PVR (Off-Peak)** — minimum buses during 11:00–15:00.  "
-            "**PVR (Charging)** — conservative upper bound during P5 midday charging (+25%)."
+            "**PVR (Peak)** — minimum buses needed at the tightest headway band. "
+            "Formula: `ceil(cycle_time_peak / peak_headway)`. Drives fleet rebalancing.  \n"
+            "**PVR (Off-Peak)** — minimum buses during 11:00–15:00 (reduced demand).  \n"
+            "**PVR (Charging)** — realistic fleet requirement including charging downtime. "
+            "Formula: `ceil(PVR_peak × (1 + charging_fraction))`.  \n"
+            "**Charging Fraction** = charging_time / charging_window. "
+            "Charging time = kWh needed ÷ charger kW. "
+            "Charging window = p5_end − p5_start from config. "
+            "A fraction of 0.30 means 30% of the fleet is unavailable at any moment during P5.  \n"
+            "**Off-Peak Slack** = PVR_peak − PVR_offpeak — buses freed during midday that can be used for interlining (Phase 2)."
         )
         try:
             slices_all = compute_pvr_slices_all(city_cfg)
@@ -1904,6 +2011,16 @@ elif app_mode == "🏙️ Citywide":
                 use_container_width=True, hide_index=True,
                 key=_hw_edit_key,
             )
+            # ── Headway feasibility check ─────────────────────────────────────
+            # Warn immediately when any edited band is physically infeasible.
+            try:
+                _fc_ri = city_cfg.routes[selected_route]
+                _fc_warnings = check_headway_feasibility(
+                    _fc_ri.config, _edited_hw, _fc_ri.travel_time_df)
+                for _fw in _fc_warnings:
+                    st.warning(_fw)
+            except Exception:
+                pass
             if st.button(f"🔄 Re-run {selected_route} with edited headway", key=f"city_hw_rerun_{selected_route}"):
                 with st.spinner(f"Re-scheduling {selected_route}…"):
                     try:
@@ -2176,6 +2293,17 @@ elif app_mode == "🏙️ Citywide":
                     key=f"city_hw_form_edit_{_cfg_sel}",
                 )
 
+                # ── Headway feasibility check ─────────────────────────────────
+                # Warn before re-run when any edited band is physically impossible
+                # for the current fleet size and cycle time.
+                try:
+                    _city_hw_warnings = check_headway_feasibility(
+                        _cfg, _edited_hw_city, _ri_cfg.travel_time_df)
+                    for _cw in _city_hw_warnings:
+                        st.warning(_cw)
+                except Exception:
+                    pass
+
                 _apply_city_cfg = st.form_submit_button(
                     f"🔄 Apply & Re-run {_cfg_sel}", type="primary"
                 )
@@ -2266,13 +2394,21 @@ elif app_mode == "🏙️ Citywide":
     # ── CITY TAB 8: Stability ─────────────────────────────────────────────────
     with tab_stability:
         st.caption(
-            "Post-rebalance PVR stability check. "
+            "**PVR Stability** checks whether fleet rebalancing caused cycle-time drift. "
+            "**Headway Stability** measures passenger-facing service quality: "
+            "on-time departures, spacing consistency, and cumulative schedule drift."
+        )
+
+        # ── Section 1: PVR drift (rebalancing stability) ──────────────────────
+        st.markdown('<div class="section-title">PVR Drift (Post-Rebalance)</div>',
+                    unsafe_allow_html=True)
+        st.caption(
             "A **drift > 0.5** means the re-run shifted cycle time enough to change the PVR, "
             "making the transfer plan potentially stale. Re-running the citywide scheduler resolves this."
         )
         stability_flags = getattr(cs, "stability_flags", [])
         if not stability_flags:
-            st.info("Stability check not applicable in Efficiency-Maximising mode, "
+            st.info("PVR drift check not applicable in Efficiency-Maximising mode, "
                     "or no transfers were needed.")
         else:
             flag_rows = [f.as_dict() for f in stability_flags]
@@ -2286,3 +2422,68 @@ elif app_mode == "🏙️ Citywide":
                     "Consider re-running the citywide schedule to stabilise."
                 )
             st.dataframe(flag_df, hide_index=True, use_container_width=True)
+
+        st.divider()
+
+        # ── Section 2: Headway stability per route ────────────────────────────
+        st.markdown('<div class="section-title">Headway Stability by Route</div>',
+                    unsafe_allow_html=True)
+        st.caption(
+            "**On-Time %** = departures within ±3 min of ideal uniform spacing. "
+            "**Headway Std** = standard deviation of inter-departure gaps. "
+            "**Stability Score** = 1 / (1 + headway_std): 1.0 = perfect, < 0.5 = poor. "
+            "**Avg Drift** = mean |actual − ideal departure| — detects cumulative slippage. "
+            "**Max Drift** = worst single trip deviation."
+        )
+        _stab_rows = []
+        for _scode, _sr in cs.results.items():
+            _sm = _sr.metrics
+            _ot = getattr(_sm, "pct_trips_on_time", 0.0)
+            _std = getattr(_sm, "headway_std_min", 0.0)
+            _adrift = getattr(_sm, "avg_drift_min", 0.0)
+            _mdrift = getattr(_sm, "max_drift_min", 0.0)
+            _cv = getattr(_sm, "headway_cv", 0.0)
+            _maxgap = getattr(_sm, "max_headway_gap_min", 0.0)
+            _ss = round(1.0 / (1.0 + _std), 3)   # Stability Score: 1.0 = perfect uniform
+            _stab_rows.append({
+                "Route":           _scode,
+                "On-Time %":       f"{_ot:.0f}%",
+                "HW Std (min)":    round(_std, 1),
+                "Stability Score": _ss,
+                "HW CV":           round(_cv, 3),
+                "Max Gap (min)":   round(_maxgap, 0),
+                "Avg Drift (min)": round(_adrift, 1),
+                "Max Drift (min)": round(_mdrift, 1),
+                "Quality":         ("✅ Good" if _ot >= 80 and _std <= 5
+                                    else ("⚠️ Fair" if _ot >= 60 or _std <= 10
+                                          else "❌ Poor")),
+            })
+        if _stab_rows:
+            _stab_df = pd.DataFrame(_stab_rows)
+            st.dataframe(
+                _stab_df,
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "On-Time %":        st.column_config.TextColumn(width="small"),
+                    "HW Std (min)":     st.column_config.NumberColumn(format="%.1f"),
+                    "Stability Score":  st.column_config.NumberColumn(
+                        format="%.3f",
+                        help="1 / (1 + headway_std). Range 0–1: 1.0 = perfect uniform spacing, "
+                             "< 0.5 = poor (std > 1 min). Passenger-facing service quality index."
+                    ),
+                    "Avg Drift (min)":  st.column_config.NumberColumn(format="%.1f"),
+                    "Max Drift (min)":  st.column_config.NumberColumn(format="%.1f"),
+                    "Quality":          st.column_config.TextColumn(width="small"),
+                },
+            )
+            _poor = [r["Route"] for r in _stab_rows if r["Quality"] == "❌ Poor"]
+            _fair = [r["Route"] for r in _stab_rows if r["Quality"] == "⚠️ Fair"]
+            if _poor:
+                st.error(f"❌ Poor headway stability: {', '.join(_poor)} — "
+                         "consider increasing fleet size or adjusting headway config.")
+            elif _fair:
+                st.warning(f"⚠️ Fair headway stability: {', '.join(_fair)} — "
+                           "check Physics Recommendations in Fleet Config tab.")
+            else:
+                st.success("✅ All routes show good headway stability (On-Time ≥ 80%, Std ≤ 5 min).")
