@@ -156,6 +156,7 @@ def build_fleet_df(config, buses):
             "Charging": len(chg),
             "Total KM": round(bus.total_km, 1),
             "Revenue KM": round(sum(t.distance_km for t in rev), 1),
+            "Shuttle KM": round(sum(t.distance_km for t in shut), 1),
             "Dead KM": round(sum(t.distance_km for t in dead), 1),
             "Final SOC (%)": round(bus.soc_percent, 1),
             "Start": first.strftime("%H:%M") if first else "—",
@@ -1789,12 +1790,113 @@ if app_mode == "🚌 Single Route":
             col1, col2 = st.columns(2)
             with col1:
                 st.markdown('<div class="section-title">KM per Bus</div>', unsafe_allow_html=True)
-                km_chart = fleet_df[["Bus","Revenue KM","Dead KM"]].set_index("Bus")
-                st.bar_chart(km_chart, color=["#4f46e5","#94a3b8"])
+                if _PLOTLY_OK:
+                    _km_buses = fleet_df["Bus"].tolist()
+                    _km_rev   = fleet_df["Revenue KM"].tolist()
+                    _km_shut  = fleet_df["Shuttle KM"].tolist()
+                    _km_dead  = fleet_df["Dead KM"].tolist()
+                    _km_totals = fleet_df["Total KM"].tolist()
+                    _fig_km = go.Figure()
+                    _fig_km.add_trace(go.Bar(
+                        name="Revenue KM", x=_km_buses, y=_km_rev,
+                        marker_color="#4f46e5",
+                        hovertemplate="%{x}<br>Revenue: %{y:.1f} km<extra></extra>",
+                    ))
+                    _fig_km.add_trace(go.Bar(
+                        name="Shuttle KM", x=_km_buses, y=_km_shut,
+                        marker_color="#a78bfa",
+                        hovertemplate="%{x}<br>Shuttle: %{y:.1f} km<extra></extra>",
+                    ))
+                    _fig_km.add_trace(go.Bar(
+                        name="Dead KM", x=_km_buses, y=_km_dead,
+                        marker_color="#94a3b8",
+                        hovertemplate="%{x}<br>Dead: %{y:.1f} km<extra></extra>",
+                    ))
+                    # Total labels above each stacked bar
+                    for _b, _tot in zip(_km_buses, _km_totals):
+                        _fig_km.add_annotation(
+                            x=_b, y=_tot, text=f"<b>{_tot:.0f}</b>",
+                            showarrow=False, yanchor="bottom",
+                            font=dict(size=10, color="#1e293b"), yshift=3,
+                        )
+                    # Average KM line
+                    _avg_km = sum(_km_totals) / len(_km_totals) if _km_totals else 0
+                    _fig_km.add_hline(
+                        y=_avg_km, line_dash="dash", line_color="#f97316", line_width=1.5,
+                        annotation_text=f"Avg {_avg_km:.0f} km",
+                        annotation_position="top right",
+                        annotation_font=dict(size=9, color="#f97316"),
+                    )
+                    _fig_km.update_layout(
+                        barmode="stack", height=300,
+                        legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center",
+                                    font=dict(size=10)),
+                        margin=dict(l=40, r=20, t=30, b=40),
+                        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                        yaxis=dict(title="km", gridcolor="rgba(0,0,0,0.07)"),
+                        xaxis=dict(tickfont=dict(size=10)),
+                    )
+                    st.plotly_chart(_fig_km, use_container_width=True)
+                else:
+                    km_chart = fleet_df[["Bus", "Revenue KM", "Shuttle KM", "Dead KM"]].set_index("Bus")
+                    st.bar_chart(km_chart)
             with col2:
-                st.markdown('<div class="section-title">Final SOC per Bus (%)</div>', unsafe_allow_html=True)
-                soc_chart = fleet_df[["Bus","Final SOC (%)"]].set_index("Bus")
-                st.bar_chart(soc_chart, color="#16a34a")
+                st.markdown('<div class="section-title">SOC per Bus</div>', unsafe_allow_html=True)
+                if _PLOTLY_OK:
+                    _soc_buses = fleet_df["Bus"].tolist()
+                    _soc_final = fleet_df["Final SOC (%)"].tolist()
+                    _soc_init  = config.initial_soc_percent
+                    _soc_colors = [
+                        "#16a34a" if s >= 40 else "#d97706" if s >= 20 else "#dc2626"
+                        for s in _soc_final
+                    ]
+                    # Horizontal bullet-style: base bar = final SOC, ghost = initial SOC
+                    _fig_soc = go.Figure()
+                    _fig_soc.add_trace(go.Bar(
+                        name=f"Initial SOC ({_soc_init:.0f}%)",
+                        y=_soc_buses, x=[_soc_init] * len(_soc_buses),
+                        orientation="h",
+                        marker_color="rgba(148,163,184,0.25)",
+                        hoverinfo="skip",
+                    ))
+                    _fig_soc.add_trace(go.Bar(
+                        name="Final SOC",
+                        y=_soc_buses, x=_soc_final,
+                        orientation="h",
+                        marker_color=_soc_colors,
+                        text=[f"<b>{s:.1f}%</b>" for s in _soc_final],
+                        textposition="outside",
+                        textfont=dict(size=10),
+                        hovertemplate="%{y}<br>Final SOC: %{x:.1f}%<extra></extra>",
+                    ))
+                    _fig_soc.add_vline(
+                        x=config.min_soc_percent, line_dash="dot",
+                        line_color="#dc2626", line_width=1.5,
+                        annotation_text=f"Floor {config.min_soc_percent}%",
+                        annotation_position="top right",
+                        annotation_font=dict(size=9, color="#dc2626"),
+                    )
+                    _fig_soc.add_vline(
+                        x=config.trigger_soc_percent, line_dash="dash",
+                        line_color="#f97316", line_width=1.5,
+                        annotation_text=f"Trigger {config.trigger_soc_percent}%",
+                        annotation_position="bottom right",
+                        annotation_font=dict(size=9, color="#f97316"),
+                    )
+                    _fig_soc.update_layout(
+                        barmode="overlay", height=300,
+                        legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center",
+                                    font=dict(size=10)),
+                        margin=dict(l=80, r=60, t=30, b=30),
+                        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                        xaxis=dict(title="SOC (%)", range=[0, 110],
+                                   gridcolor="rgba(0,0,0,0.07)"),
+                        yaxis=dict(tickfont=dict(size=10)),
+                    )
+                    st.plotly_chart(_fig_soc, use_container_width=True)
+                else:
+                    soc_chart = fleet_df[["Bus", "Final SOC (%)"]].set_index("Bus")
+                    st.bar_chart(soc_chart, color="#16a34a")
 
             st.markdown('<div class="section-title">Departure Headways</div>', unsafe_allow_html=True)
             st.caption("Time gaps between consecutive departures in the same direction. "
@@ -2343,26 +2445,57 @@ elif app_mode == "🏙️ Citywide":
             st.markdown('<div class="section-title">Fleet Allocation: PVR vs Allocated</div>',
                         unsafe_allow_html=True)
             codes = sorted(cs.results.keys())
+            _pvr_vals  = [cs.results[c].pvr for c in codes]
+            _cfg_vals  = [cs.results[c].fleet_original for c in codes]
+            _alloc_vals= [cs.results[c].fleet_allocated for c in codes]
             fig = go.Figure()
-            fig.add_trace(go.Bar(name="PVR (minimum)", x=codes,
-                                 y=[cs.results[c].pvr for c in codes], marker_color="#94a3b8"))
-            fig.add_trace(go.Bar(name="Config Fleet", x=codes,
-                                 y=[cs.results[c].fleet_original for c in codes], marker_color="#c7d2fe"))
-            fig.add_trace(go.Bar(name="Final Allocated", x=codes,
-                                 y=[cs.results[c].fleet_allocated for c in codes], marker_color="#4f46e5"))
-            fig.update_layout(barmode="group", height=350,
+            fig.add_trace(go.Bar(name="PVR (minimum)", x=codes, y=_pvr_vals,
+                                 marker_color="#94a3b8",
+                                 text=_pvr_vals, textposition="outside",
+                                 textfont=dict(size=9)))
+            fig.add_trace(go.Bar(name="Config Fleet", x=codes, y=_cfg_vals,
+                                 marker_color="#c7d2fe",
+                                 text=_cfg_vals, textposition="outside",
+                                 textfont=dict(size=9)))
+            fig.add_trace(go.Bar(name="Final Allocated", x=codes, y=_alloc_vals,
+                                 marker_color="#4f46e5",
+                                 text=_alloc_vals, textposition="outside",
+                                 textfont=dict(size=9)))
+            fig.update_layout(barmode="group", height=370,
                               legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.5, xanchor="center"),
-                              margin=dict(l=40, r=20, t=20, b=40), plot_bgcolor="white")
+                              margin=dict(l=40, r=20, t=30, b=40),
+                              plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                              yaxis=dict(gridcolor="rgba(0,0,0,0.07)"),
+                              uniformtext=dict(minsize=8, mode="hide"))
             st.plotly_chart(fig, use_container_width=True)
 
         if _PLOTLY_OK and len(cs.results) > 1:
             st.markdown('<div class="section-title">Dead KM % by Route</div>', unsafe_allow_html=True)
             codes = sorted(cs.results.keys())
             dead_pcts = [cs.results[c].metrics.dead_km_ratio * 100 for c in codes]
-            fig2 = go.Figure(go.Bar(x=codes, y=dead_pcts, marker_color=[
-                "#16a34a" if d < 15 else "#d97706" if d < 25 else "#dc2626" for d in dead_pcts]))
-            fig2.update_layout(height=280, yaxis_title="Dead KM %",
-                               margin=dict(l=40, r=20, t=20, b=40), plot_bgcolor="white")
+            _dead_colors = ["#16a34a" if d < 15 else "#d97706" if d < 25 else "#dc2626"
+                            for d in dead_pcts]
+            fig2 = go.Figure(go.Bar(
+                x=codes, y=dead_pcts,
+                marker_color=_dead_colors,
+                text=[f"{d:.1f}%" for d in dead_pcts],
+                textposition="outside",
+                textfont=dict(size=9),
+                hovertemplate="%{x}: %{y:.1f}% dead km<extra></extra>",
+            ))
+            fig2.add_hline(y=15, line_dash="dash", line_color="#16a34a", line_width=1,
+                           annotation_text="15% target", annotation_position="right",
+                           annotation_font=dict(size=9, color="#16a34a"))
+            fig2.add_hline(y=25, line_dash="dot", line_color="#dc2626", line_width=1,
+                           annotation_text="25% warn", annotation_position="right",
+                           annotation_font=dict(size=9, color="#dc2626"))
+            fig2.update_layout(
+                height=300, yaxis_title="Dead KM %",
+                margin=dict(l=40, r=60, t=20, b=40),
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                yaxis=dict(gridcolor="rgba(0,0,0,0.07)"),
+                uniformtext=dict(minsize=8, mode="hide"),
+            )
             st.plotly_chart(fig2, use_container_width=True)
 
     # ── CITY TAB 2: Fleet & Rebalancing ───────────────────────────────────────
@@ -2448,16 +2581,25 @@ elif app_mode == "🏙️ Citywide":
         # Fleet vs PVR bar chart
         if _PLOTLY_OK and len(cs.results) > 1:
             codes = sorted(cs.results.keys())
+            _rb_pvr   = [cs.results[c].pvr for c in codes]
+            _rb_cfg   = [cs.results[c].fleet_original for c in codes]
+            _rb_alloc = [cs.results[c].fleet_allocated for c in codes]
             fig_rb = go.Figure()
-            fig_rb.add_trace(go.Bar(name="PVR (minimum)", x=codes,
-                y=[cs.results[c].pvr for c in codes], marker_color="#94a3b8"))
-            fig_rb.add_trace(go.Bar(name="Config Fleet", x=codes,
-                y=[cs.results[c].fleet_original for c in codes], marker_color="#c7d2fe"))
-            fig_rb.add_trace(go.Bar(name="Final Allocated", x=codes,
-                y=[cs.results[c].fleet_allocated for c in codes], marker_color="#4f46e5"))
-            fig_rb.update_layout(barmode="group", height=320,
+            fig_rb.add_trace(go.Bar(name="PVR (minimum)", x=codes, y=_rb_pvr,
+                marker_color="#94a3b8", text=_rb_pvr, textposition="outside",
+                textfont=dict(size=9)))
+            fig_rb.add_trace(go.Bar(name="Config Fleet", x=codes, y=_rb_cfg,
+                marker_color="#c7d2fe", text=_rb_cfg, textposition="outside",
+                textfont=dict(size=9)))
+            fig_rb.add_trace(go.Bar(name="Final Allocated", x=codes, y=_rb_alloc,
+                marker_color="#4f46e5", text=_rb_alloc, textposition="outside",
+                textfont=dict(size=9)))
+            fig_rb.update_layout(barmode="group", height=340,
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.5, xanchor="center"),
-                margin=dict(l=40, r=20, t=20, b=40), plot_bgcolor="white")
+                margin=dict(l=40, r=20, t=30, b=40),
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                yaxis=dict(gridcolor="rgba(0,0,0,0.07)"),
+                uniformtext=dict(minsize=8, mode="hide"))
             st.plotly_chart(fig_rb, use_container_width=True)
 
         if cs.transfers:
@@ -2804,14 +2946,38 @@ elif app_mode == "🏙️ Citywide":
                     with _col_ut:
                         st.metric("Charger Utilization",  f"{_utilization_pct}%",
                                   help="% of operating hours where at least one bus is charging.")
-                    fig_depot = go.Figure(go.Bar(
+                    fig_depot = go.Figure()
+                    fig_depot.add_trace(go.Bar(
                         x=_bin_df["Time"], y=_bin_df["Buses Charging"],
                         marker_color="#f97316",
+                        text=_bin_df["Buses Charging"].apply(
+                            lambda v: f"<b>{v}</b>" if v > 0 else ""),
+                        textposition="outside",
+                        textfont=dict(size=9),
                         hovertemplate="%{x}: %{y} bus(es) charging<extra></extra>",
                     ))
+                    # Area overlay (cumulative utilisation feel)
+                    _max_q = max(_bin_df["Buses Charging"]) if not _bin_df.empty else 1
+                    fig_depot.add_trace(go.Scatter(
+                        x=_bin_df["Time"], y=_bin_df["Buses Charging"],
+                        fill="tozeroy", fillcolor="rgba(249,115,22,0.12)",
+                        line=dict(color="rgba(249,115,22,0.5)", width=1.5),
+                        mode="lines", showlegend=False,
+                        hoverinfo="skip",
+                    ))
+                    if _peak_queue > 0:
+                        fig_depot.add_hline(
+                            y=_peak_queue, line_dash="dot", line_color="#dc2626", line_width=1.5,
+                            annotation_text=f"Peak: {_peak_queue} buses",
+                            annotation_position="top right",
+                            annotation_font=dict(size=9, color="#dc2626"),
+                        )
                     fig_depot.update_layout(
-                        height=260, xaxis_title="Time", yaxis_title="Concurrent Buses Charging",
-                        margin=dict(l=40, r=20, t=10, b=40), plot_bgcolor="white",
+                        height=280, xaxis_title="Time", yaxis_title="Concurrent Buses Charging",
+                        margin=dict(l=40, r=20, t=20, b=40),
+                        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                        yaxis=dict(gridcolor="rgba(0,0,0,0.07)", dtick=1),
+                        xaxis=dict(tickangle=-45, tickfont=dict(size=9)),
                     )
                     st.plotly_chart(fig_depot, use_container_width=True)
 
@@ -2919,15 +3085,22 @@ elif app_mode == "🏙️ Citywide":
                     _fig_sc1 = go.Figure()
                     for _m in _avail_modes:
                         _cs_v = _scenario_results[_m]
+                        _y_sc1 = [_cs_v.total_buses_used, _cs_v.total_revenue_trips]
                         _fig_sc1.add_trace(go.Bar(
                             name=_mode_labels.get(_m, _m),
                             x=["Fleet Used", "Revenue Trips"],
-                            y=[_cs_v.total_buses_used, _cs_v.total_revenue_trips],
+                            y=_y_sc1,
+                            text=[f"<b>{v}</b>" for v in _y_sc1],
+                            textposition="outside",
+                            textfont=dict(size=9),
                         ))
                     _fig_sc1.update_layout(
-                        barmode="group", height=280, title="Fleet vs Revenue Trips",
+                        barmode="group", height=300, title="Fleet vs Revenue Trips",
                         legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center"),
-                        margin=dict(l=40, r=20, t=40, b=40), plot_bgcolor="white",
+                        margin=dict(l=40, r=20, t=50, b=40),
+                        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                        yaxis=dict(gridcolor="rgba(0,0,0,0.07)"),
+                        uniformtext=dict(minsize=8, mode="hide"),
                     )
                     st.plotly_chart(_fig_sc1, use_container_width=True)
 
@@ -2945,9 +3118,10 @@ elif app_mode == "🏙️ Citywide":
                         textposition="outside",
                     ))
                     _fig_sc2.update_layout(
-                        height=280, title="Max Waiting Time (min)",
-                        margin=dict(l=40, r=20, t=40, b=40), plot_bgcolor="white",
-                        yaxis_title="minutes",
+                        height=300, title="Max Waiting Time (min)",
+                        margin=dict(l=40, r=20, t=50, b=40),
+                        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                        yaxis=dict(title="minutes", gridcolor="rgba(0,0,0,0.07)"),
                     )
                     st.plotly_chart(_fig_sc2, use_container_width=True)
 
@@ -2961,20 +3135,26 @@ elif app_mode == "🏙️ Citywide":
                         _ot_v = (sum(getattr(r.metrics, 'pct_trips_on_time', 0.0)
                                      for r in _cs_v.results.values())
                                  / max(1, len(_cs_v.results)))
+                        _y_sc3 = [
+                            _cs_v.citywide_utilization_pct,
+                            _ot_v,
+                            100 - _cs_v.citywide_dead_km_ratio * 100,
+                        ]
                         _fig_sc3.add_trace(go.Bar(
                             name=_mode_labels.get(_m, _m),
                             x=["Utilization %", "On-Time %", "100 - Dead KM %"],
-                            y=[
-                                _cs_v.citywide_utilization_pct,
-                                _ot_v,
-                                100 - _cs_v.citywide_dead_km_ratio * 100,
-                            ],
+                            y=_y_sc3,
+                            text=[f"<b>{v:.1f}</b>" for v in _y_sc3],
+                            textposition="outside",
+                            textfont=dict(size=9),
                         ))
                     _fig_sc3.update_layout(
-                        barmode="group", height=280, title="Efficiency Metrics (higher = better)",
+                        barmode="group", height=300, title="Efficiency Metrics (higher = better)",
                         legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center"),
-                        yaxis=dict(range=[0, 110]),
-                        margin=dict(l=40, r=20, t=40, b=40), plot_bgcolor="white",
+                        yaxis=dict(range=[0, 115], gridcolor="rgba(0,0,0,0.07)"),
+                        margin=dict(l=40, r=20, t=50, b=40),
+                        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                        uniformtext=dict(minsize=8, mode="hide"),
                     )
                     st.plotly_chart(_fig_sc3, use_container_width=True)
 
@@ -2994,9 +3174,10 @@ elif app_mode == "🏙️ Citywide":
                         textposition="outside",
                     ))
                     _fig_sc4.update_layout(
-                        height=280, title="Infeasible Headway Routes",
-                        margin=dict(l=40, r=20, t=40, b=40), plot_bgcolor="white",
-                        yaxis_title="routes",
+                        height=300, title="Infeasible Headway Routes",
+                        margin=dict(l=40, r=20, t=50, b=40),
+                        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                        yaxis=dict(title="routes", gridcolor="rgba(0,0,0,0.07)"),
                     )
                     st.plotly_chart(_fig_sc4, use_container_width=True)
 

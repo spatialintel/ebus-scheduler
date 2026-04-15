@@ -25,8 +25,10 @@ class ScheduleMetrics:
     total_km: float = 0.0
     revenue_km: float = 0.0
     dead_km: float = 0.0
-    dead_km_ratio: float = 0.0          # dead_km / total_km
+    shuttle_km: float = 0.0              # km on Shuttle legs (on-corridor, non-depot)
+    dead_km_ratio: float = 0.0          # dead_km / total_km (Shuttle excluded — it carries passengers)
     dead_trips: int = 0                  # number of dead run legs
+    shuttle_trips: int = 0               # number of shuttle legs
 
     # Fleet balance
     km_per_bus: list[float] = field(default_factory=list)
@@ -81,7 +83,8 @@ class ScheduleMetrics:
     def summary(self) -> str:
         lines = [
             f"Revenue trips: {self.revenue_trips_assigned}/{self.revenue_trips_total}",
-            f"Total km: {self.total_km:.1f} (revenue: {self.revenue_km:.1f}, dead: {self.dead_km:.1f})",
+            f"Total km: {self.total_km:.1f} (revenue: {self.revenue_km:.1f}, "
+            f"shuttle: {self.shuttle_km:.1f}, dead: {self.dead_km:.1f})",
             f"Dead km ratio: {self.dead_km_ratio:.1%}",
             f"KM per bus: {', '.join(f'{k:.1f}' for k in self.km_per_bus)}",
             f"KM range: {self.km_range:.1f} (std: {self.km_std:.1f})",
@@ -115,13 +118,19 @@ def compute_metrics(
     rev = [t for t in all_trips if t.trip_type == "Revenue"]
     dead = [t for t in all_trips if t.trip_type == "Dead"]
     chg = [t for t in all_trips if t.trip_type == "Charging"]
+    shut = [t for t in all_trips if t.trip_type == "Shuttle"]
 
     m.revenue_trips_assigned = assigned_revenue_trips if assigned_revenue_trips is not None else len(rev)
     m.revenue_trips_total = total_revenue_trips or len(rev)
     m.revenue_km = sum(t.distance_km for t in rev)
     m.dead_km = sum(t.distance_km for t in dead)
+    m.shuttle_km = sum(t.distance_km for t in shut)
     m.dead_trips = len(dead)
-    m.total_km = m.revenue_km + m.dead_km
+    m.shuttle_trips = len(shut)
+    # total_km = revenue + shuttle (passengers aboard) + dead (empty running)
+    # This matches bus.total_km and the Excel schedule sum.
+    m.total_km = m.revenue_km + m.shuttle_km + m.dead_km
+    # dead_km_ratio: Shuttle km is excluded from numerator — it carries passengers
     m.dead_km_ratio = m.dead_km / m.total_km if m.total_km > 0 else 0.0
     m.charging_stops = len(chg)
 
