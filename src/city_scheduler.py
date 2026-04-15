@@ -62,10 +62,12 @@ from src.metrics import compute_metrics
 # Increase if you still see occasional spikes at the theoretical minimum.
 SPIKE_SAFETY_BUFFER: int = 3
 
-# Maximum number of spikes (gaps > 2×H) allowed per direction per day
+# Maximum number of spikes (gaps > 2×H) allowed TOTAL (UP + DN combined) per day
 # in non-peak hours before the binary search increments H.
-# 1 = at most one charging gap per direction (recommended for planning).
-# 2 = more permissive (useful when charging window is very wide).
+# 1 = at most one charging gap across the entire day, either direction
+#     (a single charging event creates one gap in each direction, so combined = 2 →
+#      exceeds limit → H is forced higher until the gap falls below the threshold).
+# 0 = zero tolerance — H climbs until no spike at all (strict, may push H very high).
 MAX_SPIKES_ALLOWED: int = 1
 
 
@@ -150,6 +152,11 @@ def _count_spikes(buses, headway_min: float, headway_df=None,
     Falls back to hardcoded 08:00–11:00 and 16:00–20:00 if headway_df is None.
 
     Returns {"UP": n, "DN": n, "exceeds_limit": bool}.
+
+    exceeds_limit is True when (UP + DN) > max_allowed.
+    A single charging event creates one gap in each direction (UP + DN = 2),
+    so with max_allowed=1 the binary search increments H until the gap falls
+    below the 2×H threshold, yielding zero combined spikes at convergence.
     """
     from datetime import datetime as _dt2
     REF = _dt2(2025, 1, 1)
@@ -179,22 +186,28 @@ def _count_spikes(buses, headway_min: float, headway_df=None,
             if gap > threshold and not _is_peak(deps[i - 1]):
                 result[direction] += 1
 
-    result["exceeds_limit"] = (result["UP"] > max_allowed or
-                                result["DN"] > max_allowed)
+    # A single charging event creates one gap in UP and one in DN simultaneously.
+    # Counting per-direction would allow 1+1=2 spikes to pass undetected.
+    # We therefore check the combined total so one physical event = one spike.
+    result["exceeds_limit"] = (result["UP"] + result["DN"]) > max_allowed
     return result
 
 
 def _natural_headway(ri: RouteInput) -> float:
     """
     Compute minimum constant headway that satisfies the spike-tolerance rule:
-      At most 1 spike > 2×H per direction per day, during non-peak hours only.
+      (UP + DN) combined spikes ≤ MAX_SPIKES_ALLOWED per day, non-peak hours only.
+
+    A single charging event creates exactly one gap in each direction, so
+    combined = 2 for one event.  With MAX_SPIKES_ALLOWED=1 the search keeps
+    climbing until 2×H exceeds the charging round-trip time → zero spikes.
 
     Algorithm:
-      1. Start at physics minimum: H = ceil((max_cycle + charging_RT) / fleet)
+      1. Start at physics minimum: H = ceil((max_cycle + charging_RT) / fleet) + buffer
       2. Run scheduler with flat H headway
-      3. Count spikes (>2H, non-peak, per direction)
-      4. If any direction has > 1 spike: H += 1 and retry (max 20 iterations)
-      5. Return the first H that satisfies the condition
+      3. Count combined spikes (>2H, non-peak, UP+DN total)
+      4. If combined > MAX_SPIKES_ALLOWED: H += 1 and retry (max 25 iterations)
+      5. Return the first H where the combined spike count is within tolerance
 
     Falls back to ceil(max_cycle/fleet) if scheduler fails.
     """
@@ -415,6 +428,17 @@ def _run_single_route(
 
         _feas_status = "INFEASIBLE" if _any_infeas else "OK"
 
+        # ── Spike counts (all modes) ──────────────────────────────────────────
+        # Use the widest headway band (off-peak H) as the comparison threshold,
+        # since spikes are only measured during non-peak windows.
+        try:
+            _h_spike = float(headway_df["headway_min"].max())
+            _sc = _count_spikes(buses, _h_spike, headway_df=headway_df)
+            _spike_up = _sc["UP"]
+            _spike_dn = _sc["DN"]
+        except Exception:
+            _spike_up = _spike_dn = 0
+
         return RouteResult(
             route_code=config.route_code,
             config=config,
@@ -436,6 +460,8 @@ def _run_single_route(
             headway_source="user",          # set to "recommended" or "scaled:kX.X" by UI
             headway_k=rec_k,
             headway_alpha=rec_alpha,
+            spike_count_up=_spike_up,
+            spike_count_dn=_spike_dn,
         )
     finally:
         config.fleet_size = original_fleet

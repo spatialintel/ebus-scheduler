@@ -56,6 +56,11 @@ class RouteResult:
     # Scaling parameters that produced recommended_headway_profile:
     headway_k: float = 1.0      # scaling factor applied to H_phys
     headway_alpha: float = 0.15  # off-peak spread: H_offpeak = H_peak × (1 + alpha)
+    # Spike counts post-schedule — gaps > 2×H during non-peak hours.
+    # Populated for all three scheduling modes using max(headway_df["headway_min"]) as H.
+    # A single charging event typically contributes 1 to each direction (UP + DN = 2 total).
+    spike_count_up: int = 0
+    spike_count_dn: int = 0
 
 
 @dataclass
