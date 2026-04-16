@@ -718,7 +718,15 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
     #
     # B) INTERMEDIATE ROUTE (has intermediate stops, not rural, not circular):
     #      First half  → DEPOT → intermediate_node → nearest_terminal
-    #      Second half → DEPOT → far_terminal  (direct)
+    #      Second half → DEPOT → intermediate_node → far_terminal
+    #      Both halves pass through the intermediate — they diverge FROM there,
+    #      not from the depot. Direct depot→far is only used as a fallback if
+    #      the intermediate→far segment is missing from the Distances sheet.
+    #      Rule: only applies at start-of-day; mid-day/end-of-day depot visits
+    #      are unaffected (those go to nearest node per P2).
+    #
+    #      is_suburban_route=YES overrides this: rural routes always use Mode A
+    #      regardless of whether intermediates are present.
     #      Ensures both terminals are served at service start.
     #
     # C) SIMPLE ROUTE (no intermediates, or circular):
@@ -819,16 +827,32 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                 _make_dead(bus, rev_start, d_near, t_near, config=config)
 
         elif split_dispatch and i >= inter_half:
-            # Second half: DEPOT → far terminal (direct, no intermediate)
+            # Second half: DEPOT → intermediate → far terminal
+            # ALL buses on intermediate routes must pass through the intermediate
+            # first at start-of-day — they diverge from there, not from depot.
             slot_idx  = i - inter_half
             arrive_at = op_start_dt + timedelta(minutes=slot_idx * phase1_gap)
             try:
-                d_far2 = config.get_distance(config.depot, far_loc)
-                t_far2 = config.get_travel_time(config.depot, far_loc)
+                d_int2 = config.get_distance(config.depot, intermediate_node)
+                t_int2 = config.get_travel_time(config.depot, intermediate_node)
             except KeyError:
-                d_far2, t_far2 = 0, nearest_tt
-            bus.current_time = arrive_at - timedelta(minutes=t_far2)
-            if d_far2 > 0:
+                d_int2, t_int2 = 0, 0
+            try:
+                d_far2 = config.get_distance(intermediate_node, far_loc)
+                t_far2 = config.get_travel_time(intermediate_node, far_loc)
+            except KeyError:
+                # fallback: direct depot → far if intermediate→far segment missing
+                try:
+                    d_far2 = config.get_distance(config.depot, far_loc)
+                    t_far2 = config.get_travel_time(config.depot, far_loc)
+                    d_int2, t_int2 = 0, 0
+                except KeyError:
+                    d_far2, t_far2 = 0, nearest_tt
+            total_travel2    = t_int2 + t_far2
+            bus.current_time = arrive_at - timedelta(minutes=total_travel2)
+            if d_int2 > 0:
+                _make_dead(bus, intermediate_node, d_int2, t_int2, config=config)
+            if d_far2 > 0 and bus.current_location != far_loc:
                 _make_dead(bus, far_loc, d_far2, t_far2, config=config)
 
         # ── Mode C: Simple route — all buses to nearest terminal ─────────────
