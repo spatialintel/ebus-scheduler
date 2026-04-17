@@ -633,17 +633,33 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
     nearest_node, _, nearest_tt = _nearest_node_from_depot(config)
 
     # Detect circular route: start_point == end_point.
-    # On circular routes all trips run in the same direction — there is no UP/DN
-    # alternation. natural_gap = cycle_time/fleet fills ALL slots perfectly,
-    # leaving no room for late-arriving buses. Use headway_min as the spacing
-    # floor for circular routes so buses re-enter service at the next available gap.
+    # For circular routes WITH intermediates: the intermediate becomes the logical
+    # "far terminal", creating two legs:
+    #   DN = intermediate → start (clockwise)
+    #   UP = start → intermediate (counter-clockwise)
+    # This matches trip_generator which uses the same split.
+    # For circular routes WITHOUT intermediates: single-direction loop (legacy).
     is_circular = config.start_point == config.end_point
+    circular_has_intermediate = False
+    circular_intermediate = None
+
+    if is_circular:
+        clean_ints = [n.strip() for n in getattr(config, 'intermediates', [])
+                      if n and n.strip()]
+        if clean_ints:
+            circular_has_intermediate = True
+            circular_intermediate = clean_ints[0]
 
     terminals = [config.start_point, config.end_point]
     # De-duplicate for circular (start==end gives [X, X])
     terminals = list(dict.fromkeys(terminals))
 
-    if nearest_node in terminals:
+    # For circular routes with intermediate: override far_loc to the intermediate
+    if circular_has_intermediate:
+        rev_start = config.start_point          # GANGAJALIYA
+        far_loc   = circular_intermediate       # DUKHISHYAM CIRCLE
+        reposition_to = None
+    elif nearest_node in terminals:
         rev_start = nearest_node
         far_loc   = (config.end_point if nearest_node == config.start_point
                      else config.start_point)
@@ -663,21 +679,31 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
 
     # For circular routes: trip goes start→start (one full loop).
     # dn_tt = one-way travel time; cycle = dn_tt + break (no reverse direction).
+    # EXCEPTION: circular with intermediate = two-leg route (treated like linear).
     try:
-        dn_tt = config.get_travel_time(rev_start, far_loc if not is_circular
-                                       else rev_start)
-        if is_circular and dn_tt == 0:
-            # Fallback: use segment GANGAJALIA→GANGAJALIA if available
-            dn_tt = config.get_travel_time(config.start_point, config.start_point)
+        if circular_has_intermediate:
+            # Two-leg: far_loc(intermediate) → rev_start and rev_start → far_loc
+            dn_tt = config.get_travel_time(far_loc, rev_start)
+        elif is_circular:
+            dn_tt = config.get_travel_time(rev_start, rev_start)
+            if dn_tt == 0:
+                dn_tt = config.get_travel_time(config.start_point, config.start_point)
+        else:
+            dn_tt = config.get_travel_time(rev_start, far_loc)
     except KeyError:
         dn_tt = 45
     try:
-        up_tt = (0 if is_circular else config.get_travel_time(far_loc, rev_start))
+        if circular_has_intermediate:
+            up_tt = config.get_travel_time(rev_start, far_loc)
+        elif is_circular:
+            up_tt = 0
+        else:
+            up_tt = config.get_travel_time(far_loc, rev_start)
     except KeyError:
-        up_tt = dn_tt if not is_circular else 0
+        up_tt = dn_tt if not (is_circular and not circular_has_intermediate) else 0
 
-    if is_circular:
-        cycle_time  = dn_tt + min_break   # one direction only
+    if is_circular and not circular_has_intermediate:
+        cycle_time  = dn_tt + min_break   # legacy: one direction only
     else:
         cycle_time  = dn_tt + min_break + up_tt + min_break
 
@@ -841,28 +867,37 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                 _make_dead(bus, far_loc, d_far2, t_far2, config=config)
 
         # ── Mode C: Simple route — all buses to nearest terminal ─────────────
-        #    For circular routes: stagger half the fleet to serve UP trips first.
-        #    Even-indexed buses arrive at op_start → naturally pick DN first.
-        #    Odd-indexed buses arrive offset by (dn_travel + break) → pick UP first.
-        #    This ensures both directions get simultaneous coverage from service start.
+        #    Circular routes WITH intermediate: half buses to start (UP first),
+        #    half to intermediate/far_loc (DN first). Creates CW/CCW coverage.
         else:
-            if is_circular and i % 2 == 1:
-                # Odd bus: offset by half-cycle so it arrives when UP trips start
-                up_offset = dn_tt + min_break
-                slot_idx  = (i - 1) // 2
-                arrive_at = op_start_dt + timedelta(minutes=slot_idx * phase1_gap + up_offset)
-            else:
-                slot_idx  = i // 2 if is_circular else i
+            if circular_has_intermediate:
+                # Split fleet: even-indexed → far_loc (DN first), odd → rev_start (UP first)
+                if i % 2 == 0:
+                    dest_loc = far_loc          # DUKHISHYAM → serve DN first
+                    slot_idx = i // 2
+                else:
+                    dest_loc = rev_start        # GANGAJALIYA → serve UP first
+                    slot_idx = (i - 1) // 2
                 arrive_at = op_start_dt + timedelta(minutes=slot_idx * phase1_gap)
-            bus.current_time = arrive_at - timedelta(minutes=nearest_tt)
-            _morning_dead_run(bus, config)
-            if reposition_to and bus.current_location != reposition_to:
                 try:
-                    rd    = config.get_distance(bus.current_location, reposition_to)
-                    rt_tt = config.get_travel_time(bus.current_location, reposition_to)
-                    _make_dead(bus, reposition_to, rd, rt_tt, config=config)
+                    d_dest = config.get_distance(config.depot, dest_loc)
+                    t_dest = config.get_travel_time(config.depot, dest_loc)
                 except KeyError:
-                    pass
+                    d_dest, t_dest = 0, nearest_tt
+                bus.current_time = arrive_at - timedelta(minutes=t_dest)
+                if d_dest > 0:
+                    _make_dead(bus, dest_loc, d_dest, t_dest, config=config)
+            else:
+                arrive_at        = op_start_dt + timedelta(minutes=i * phase1_gap)
+                bus.current_time = arrive_at - timedelta(minutes=nearest_tt)
+                _morning_dead_run(bus, config)
+                if reposition_to and bus.current_location != reposition_to:
+                    try:
+                        rd    = config.get_distance(bus.current_location, reposition_to)
+                        rt_tt = config.get_travel_time(bus.current_location, reposition_to)
+                        _make_dead(bus, reposition_to, rd, rt_tt, config=config)
+                    except KeyError:
+                        pass
 
         bus.phase_index = i
 
@@ -971,8 +1006,8 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
             recent_types = [t.trip_type for t in bus.trips[-4:]]
             just_charged = "Charging" in recent_types
 
-            if is_circular:
-                # Circular route: always same direction (DN), always start→start
+            if is_circular and not circular_has_intermediate:
+                # Pure circular route (no intermediate): always same direction (DN)
                 next_dir   = "DN"
                 trip_start = rev_start
                 trip_end   = rev_start   # circular: end == start
@@ -1259,7 +1294,7 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
         _would_be_stuck = (best_bus.soc_percent
                            - _cost_one_trip
                            - _cost_return) < SOC_FLOOR + 5.0
-        at_far_loc = (not is_circular and
+        at_far_loc = (not (is_circular and not circular_has_intermediate) and
                       best_bus.current_location == far_loc and
                       _p5_window_remaining > 90 and
                       not _would_be_stuck)   # override: charge now if near-emergency

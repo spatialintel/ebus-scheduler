@@ -61,6 +61,8 @@ class RouteResult:
     # A single charging event typically contributes 1 to each direction (UP + DN = 2 total).
     spike_count_up: int = 0
     spike_count_dn: int = 0
+    # Phase 2: depot simulation output
+    depot_log: object = None    # DepotLog or None
 
 
 @dataclass
@@ -97,6 +99,10 @@ class CitySchedule:
     results: dict[str, RouteResult]     # route_code → RouteResult
     transfers: list[Transfer] = field(default_factory=list)
     stability_flags: list = field(default_factory=list)  # list[StabilityFlag]
+    # Phase 2: auto-generated recommendations
+    recommendations: list = field(default_factory=list)  # list[Recommendation]
+    # Phase 3: corridor analysis results
+    corridors: list = field(default_factory=list)  # list[CorridorAnalysis]
 
     # ── Aggregate KPIs ────────────────────────────────────────────────────────
 

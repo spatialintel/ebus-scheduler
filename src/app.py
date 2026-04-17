@@ -2880,7 +2880,7 @@ elif app_mode == "🏙️ Citywide":
             trip_rows = []
             trip_seq_n = 0
             for bus in r.buses:
-                soc_t = r.config.initial_soc_percent   # reset per bus — was missing, caused negative SOC
+                soc_t = r.config.initial_soc_percent   # reset per bus — prevents negative SOC cascade
                 for trip in bus.trips:
                     soc_t -= (trip.distance_km * r.config.consumption_rate / r.config.battery_kwh) * 100
                     if trip.trip_type == "Charging":

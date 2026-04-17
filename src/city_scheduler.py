@@ -53,7 +53,7 @@ from src.trip_generator import generate_trips
 from src.bus_scheduler import schedule_buses
 from src.metrics import compute_metrics
 
-# Phase 2 imports — soft so missing files don't break existing functionality
+# ── Phase 2+3 soft imports (missing files don't break existing functionality) ──
 try:
     from src.recommender import generate_recommendations
     _HAS_RECOMMENDER = True
@@ -62,9 +62,21 @@ except ImportError:
 
 try:
     from src.depot_model import simulate_depot
-    _HAS_DEPOT_MODEL = True
+    _HAS_DEPOT = True
 except ImportError:
-    _HAS_DEPOT_MODEL = False
+    _HAS_DEPOT = False
+
+try:
+    from src.network_analyzer import analyze_network
+    _HAS_NETWORK = True
+except ImportError:
+    _HAS_NETWORK = False
+
+try:
+    from src.scenario_store import save_scenario
+    _HAS_SCENARIO = True
+except ImportError:
+    _HAS_SCENARIO = False
 
 # ---------------------------------------------------------------------------
 # Tunable constants — change here to affect all modes globally
@@ -738,35 +750,45 @@ def schedule_city(
     else:
         result = _schedule_headway_driven(city)
 
-    # Phase 2: post-processing — depot model + recommendations
-    _post_process(result)
+    # Post-processing: depot model, recommendations, network analysis, scenario save
+    _post_process(result, mode)
     return result
 
 
-def _post_process(cs: CitySchedule) -> None:
+def _post_process(cs: CitySchedule, mode: str = "planning") -> None:
     """
-    Run depot simulation and recommendation engine on a completed CitySchedule.
-    Modifies cs in-place (adds depot_log per route, recommendations on CitySchedule).
-    Soft-fails: if Phase 2 modules aren't available, skips silently.
+    Run analysis modules on completed CitySchedule. Modifies cs in-place.
+    All modules are optional — missing imports skip silently.
     """
-    # Depot model: simulate charger queue per route
-    if _HAS_DEPOT_MODEL:
+    # Depot model
+    if _HAS_DEPOT:
         try:
             for code, r in cs.results.items():
-                slots_slow = getattr(cs.city_config, "depot_charger_slots", 0) or 0
-                r.depot_log = simulate_depot(
-                    r.buses, r.config,
-                    slots_slow=slots_slow,
-                )
+                slots = getattr(cs.city_config, "depot_charger_slots", 0) or 0
+                r.depot_log = simulate_depot(r.buses, r.config, slots_slow=slots)
         except Exception:
-            pass  # depot model is non-critical
+            pass
 
-    # Recommender: generate actionable recommendations
+    # Network/corridor analysis
+    if _HAS_NETWORK:
+        try:
+            cs.corridors = analyze_network(cs)
+        except Exception:
+            cs.corridors = []
+
+    # Recommender
     if _HAS_RECOMMENDER:
         try:
             cs.recommendations = generate_recommendations(cs)
         except Exception:
-            pass  # recommender is non-critical
+            pass
+
+    # Auto-save scenario
+    if _HAS_SCENARIO:
+        try:
+            save_scenario(cs, mode=mode)
+        except Exception:
+            pass
 
 
 # ── Mode display names (used by dashboard for user-facing labels) ────────────

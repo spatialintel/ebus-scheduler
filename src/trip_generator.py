@@ -124,6 +124,21 @@ def _generate_revenue_trips(config, headway_df, travel_time_df,
     # Buses park at the node nearest to the depot after the morning dead run.
     # In most configs this equals end_point, but it may differ — use actuals.
     dn_start_loc = _nearest_node_for_buses(config)
+
+    # ── Circular route fix ────────────────────────────────────────────────────
+    # When start_point == end_point (circular/loop), both DN and UP threads
+    # collapse to the same trip (start → start = full loop in one direction).
+    # Fix: use the first intermediate as the logical "far terminal" so:
+    #   DN = intermediate → start  (clockwise half)
+    #   UP = start → intermediate  (counter-clockwise half)
+    # Each bus alternates DN → UP → DN → ..., covering the full loop.
+    is_circular = config.start_point == config.end_point
+    if is_circular:
+        clean_ints = [n.strip() for n in getattr(config, 'intermediates', [])
+                      if n and n.strip()]
+        if clean_ints:
+            dn_start_loc = clean_ints[0]  # e.g. DUKHISHYAM CIRCLE
+
     try:
         e2s_dist = config.get_distance(dn_start_loc, start_loc)
     except KeyError:

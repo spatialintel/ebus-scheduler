@@ -1,148 +1,153 @@
 """
-planning_summary_ui.py — Streamlit helper for rendering the Planning Summary.
+planning_summary_ui.py — Planning Summary renderer for eBus Scheduler.
 
-Imported by app.py. Renders the Planning Summary as the first element on the
-citywide dashboard, BEFORE any tabs. This is what the planner sees first.
-
-Usage in app.py:
-    from src.planning_summary_ui import render_planning_summary
-    render_planning_summary(city_schedule)
+Professional transit authority style. Data-dense, no decoration.
+Renders as the first element on the citywide dashboard.
 """
 
 from __future__ import annotations
-__version__ = "2026-04-15-p1"
+__version__ = "2026-04-17-p3"
 
 import streamlit as st
+import pandas as pd
 
 
-# ── LOS grade colour mapping ──────────────────────────────────────────────────
-
-_LOS_COLORS = {
-    "A": "#1E8449",  # green — excellent
-    "B": "#52A043",  # light green — good
-    "C": "#B7950B",  # amber — acceptable
-    "D": "#D35400",  # orange — marginal
-    "E": "#C0392B",  # red — poor
-    "F": "#922B21",  # dark red — failing
+_CSS = """
+<style>
+.ps-wrap { margin-bottom: 1rem; }
+.ps-header {
+  display: flex; align-items: baseline; gap: 12px;
+  border-bottom: 2px solid #1a1a2e; padding-bottom: 5px; margin-bottom: 12px;
 }
+.ps-title { font-size: 1.05rem; font-weight: 700; color: #1a1a2e; }
+.ps-sub { font-size: 0.76rem; color: #888; }
+.ps-kpi-strip {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 0; border: 1px solid #ddd; border-radius: 3px; overflow: hidden;
+  margin-bottom: 12px;
+}
+.ps-kpi { padding: 8px 12px; border-right: 1px solid #eee; background: #fafbfc; }
+.ps-kpi:last-child { border-right: none; }
+.ps-kpi-v { font-size: 1.3rem; font-weight: 700; color: #1a1a2e; font-family: 'DM Mono',monospace; line-height: 1.1; }
+.ps-kpi-l { font-size: 0.65rem; color: #999; text-transform: uppercase; letter-spacing: .04em; margin-top: 1px; }
+.ps-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; }
+.ps-dot-g { background: #16a34a; } .ps-dot-y { background: #ca8a04; } .ps-dot-r { background: #dc2626; }
+.ps-alert { padding: 6px 10px; border-radius: 2px; margin-bottom: 4px; font-size: 0.8rem; line-height: 1.4; }
+.ps-alert-w { background: #fffbeb; border-left: 3px solid #ca8a04; color: #713f12; }
+.ps-alert-ok { background: #f0fdf4; border-left: 3px solid #16a34a; color: #166534; }
+.ps-sec { font-size: 0.68rem; font-weight: 600; color: #999; text-transform: uppercase; letter-spacing: .05em; margin: 12px 0 5px; padding-bottom: 2px; border-bottom: 1px solid #eee; }
+.ps-rec { display: grid; grid-template-columns: 28px 70px 1fr; gap: 0; border-bottom: 1px solid #f5f5f5; padding: 5px 0; font-size: 0.8rem; }
+.ps-rec:last-child { border-bottom: none; }
+.ps-rp { font-family: monospace; font-weight: 700; text-align: center; }
+.ps-rp1{color:#dc2626} .ps-rp2{color:#ea580c} .ps-rp3{color:#ca8a04} .ps-rp4{color:#2563eb} .ps-rp5{color:#9ca3af}
+.ps-rr { color: #555; font-weight: 600; }
+.ps-ra { color: #333; } .ps-rx { color: #999; font-size: 0.72rem; margin-top: 1px; }
+</style>
+"""
 
+_LOS_DOT = {"A":"ps-dot-g","B":"ps-dot-g","C":"ps-dot-y","D":"ps-dot-r","E":"ps-dot-r","F":"ps-dot-r"}
 
-def _los_badge(grade: str) -> str:
-    """Return HTML badge for an LOS grade."""
-    color = _LOS_COLORS.get(grade, "#666666")
-    return (
-        f'<span style="display:inline-block; padding:2px 10px; '
-        f'border-radius:4px; background:{color}; color:#fff; '
-        f'font-weight:600; font-size:0.9rem;">LOS {grade or "—"}</span>'
-    )
+def _dot(g): return f'<span class="ps-dot {_LOS_DOT.get(g,"ps-dot-y")}"></span>{g or "\u2014"}'
 
 
 def render_planning_summary(city_schedule) -> None:
-    """
-    Render the Planning Summary as the first element on the citywide dashboard.
-
-    Sections:
-      1. Fleet Overview (KPI row)
-      2. Service Quality (citywide LOS + routes below LOS C)
-      3. Warnings (SOC risks, headway infeasibilities, fleet deficits)
-    """
     if city_schedule is None:
         return
+    st.markdown(_CSS, unsafe_allow_html=True)
+    s = city_schedule.planning_summary
+    fl, sq = s["fleet"], s["service_quality"]
 
-    summary = city_schedule.planning_summary
-
-    # ── Header ───────────────────────────────────────────────────────────────
+    # Header
     st.markdown(
-        '<div style="background: linear-gradient(90deg, #1B4F72 0%, #2E86C1 100%); '
-        'padding: 12px 20px; border-radius: 8px; margin-bottom: 16px; color: white;">'
-        '<div style="font-size: 1.1rem; font-weight: 700;">📋 Planning Summary</div>'
-        '<div style="font-size: 0.85rem; opacity: 0.9;">'
-        'Auto-generated from the current schedule. Review before diving into tabs.'
-        '</div></div>',
-        unsafe_allow_html=True,
-    )
+        '<div class="ps-wrap"><div class="ps-header">'
+        '<span class="ps-title">Planning summary</span>'
+        '<span class="ps-sub">Auto-generated</span></div>',
+        unsafe_allow_html=True)
 
-    # ── Section 1: Fleet Overview ────────────────────────────────────────────
-    fleet = summary["fleet"]
-    c1, c2, c3, c4 = st.columns(4)
+    # KPI strip
+    delta = fl["surplus"] if fl["surplus"] > 0 else -fl["deficit"]
+    ds = f"+{delta}" if delta > 0 else str(delta) if delta < 0 else "0"
+    kpis = [
+        (str(len(city_schedule.results)), "Routes"),
+        (str(fl["total_allocated"]), "Fleet"),
+        (str(fl["total_pvr"]), "PVR"),
+        (ds, "Surplus/deficit"),
+        (sq["citywide_los"], "Citywide LOS"),
+        (str(sq["total_revenue_trips"]), "Revenue trips"),
+        (sq["citywide_dead_km_ratio"], "Dead km %"),
+        (sq["min_soc_citywide"], "Min SOC"),
+    ]
+    h = '<div class="ps-kpi-strip">'
+    for v, l in kpis:
+        h += f'<div class="ps-kpi"><div class="ps-kpi-v">{v}</div><div class="ps-kpi-l">{l}</div></div>'
+    st.markdown(h + '</div>', unsafe_allow_html=True)
+
+    # Two columns
+    c1, c2 = st.columns([1, 1], gap="medium")
+
     with c1:
-        st.metric("Total Fleet", fleet["total_allocated"],
-                  help="Total buses allocated across all routes")
-    with c2:
-        st.metric("Total PVR", fleet["total_pvr"],
-                  help="Peak Vehicle Requirement — theoretical minimum")
-    with c3:
-        delta = fleet["surplus"] if fleet["surplus"] > 0 else -fleet["deficit"]
-        st.metric("Surplus / Deficit", f"{delta:+d}",
-                  delta_color=("normal" if delta >= 0 else "inverse"))
-    with c4:
-        sq = summary["service_quality"]
-        st.metric("Citywide LOS", sq["citywide_los"],
-                  help="Weighted average Level of Service across routes")
-
-    # ── Section 2: Service Quality ───────────────────────────────────────────
-    sq = summary["service_quality"]
-    routes_below = sq["routes_below_los_c"]
-
-    if routes_below:
-        st.markdown(
-            f'<div style="background: #FEF9E7; border-left: 4px solid #D35400; '
-            f'padding: 10px 14px; border-radius: 4px; margin: 8px 0;">'
-            f'<strong>⚠ {len(routes_below)} route(s) below LOS C:</strong></div>',
-            unsafe_allow_html=True,
-        )
-        cols_per_row = 3
-        for i in range(0, len(routes_below), cols_per_row):
-            cols = st.columns(cols_per_row)
-            for j, rb in enumerate(routes_below[i:i + cols_per_row]):
-                with cols[j]:
-                    st.markdown(
-                        f"**{rb['route']}** &nbsp; {_los_badge(rb['los'])}  \n"
-                        f"Max gap: {rb['max_gap_min']:.0f} min &nbsp;·&nbsp; "
-                        f"Avg wait: {rb['avg_wait_min']:.0f} min &nbsp;·&nbsp; "
-                        f"CV: {rb['headway_cv']:.2f}",
-                        unsafe_allow_html=True,
-                    )
-
-    # ── Section 3: Recommendations [Phase 2] ────────────────────────────────
-    recs = getattr(city_schedule, "recommendations", [])
-    if recs:
-        st.markdown(
-            '<div style="background: var(--color-background-secondary); '
-            'border-left: 4px solid #2E86C1; padding: 10px 14px; '
-            'border-radius: 4px; margin: 8px 0;">'
-            '<strong>📋 Top recommendations</strong></div>',
-            unsafe_allow_html=True,
-        )
-        _PRIO_EMOJI = {1: "🔴", 2: "🟠", 3: "🟡", 4: "🔵", 5: "⚪"}
-        for rec in recs[:5]:
-            emoji = _PRIO_EMOJI.get(rec.priority, "⚪")
-            routes = ", ".join(rec.route_codes) if rec.route_codes else "Citywide"
-            with st.container():
+        rb = sq["routes_below_los_c"]
+        if rb:
+            st.markdown('<div class="ps-sec">Service quality alerts</div>', unsafe_allow_html=True)
+            for r in rb[:6]:
                 st.markdown(
-                    f"{emoji} **[{routes}]** {rec.action}  \n"
-                    f"<span style='font-size:0.85rem; color:var(--color-text-secondary);'>"
-                    f"↳ {rec.reason}</span>",
-                    unsafe_allow_html=True,
-                )
+                    f'<div class="ps-alert ps-alert-w">{_dot(r["los"])} '
+                    f'<strong>{r["route"]}</strong> \u2014 '
+                    f'gap {r["max_gap_min"]:.0f}\u2009min, '
+                    f'wait {r["avg_wait_min"]:.0f}\u2009min, '
+                    f'CV\u2009{r["headway_cv"]:.2f}</div>',
+                    unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="ps-alert ps-alert-ok">All routes at LOS C or above</div>',
+                        unsafe_allow_html=True)
+        w = s.get("warnings", [])
+        if w:
+            st.markdown('<div class="ps-sec">Warnings</div>', unsafe_allow_html=True)
+            for x in w[:5]:
+                x = x.lstrip("\u26a0\ufe0f ").strip()
+                st.markdown(f'<div class="ps-alert ps-alert-w">{x}</div>', unsafe_allow_html=True)
 
-    # ── Section 4: Warnings ──────────────────────────────────────────────────
-    warnings = summary["warnings"]
-    if warnings:
-        with st.expander(f"⚠ {len(warnings)} warning(s)", expanded=True):
-            for w in warnings:
-                st.markdown(f"- {w}")
-    else:
-        st.success("✓ No warnings. All routes meet compliance and SOC thresholds.")
+    with c2:
+        recs = getattr(city_schedule, "recommendations", [])
+        st.markdown('<div class="ps-sec">Recommendations</div>', unsafe_allow_html=True)
+        if recs:
+            for rec in recs[:6]:
+                rt = ", ".join(rec.route_codes) if rec.route_codes else "All"
+                st.markdown(
+                    f'<div class="ps-rec">'
+                    f'<div class="ps-rp ps-rp{rec.priority}">P{rec.priority}</div>'
+                    f'<div class="ps-rr">{rt}</div>'
+                    f'<div><div class="ps-ra">{rec.action}</div>'
+                    f'<div class="ps-rx">{rec.reason}</div></div></div>',
+                    unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="ps-alert ps-alert-ok">No actionable items</div>',
+                        unsafe_allow_html=True)
 
+    st.markdown('</div>', unsafe_allow_html=True)
     st.markdown("---")
 
 
-def render_route_category_legend() -> None:
-    """Small inline legend explaining route categories."""
-    st.caption(
-        "**Route categories:** "
-        "**Trunk** = high-frequency corridor (target LOS A–B) · "
-        "**Standard** = regular urban route (target LOS B–C) · "
-        "**Feeder** = low-frequency connector (target LOS C–D acceptable)"
-    )
+def render_route_los_table(city_schedule) -> None:
+    """Compact LOS + metrics table for Service Quality tab."""
+    if city_schedule is None:
+        return
+    rows = []
+    for code in sorted(city_schedule.results):
+        r = city_schedule.results[code]
+        m = r.metrics
+        rows.append({
+            "Route": code,
+            "Category": getattr(r.config, "route_category", "standard").title(),
+            "LOS": getattr(m, "los_grade", ""),
+            "CV": round(m.headway_cv, 3),
+            "Max gap": f"{m.max_headway_gap_min:.0f}",
+            "Avg wait": f"{getattr(m, 'avg_wait_min', 0):.0f}",
+            "EWT": f"{getattr(m, 'ewt_proxy', 0):.1f}",
+            "kWh/km": f"{getattr(m, 'kwh_per_rev_km', 0):.2f}",
+            "Reliability": f"{getattr(m, 'service_reliability_idx', 0):.3f}",
+            "Fleet": r.fleet_allocated,
+            "PVR": r.pvr,
+        })
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
