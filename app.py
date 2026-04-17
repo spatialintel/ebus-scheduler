@@ -46,18 +46,19 @@ st.set_page_config(page_title="eBus Scheduler", page_icon="🚌", layout="wide",
 
 st.markdown("""
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
-  html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
-  .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+  html, body, [class*="css"] { font-family: 'Inter', -apple-system, sans-serif; }
+  .block-container { padding-top: 1.2rem; padding-bottom: 1.5rem; }
 
-  /* KPI cards */
-  .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin-bottom: 1.2rem; }
-  .kpi { background: #fff; border: 1px solid #e8eaed; border-radius: 10px; padding: 14px 16px; }
-  .kpi-val { font-size: 1.65rem; font-weight: 700; color: #1a1a2e; line-height: 1.1; font-family: 'DM Mono', monospace; }
-  .kpi-label { font-size: 0.72rem; font-weight: 500; color: #888; text-transform: uppercase; letter-spacing: .05em; margin-top: 4px; }
-  .kpi-sub { font-size: 0.68rem; color: #aaa; margin-top: 2px; }
+  /* KPI strip — compact, data-dense */
+  .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 0; margin-bottom: 1rem; border: 1px solid #e2e4e8; border-radius: 4px; overflow: hidden; }
+  .kpi { background: #fafbfc; border-right: 1px solid #eee; padding: 10px 14px; }
+  .kpi:last-child { border-right: none; }
+  .kpi-val { font-size: 1.35rem; font-weight: 700; color: #1a1a2e; line-height: 1.1; font-family: 'JetBrains Mono', monospace; }
+  .kpi-label { font-size: 0.62rem; font-weight: 500; color: #999; text-transform: uppercase; letter-spacing: .04em; margin-top: 2px; }
+  .kpi-sub { font-size: 0.62rem; color: #bbb; margin-top: 1px; }
   .kpi-ok .kpi-val { color: #16a34a; }
-  .kpi-warn .kpi-val { color: #d97706; }
+  .kpi-warn .kpi-val { color: #b45309; }
   .kpi-bad .kpi-val { color: #dc2626; }
 
   /* Compliance scorecard */
@@ -77,7 +78,7 @@ st.markdown("""
   .bus-pill { font-size: 0.72rem; font-weight: 600; padding: 2px 10px; border-radius: 20px; background: #e0e7ff; color: #4338ca; }
 
   /* Section headers */
-  .section-title { font-size: 1.1rem; font-weight: 700; color: #1a1a2e; margin: 1.2rem 0 0.4rem 0; padding-bottom: 6px; border-bottom: 2px solid #e8eaed; }
+  .section-title { font-size: 0.92rem; font-weight: 600; color: #555; margin: 1rem 0 0.3rem 0; padding-bottom: 4px; border-bottom: 1px solid #e8eaed; text-transform: uppercase; letter-spacing: 0.03em; }
 
   div[data-testid="stDownloadButton"] button { background: #4f46e5; color: white; border: none; border-radius: 8px; font-weight: 600; padding: 0.5rem 1.5rem; }
   div[data-testid="stDownloadButton"] button:hover { background: #4338ca; }
@@ -2319,68 +2320,58 @@ elif app_mode == "🏙️ Citywide":
             for w in load_warnings:
                 st.warning(w)
 
-    _mode_map = {
-        "planning":    "📋 Planning-Compliant",
-        "efficiency":  "⚡ Resource Optimization",
-        "service_max": "🎯 Service Maximization",
-    }
     _stored_city_mode = st.session_state.get("city_mode_used", "planning")
-    mode_label = _mode_map.get(_stored_city_mode, "📋 Planning-Compliant")
-    st.markdown(f"## 🏙️ Citywide Schedule — {len(cs.results)} Routes")
-    st.caption(f"Mode: **{mode_label}** · Depot: **{city_cfg.depot_name}**")
-    _stored_city_mode = st.session_state.get("city_mode_used", "planning")
-    if _stored_city_mode == "efficiency":
-        st.info("⚡ **Resource Optimization**: binary-searches minimum fleet per route satisfying "
-                "all P1–P6 rules. Config fleet size overridden; headway floor still enforced.", icon="⚡")
-    elif _stored_city_mode == "service_max":
-        st.info("🎯 **Service Maximization**: config fleet used as-is. Headway profile replaced "
-                "with constant minimum-achievable headway per route for even spacing.", icon="🎯")
-    else:
-        st.info("📋 **Planning-Compliant**: headway profile respected. "
-                "Surplus buses redistributed to deficit routes based on time-sliced PVR.", icon="📋")
+    # ── Header bar ─────────────────────────────────────────────────────────────
+    _mode_labels = {"planning": "Planning-Compliant", "efficiency": "Resource Optimization",
+                    "resource_optimization": "Resource Optimization", "service_max": "Service Maximization"}
+    _mode_used = st.session_state.get("city_mode_used", "planning")
+    _ml = _mode_labels.get(_mode_used, "Planning-Compliant")
 
-    # ── Citywide KPIs ─────────────────────────────────────────────────────────
-    st.markdown(f"## 🏙️ Citywide Schedule — {len(cs.results)} Routes")
-    st.caption(f"Mode: **{mode_label}** · Depot: **{city_cfg.depot_name}**")
+    st.markdown(
+        f'<div style="display:flex; align-items:baseline; gap:12px; '
+        f'border-bottom:2px solid #1a1a2e; padding-bottom:6px; margin-bottom:10px;">'
+        f'<span style="font-size:1.15rem; font-weight:700; color:#1a1a2e;">'
+        f'Citywide schedule — {len(cs.results)} routes</span>'
+        f'<span style="font-size:0.78rem; color:#888;">{_ml} · {city_cfg.depot_name}</span>'
+        f'</div>', unsafe_allow_html=True)
 
+    # ── KPI strip ─────────────────────────────────────────────────────────────
     st.markdown(
         '<div class="kpi-grid">' +
         kpi("Routes", str(len(cs.results))) +
-        kpi("Total Fleet", str(cs.total_buses_used),
-            sub=f"configured: {city_cfg.total_configured_fleet}") +
-        kpi("Revenue Trips", str(cs.total_revenue_trips)) +
-        kpi("Total KM", f"{cs.total_km:,.0f}",
-            sub=f"revenue: {cs.total_revenue_km:,.0f}") +
-        kpi("Dead KM", f"{cs.total_dead_km:,.0f}",
+        kpi("Fleet", str(cs.total_buses_used),
+            sub=f"cfg: {city_cfg.total_configured_fleet}") +
+        kpi("Revenue trips", str(cs.total_revenue_trips)) +
+        kpi("Revenue km", f"{cs.total_revenue_km:,.0f}") +
+        kpi("Dead km", f"{cs.total_dead_km:,.0f}",
             "ok" if cs.citywide_dead_km_ratio < 0.15 else "warn",
-            sub=f"{cs.citywide_dead_km_ratio:.1%} of total · {cs.total_dead_trips} trips") +
+            sub=f"{cs.citywide_dead_km_ratio:.1%}") +
         kpi("Min SOC", f"{cs.min_soc_citywide:.1f}%",
             "ok" if cs.min_soc_citywide >= 25 else "warn" if cs.min_soc_citywide >= 20 else "bad") +
         kpi("Utilization", f"{cs.citywide_utilization_pct:.0f}%",
             "ok" if cs.citywide_utilization_pct >= 85 else "warn") +
-        kpi("Avg HW Dev", f"{cs.avg_headway_deviation_min:.1f} min",
-            "ok" if cs.avg_headway_deviation_min < 5 else "warn"
-            if cs.avg_headway_deviation_min < 10 else "bad",
-            sub="vs configured") +
+        kpi("HW deviation", f"{cs.avg_headway_deviation_min:.1f}m",
+            "ok" if cs.avg_headway_deviation_min < 5 else "warn",
+            sub="vs config") +
         '</div>', unsafe_allow_html=True,
     )
 
-    # Phase 1: Planning Summary — first thing the planner sees
-    render_planning_summary(cs)
-
+    # ── Tabs ──────────────────────────────────────────────────────────────────
     tab_overview, tab_rebalance, tab_hw_routes, tab_depot, tab_fleet_config, tab_compare, tab_advanced = st.tabs([
-        "📊 Overview", "🔄 Fleet & Rebalancing", "📈 Headways & Routes",
-        "🏭 Depot", "⚙️ Config Editor", "⚖️ Compare Modes", "🔬 Advanced ▾",
+        "Summary", "Fleet", "Routes & headways",
+        "Depot", "Config", "Compare", "Advanced",
     ])
-    # Bind legacy variable names so existing content blocks still work
     tab_headways      = tab_hw_routes
     tab_route_detail  = tab_hw_routes
     tab_pvr           = tab_advanced
     tab_stability     = tab_advanced
 
-    # ── CITY TAB 1: Overview ──────────────────────────────────────────────────
+    # ── CITY TAB 1: Summary ───────────────────────────────────────────────────
     with tab_overview:
-        # ── Min feasible headway table (compact, no per-route error boxes) ────
+        # Planning summary: recommendations + alerts + route table
+        render_planning_summary(cs)
+
+        # Min feasible headway table
         _city_mode_used = st.session_state.get("city_mode_used", "planning")
         _mf_display     = []
         _problem_count  = 0
