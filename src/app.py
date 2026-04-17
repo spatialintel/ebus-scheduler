@@ -24,6 +24,9 @@ from src.trip_generator import generate_trips, check_headway_feasibility
 from src.bus_scheduler import schedule_buses, check_compliance
 from src.output_formatter import write_schedule
 from src.metrics import compute_metrics
+from src.planning_summary_ui import render_planning_summary
+from src.city_scheduler import mode_display_name
+from src.config_validator import validate_city_config, validate_route_config, ConfigError as ValidatorConfigError
 
 # Citywide imports — safe fallback if files not yet deployed
 try:
@@ -1349,7 +1352,8 @@ def _run_core(config, headway_df, travel_time_df, optimize,
         assigned_rev = sum(1 for b in buses for t in b.trips if t.trip_type == 'Revenue')
         metrics = compute_metrics(config, buses,
                                   total_revenue_trips=len(revenue_trips),
-                                  assigned_revenue_trips=assigned_rev)
+                                  assigned_revenue_trips=assigned_rev,
+                                  headway_df=headway_df)
     else:
         buses = schedule_buses(config, trips,
                                headway_df=headway_df, travel_time_df=travel_time_df,
@@ -1359,7 +1363,8 @@ def _run_core(config, headway_df, travel_time_df, optimize,
         assigned_rev = sum(1 for b in buses for t in b.trips if t.trip_type == 'Revenue')
         metrics = compute_metrics(config, buses,
                                   total_revenue_trips=len(revenue_trips),
-                                  assigned_revenue_trips=assigned_rev)
+                                  assigned_revenue_trips=assigned_rev,
+                                  headway_df=headway_df)
     compliance = check_compliance(config, buses, headway_df=headway_df)
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
         write_schedule(config, buses, f.name)
@@ -1392,7 +1397,8 @@ def auto_detect_fleet(raw_config, headway_df, travel_time_df, max_fleet=20):
         hard_pass    = all(r["status"] == "PASS"
                            for r in compliance if r.get("priority", 99) <= 6)
         if hard_pass and rev_assigned == rev_total:
-            metrics = compute_metrics(cfg, buses, total_revenue_trips=rev_total)
+            metrics = compute_metrics(cfg, buses, total_revenue_trips=rev_total,
+                                      headway_df=headway_df)
             with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
                 write_schedule(cfg, buses, f.name)
                 out = Path(f.name).read_bytes()
@@ -1402,7 +1408,8 @@ def auto_detect_fleet(raw_config, headway_df, travel_time_df, max_fleet=20):
 
     # Fallback: return best attempt with max fleet
     n, cfg, buses, rev_total, compliance = last_result
-    metrics = compute_metrics(cfg, buses, total_revenue_trips=rev_total)
+    metrics = compute_metrics(cfg, buses, total_revenue_trips=rev_total,
+                              headway_df=headway_df)
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
         write_schedule(cfg, buses, f.name)
         out = Path(f.name).read_bytes()
@@ -1418,6 +1425,19 @@ def run_pipeline(uploaded_file, optimize, config_overrides=None, headway_overrid
     st.session_state["raw_travel_time_df"] = travel_time_df.copy()
     if config_overrides: config = _apply_config_overrides(config, config_overrides)
     if headway_overrides is not None: headway_df = headway_overrides
+
+    # Phase 1: Pre-flight validation (single-route)
+    _v_errors, _v_warnings = validate_route_config(config, headway_df=headway_df,
+                                                    travel_time_df=travel_time_df)
+    if _v_errors:
+        st.error("Config validation failed — fix these before scheduling:")
+        for e in _v_errors:
+            st.markdown(f"- {e}")
+        st.stop()
+    if _v_warnings:
+        with st.expander(f"⚠ {len(_v_warnings)} config warning(s)", expanded=False):
+            for w in _v_warnings:
+                st.markdown(f"- {w}")
 
     # Auto fleet-size detection when fleet_size == 0 in the Excel
     if config.fleet_size == 0:
@@ -1490,16 +1510,16 @@ with st.sidebar:
         uploaded = st.file_uploader("Config Excel", type=["xlsx"], label_visibility="collapsed")
         single_mode = st.radio(
             "Scheduling mode",
-            ["📋 Planning-Compliant", "⚡ Efficiency-Maximising", "🎯 Service Maximization"],
+            ["📋 Planning-Compliant", "⚡ Resource Optimization", "🎯 Service Maximization"],
             index=0, label_visibility="collapsed",
         )
         if single_mode == "📋 Planning-Compliant":
             optimize = False; service_max_single = False
             st.info("📋 **Planning-Compliant** — follows headway profile strictly. "
                     "Fleet size from config.", icon="📋")
-        elif single_mode == "⚡ Efficiency-Maximising":
+        elif single_mode == "⚡ Resource Optimization":
             optimize = True; service_max_single = False
-            st.info("⚡ **Efficiency-Maximising** — finds minimum fleet satisfying all rules. "
+            st.info("⚡ **Resource Optimization** — finds minimum fleet satisfying all rules. "
                     "Config fleet size overridden; headway floor still enforced.", icon="⚡")
         else:
             optimize = False; service_max_single = True
@@ -1516,15 +1536,15 @@ with st.sidebar:
         )
         city_sched_mode = st.radio(
             "Scheduling mode",
-            ["📋 Planning-Compliant", "⚡ Efficiency-Maximising", "🎯 Service Maximization"],
+            ["📋 Planning-Compliant", "⚡ Resource Optimization", "🎯 Service Maximization"],
             index=0, label_visibility="collapsed",
         )
         if city_sched_mode == "📋 Planning-Compliant":
             city_mode = "planning"
             st.info("📋 **Planning-Compliant** — headway profile respected, surplus rebalanced.", icon="📋")
-        elif city_sched_mode == "⚡ Efficiency-Maximising":
+        elif city_sched_mode == "⚡ Resource Optimization":
             city_mode = "efficiency"
-            st.info("⚡ **Efficiency-Maximising** — minimum fleet per route, KPI-driven. "
+            st.info("⚡ **Resource Optimization** — minimum fleet per route, KPI-driven. "
                     "Config fleet size overridden; headway floor still enforced.", icon="⚡")
         else:
             city_mode = "service_max"
@@ -1539,7 +1559,7 @@ with st.sidebar:
             disabled=not uploaded_files,
         )
         st.divider()
-        st.caption("📋 Planning-Compliant · ⚡ Efficiency-Maximising · 🎯 Service Maximization")
+        st.caption("📋 Planning-Compliant · ⚡ Resource Optimization · 🎯 Service Maximization")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -2258,6 +2278,17 @@ elif app_mode == "🏙️ Citywide":
                 city_config, load_warnings = load_city_config_from_files(uploaded_files)
                 if total_fleet_override > 0:
                     city_config.total_fleet = total_fleet_override
+                # Phase 1: Pre-flight validation
+                _v_errors, _v_warnings = validate_city_config(city_config)
+                if _v_errors:
+                    st.error("Config validation failed — fix these before scheduling:")
+                    for e in _v_errors:
+                        st.markdown(f"- {e}")
+                    st.stop()
+                if _v_warnings:
+                    with st.expander(f"⚠ {len(_v_warnings)} config warning(s)", expanded=False):
+                        for w in _v_warnings:
+                            st.markdown(f"- {w}")
                 city_result = schedule_city(city_config, mode=city_mode)
             except ConfigError as e:
                 st.error(f"Config error: {e}"); st.stop()
@@ -2290,7 +2321,7 @@ elif app_mode == "🏙️ Citywide":
 
     _mode_map = {
         "planning":    "📋 Planning-Compliant",
-        "efficiency":  "⚡ Efficiency-Maximising",
+        "efficiency":  "⚡ Resource Optimization",
         "service_max": "🎯 Service Maximization",
     }
     _stored_city_mode = st.session_state.get("city_mode_used", "planning")
@@ -2299,7 +2330,7 @@ elif app_mode == "🏙️ Citywide":
     st.caption(f"Mode: **{mode_label}** · Depot: **{city_cfg.depot_name}**")
     _stored_city_mode = st.session_state.get("city_mode_used", "planning")
     if _stored_city_mode == "efficiency":
-        st.info("⚡ **Efficiency-Maximising**: binary-searches minimum fleet per route satisfying "
+        st.info("⚡ **Resource Optimization**: binary-searches minimum fleet per route satisfying "
                 "all P1–P6 rules. Config fleet size overridden; headway floor still enforced.", icon="⚡")
     elif _stored_city_mode == "service_max":
         st.info("🎯 **Service Maximization**: config fleet used as-is. Headway profile replaced "
@@ -2333,6 +2364,9 @@ elif app_mode == "🏙️ Citywide":
             sub="vs configured") +
         '</div>', unsafe_allow_html=True,
     )
+
+    # Phase 1: Planning Summary — first thing the planner sees
+    render_planning_summary(cs)
 
     tab_overview, tab_rebalance, tab_hw_routes, tab_depot, tab_fleet_config, tab_compare, tab_advanced = st.tabs([
         "📊 Overview", "🔄 Fleet & Rebalancing", "📈 Headways & Routes",
@@ -2844,9 +2878,9 @@ elif app_mode == "🏙️ Citywide":
             st.markdown('<div class="section-title">Full Trip Schedule</div>',
                         unsafe_allow_html=True)
             trip_rows = []
-            soc_t = r.config.initial_soc_percent
             trip_seq_n = 0
             for bus in r.buses:
+                soc_t = r.config.initial_soc_percent   # reset per bus — was missing, caused negative SOC
                 for trip in bus.trips:
                     soc_t -= (trip.distance_km * r.config.consumption_rate / r.config.battery_kwh) * 100
                     if trip.trip_type == "Charging":

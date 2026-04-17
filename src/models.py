@@ -71,6 +71,11 @@ class BusState:
     trips: list[Trip] = field(default_factory=list)
     route_history: list[str] = field(default_factory=list)  # citywide: routes served [Phase 2 interlining]
     current_route: str = ""                                  # citywide: currently assigned route
+    # Per-bus decision log — records WHY each key scheduling decision was made.
+    # Populated by bus_scheduler.py at: bus selection, charge triggers, emergency rescue.
+    # Use for debugging silent failures, audit trail, and future explainability UI.
+    # Format: "<HH:MM> <REASON>" — append only, never mutate existing entries.
+    decision_log: list[str] = field(default_factory=list)
 
     def _soc_cost(self, km: float) -> float:
         """SOC percentage consumed for a given distance."""
@@ -209,6 +214,17 @@ class RouteConfig:
     # rural_node must be "start_point" or "end_point"
     is_suburban_route: bool = False
     rural_node: str = ""
+
+    # v9: route classification — determines service expectations (min frequency, max gap)
+    #   "trunk"    — high-frequency corridor (target LOS A–B)
+    #   "standard" — regular urban route (target LOS B–C)
+    #   "feeder"   — low-frequency connector (target LOS C–D acceptable)
+    route_category: str = "standard"
+
+    # v9: recovery buffer added to cycle_time in Resource Optimization mode
+    # Accounts for minor delays (dwell time, traffic). 0 = disabled (default).
+    # cycle_time_effective = up + dn + 2×preferred_layover + 2×recovery_buffer
+    recovery_buffer_min: int = 0
 
     @property
     def depot_flow_rate_kw(self) -> float:

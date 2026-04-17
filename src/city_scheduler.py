@@ -53,6 +53,19 @@ from src.trip_generator import generate_trips
 from src.bus_scheduler import schedule_buses
 from src.metrics import compute_metrics
 
+# Phase 2 imports — soft so missing files don't break existing functionality
+try:
+    from src.recommender import generate_recommendations
+    _HAS_RECOMMENDER = True
+except ImportError:
+    _HAS_RECOMMENDER = False
+
+try:
+    from src.depot_model import simulate_depot
+    _HAS_DEPOT_MODEL = True
+except ImportError:
+    _HAS_DEPOT_MODEL = False
+
 # ---------------------------------------------------------------------------
 # Tunable constants — change here to affect all modes globally
 # ---------------------------------------------------------------------------
@@ -314,6 +327,7 @@ def _run_single_route(
         metrics = compute_metrics(
             config, buses,
             total_revenue_trips=revenue_count,
+            headway_df=headway_df,
         )
 
         # Tag buses and trips with route_code
@@ -693,28 +707,78 @@ def _schedule_service_maximization(city: CityConfig) -> CitySchedule:
 def schedule_city(
     city: CityConfig,
     optimize: bool = False,   # kept for backward compat
-    mode: str = "planning",   # "planning" | "efficiency" | "service_max"
+    mode: str = "planning",   # "planning" | "efficiency" | "resource_optimization" | "service_max"
 ) -> CitySchedule:
     """
     Main entry point for citywide scheduling.
 
     Args:
         city:     CityConfig with all routes loaded
-        optimize: legacy flag — True maps to mode='efficiency'
-        mode:     'planning'    → Planning-Compliant (headway profile respected)
-                  'efficiency'  → Efficiency-Maximising (minimum fleet, KPI-driven)
-                  'service_max' → Service Maximization (fixed fleet, constant headway)
+        optimize: legacy flag — True maps to mode='resource_optimization'
+        mode:     'planning'              → Planning-Compliant (headway profile respected)
+                  'resource_optimization' → Resource Optimization (minimum fleet, KPI-driven)
+                  'efficiency'            → legacy alias for 'resource_optimization'
+                  'service_max'           → Service Maximization (fixed fleet, constant headway)
 
     Returns:
         CitySchedule with per-route results + transfer records + stability flags
     """
-    # Backward compat: old callers pass optimize=True for efficiency mode
+    # Backward compat: old callers pass optimize=True
     if optimize and mode == "planning":
+        mode = "resource_optimization"
+
+    # Mode alias: 'resource_optimization' is the new canonical name; 'efficiency' still works
+    if mode == "resource_optimization":
         mode = "efficiency"
 
     if mode == "efficiency":
-        return _schedule_kpi_driven(city)
+        result = _schedule_kpi_driven(city)
     elif mode == "service_max":
-        return _schedule_service_maximization(city)
+        result = _schedule_service_maximization(city)
     else:
-        return _schedule_headway_driven(city)
+        result = _schedule_headway_driven(city)
+
+    # Phase 2: post-processing — depot model + recommendations
+    _post_process(result)
+    return result
+
+
+def _post_process(cs: CitySchedule) -> None:
+    """
+    Run depot simulation and recommendation engine on a completed CitySchedule.
+    Modifies cs in-place (adds depot_log per route, recommendations on CitySchedule).
+    Soft-fails: if Phase 2 modules aren't available, skips silently.
+    """
+    # Depot model: simulate charger queue per route
+    if _HAS_DEPOT_MODEL:
+        try:
+            for code, r in cs.results.items():
+                slots_slow = getattr(cs.city_config, "depot_charger_slots", 0) or 0
+                r.depot_log = simulate_depot(
+                    r.buses, r.config,
+                    slots_slow=slots_slow,
+                )
+        except Exception:
+            pass  # depot model is non-critical
+
+    # Recommender: generate actionable recommendations
+    if _HAS_RECOMMENDER:
+        try:
+            cs.recommendations = generate_recommendations(cs)
+        except Exception:
+            pass  # recommender is non-critical
+
+
+# ── Mode display names (used by dashboard for user-facing labels) ────────────
+
+MODE_DISPLAY_NAMES: dict[str, str] = {
+    "planning":                "Planning-Compliant",
+    "efficiency":              "Resource Optimization",   # renamed for v9
+    "resource_optimization":   "Resource Optimization",
+    "service_max":             "Service Maximization",
+}
+
+
+def mode_display_name(mode: str) -> str:
+    """Return user-facing display name for a scheduling mode."""
+    return MODE_DISPLAY_NAMES.get(mode, mode)

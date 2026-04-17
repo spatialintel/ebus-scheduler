@@ -680,6 +680,15 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
         cycle_time  = dn_tt + min_break   # one direction only
     else:
         cycle_time  = dn_tt + min_break + up_tt + min_break
+
+    # v9 (Phase 1): Recovery buffer — efficiency / resource_optimization mode only.
+    # Adds slack to cycle_time to account for minor delays (dwell, traffic).
+    # Planning mode is untouched. Default 0 = no change in behaviour.
+    if scheduling_mode != "planning":
+        recovery = getattr(config, "recovery_buffer_min", 0) or 0
+        if recovery > 0:
+            cycle_time += 2 * recovery  # one buffer per direction
+
     natural_gap = cycle_time / max(1, config.fleet_size)
 
     # Phase 1 stagger gap: space buses at the minimum headway so they arrive
@@ -718,15 +727,7 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
     #
     # B) INTERMEDIATE ROUTE (has intermediate stops, not rural, not circular):
     #      First half  → DEPOT → intermediate_node → nearest_terminal
-    #      Second half → DEPOT → intermediate_node → far_terminal
-    #      Both halves pass through the intermediate — they diverge FROM there,
-    #      not from the depot. Direct depot→far is only used as a fallback if
-    #      the intermediate→far segment is missing from the Distances sheet.
-    #      Rule: only applies at start-of-day; mid-day/end-of-day depot visits
-    #      are unaffected (those go to nearest node per P2).
-    #
-    #      is_suburban_route=YES overrides this: rural routes always use Mode A
-    #      regardless of whether intermediates are present.
+    #      Second half → DEPOT → far_terminal  (direct)
     #      Ensures both terminals are served at service start.
     #
     # C) SIMPLE ROUTE (no intermediates, or circular):
@@ -827,37 +828,32 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                 _make_dead(bus, rev_start, d_near, t_near, config=config)
 
         elif split_dispatch and i >= inter_half:
-            # Second half: DEPOT → intermediate → far terminal
-            # ALL buses on intermediate routes must pass through the intermediate
-            # first at start-of-day — they diverge from there, not from depot.
+            # Second half: DEPOT → far terminal (direct, no intermediate)
             slot_idx  = i - inter_half
             arrive_at = op_start_dt + timedelta(minutes=slot_idx * phase1_gap)
             try:
-                d_int2 = config.get_distance(config.depot, intermediate_node)
-                t_int2 = config.get_travel_time(config.depot, intermediate_node)
+                d_far2 = config.get_distance(config.depot, far_loc)
+                t_far2 = config.get_travel_time(config.depot, far_loc)
             except KeyError:
-                d_int2, t_int2 = 0, 0
-            try:
-                d_far2 = config.get_distance(intermediate_node, far_loc)
-                t_far2 = config.get_travel_time(intermediate_node, far_loc)
-            except KeyError:
-                # fallback: direct depot → far if intermediate→far segment missing
-                try:
-                    d_far2 = config.get_distance(config.depot, far_loc)
-                    t_far2 = config.get_travel_time(config.depot, far_loc)
-                    d_int2, t_int2 = 0, 0
-                except KeyError:
-                    d_far2, t_far2 = 0, nearest_tt
-            total_travel2    = t_int2 + t_far2
-            bus.current_time = arrive_at - timedelta(minutes=total_travel2)
-            if d_int2 > 0:
-                _make_dead(bus, intermediate_node, d_int2, t_int2, config=config)
-            if d_far2 > 0 and bus.current_location != far_loc:
+                d_far2, t_far2 = 0, nearest_tt
+            bus.current_time = arrive_at - timedelta(minutes=t_far2)
+            if d_far2 > 0:
                 _make_dead(bus, far_loc, d_far2, t_far2, config=config)
 
         # ── Mode C: Simple route — all buses to nearest terminal ─────────────
+        #    For circular routes: stagger half the fleet to serve UP trips first.
+        #    Even-indexed buses arrive at op_start → naturally pick DN first.
+        #    Odd-indexed buses arrive offset by (dn_travel + break) → pick UP first.
+        #    This ensures both directions get simultaneous coverage from service start.
         else:
-            arrive_at        = op_start_dt + timedelta(minutes=i * phase1_gap)
+            if is_circular and i % 2 == 1:
+                # Odd bus: offset by half-cycle so it arrives when UP trips start
+                up_offset = dn_tt + min_break
+                slot_idx  = (i - 1) // 2
+                arrive_at = op_start_dt + timedelta(minutes=slot_idx * phase1_gap + up_offset)
+            else:
+                slot_idx  = i // 2 if is_circular else i
+                arrive_at = op_start_dt + timedelta(minutes=slot_idx * phase1_gap)
             bus.current_time = arrive_at - timedelta(minutes=nearest_tt)
             _morning_dead_run(bus, config)
             if reposition_to and bus.current_location != reposition_to:
@@ -948,6 +944,11 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
             _charging_detour(_rescue_candidate, config,
                              resume_by=op_end, min_break=min_break)
             charged_today.add(_rescue_candidate.bus_id)
+            _rescue_candidate.decision_log.append(
+                f"{_rescue_candidate.current_time.strftime('%H:%M')} EMERGENCY_RESCUE: "
+                f"SOC={_rescue_candidate.soc_percent:.1f}% below safe return threshold "
+                f"(floor={SOC_FLOOR}%). Forced charge bypasses P5 stagger gate."
+            )
 
 
         # Find the bus ready soonest that can make a valid trip
@@ -1215,6 +1216,12 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
         best_bus.assign(trip)
         # Clear the P6 headway hold for this bus — it has now departed.
         headway_hold.pop((best_bus.bus_id, best_dir, best_start), None)
+        best_bus.decision_log.append(
+            f"{best_rt.strftime('%H:%M')} SELECTED: dir={best_dir} "
+            f"{best_start}→{best_end} score={best_score:.2f} "
+            f"mode={scheduling_mode} SOC={best_bus.soc_percent:.1f}% "
+            f"km={best_bus.total_km:.1f}"
+        )
 
         # Post-trip charging decisions
         midday_soc  = getattr(config, 'midday_charge_soc_percent', MIDDAY_CHARGE_SOC)
@@ -1371,6 +1378,11 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
             _charging_detour(best_bus, config,
                              resume_by=op_end, min_break=min_break)
             charged_today.add(best_bus.bus_id)
+            best_bus.decision_log.append(
+                f"{best_bus.current_time.strftime('%H:%M')} P5_CHARGE: "
+                f"SOC={best_bus.soc_percent:.1f}% < midday_soc={midday_soc}%. "
+                f"In P5 window, stagger_ok=True, at_near_loc."
+            )
             for k in list(headway_hold.keys()):
                 if k[0] == best_bus.bus_id:
                     del headway_hold[k]
@@ -1382,12 +1394,22 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                 _charging_detour(best_bus, config,
                                  resume_by=op_end, min_break=min_break)
                 charged_today.add(best_bus.bus_id)
+                best_bus.decision_log.append(
+                    f"{best_bus.current_time.strftime('%H:%M')} SOC_TRIGGER_P5_WINDOW: "
+                    f"SOC={best_bus.soc_percent:.1f}% ≤ trigger={soc_trigger}%. "
+                    f"In P5 window, stagger_ok=True."
+                )
                 for k in list(headway_hold.keys()):
                     if k[0] == best_bus.bus_id: del headway_hold[k]
             elif not _is_peak(best_bus.current_time) and charge_stagger_ok:
                 _charging_detour(best_bus, config,
                                  resume_by=op_end, min_break=min_break)
                 charged_today.add(best_bus.bus_id)
+                best_bus.decision_log.append(
+                    f"{best_bus.current_time.strftime('%H:%M')} SOC_TRIGGER_OFFPEAK: "
+                    f"SOC={best_bus.soc_percent:.1f}% ≤ trigger={soc_trigger}%. "
+                    f"Off-peak window, stagger_ok=True."
+                )
                 for k in list(headway_hold.keys()):
                     if k[0] == best_bus.bus_id: del headway_hold[k]
             else:
@@ -1397,6 +1419,11 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                     _charging_detour(best_bus, config,
                                      resume_by=op_end, min_break=min_break)
                     charged_today.add(best_bus.bus_id)
+                    best_bus.decision_log.append(
+                        f"{best_bus.current_time.strftime('%H:%M')} SOC_P3_OVERRIDE: "
+                        f"SOC={best_bus.soc_percent:.1f}% — next trip would breach "
+                        f"P3 floor={SOC_FLOOR}%. Charging now despite peak/stagger gate."
+                    )
                     for k in list(headway_hold.keys()):
                         if k[0] == best_bus.bus_id: del headway_hold[k]
 

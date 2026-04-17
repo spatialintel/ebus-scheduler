@@ -226,6 +226,7 @@ class CitySchedule:
             rows.append({
                 "Route": code,
                 "Name": r.config.route_name,
+                "Category": getattr(r.config, "route_category", "standard"),
                 "PVR": r.pvr,
                 "Config Fleet": r.fleet_original,
                 "Allocated": r.fleet_allocated,
@@ -236,6 +237,112 @@ class CitySchedule:
                 "Dead KM": round(m.dead_km, 1),
                 "Dead %": f"{m.dead_km_ratio:.1%}",
                 "Min SOC": f"{m.min_soc_seen:.1f}%",
+                "LOS": getattr(m, "los_grade", ""),
+                "Avg Wait": f"{getattr(m, 'avg_wait_min', 0):.0f} min",
                 "Score": f"{m.weighted_score():.4f}",
             })
         return rows
+
+    @property
+    def planning_summary(self) -> dict:
+        """
+        Auto-generated planning summary — the first thing the planner sees.
+        Returns a dict with sections: fleet, service_quality, warnings.
+        """
+        summary = {
+            "fleet": {},
+            "service_quality": {},
+            "warnings": [],
+        }
+
+        # ── Fleet overview ────────────────────────────────────────────────
+        total_fleet = self.total_buses_used
+        total_pvr = sum(r.pvr for r in self.results.values())
+        total_surplus = max(0, total_fleet - total_pvr)
+        total_deficit = max(0, total_pvr - total_fleet)
+        summary["fleet"] = {
+            "total_allocated": total_fleet,
+            "total_pvr": total_pvr,
+            "surplus": total_surplus,
+            "deficit": total_deficit,
+            "routes_with_deficit": [
+                code for code, r in self.results.items()
+                if r.fleet_allocated < r.pvr
+            ],
+        }
+
+        # ── Service quality ───────────────────────────────────────────────
+        los_grades = {}
+        routes_below_los_c = []
+        for code, r in self.results.items():
+            grade = getattr(r.metrics, "los_grade", "")
+            los_grades[code] = grade
+            if grade in ("D", "E", "F"):
+                routes_below_los_c.append({
+                    "route": code,
+                    "los": grade,
+                    "headway_cv": round(r.metrics.headway_cv, 3),
+                    "max_gap_min": round(r.metrics.max_headway_gap_min, 0),
+                    "avg_wait_min": round(getattr(r.metrics, "avg_wait_min", 0), 1),
+                })
+
+        # Citywide avg LOS (weighted by revenue trips)
+        grade_to_num = {"A": 1, "B": 2, "C": 3, "D": 4, "E": 5, "F": 6}
+        total_weight = sum(r.metrics.revenue_trips_assigned for r in self.results.values())
+        if total_weight > 0:
+            weighted_sum = sum(
+                grade_to_num.get(getattr(r.metrics, "los_grade", "C"), 3) * r.metrics.revenue_trips_assigned
+                for r in self.results.values()
+            )
+            avg_num = weighted_sum / total_weight
+            num_to_grade = {v: k for k, v in grade_to_num.items()}
+            citywide_los = num_to_grade.get(round(avg_num), "C")
+        else:
+            citywide_los = "—"
+
+        summary["service_quality"] = {
+            "citywide_los": citywide_los,
+            "routes_below_los_c": routes_below_los_c,
+            "total_revenue_trips": self.total_revenue_trips,
+            "total_revenue_km": round(self.total_revenue_km, 1),
+            "citywide_dead_km_ratio": f"{self.citywide_dead_km_ratio:.1%}",
+            "min_soc_citywide": f"{self.min_soc_citywide:.1f}%",
+        }
+
+        # ── Warnings ──────────────────────────────────────────────────────
+        # SOC risks
+        for code, r in self.results.items():
+            if r.metrics.min_soc_seen < r.config.min_soc_percent + 5:
+                summary["warnings"].append(
+                    f"⚠ SOC risk on {code}: min SOC = {r.metrics.min_soc_seen:.1f}% "
+                    f"(floor = {r.config.min_soc_percent}%, margin only "
+                    f"{r.metrics.min_soc_seen - r.config.min_soc_percent:.1f}%)"
+                )
+
+        # Headway infeasibilities
+        for code, r in self.results.items():
+            status = getattr(r, "headway_feasibility_status", "UNKNOWN")
+            if status == "INFEASIBLE":
+                details = getattr(r, "headway_feasibility_details", []) or []
+                infeasible_bands = [
+                    d for d in details
+                    if isinstance(d, dict) and d.get("status") == "INFEASIBLE"
+                ]
+                if infeasible_bands:
+                    band_str = ", ".join(
+                        str(d.get("band", "?")) for d in infeasible_bands[:3]
+                    )
+                    summary["warnings"].append(
+                        f"⚠ {code} headway infeasible in bands: {band_str}. "
+                        f"Scheduler used physics minimum instead of configured value."
+                    )
+
+        # Fleet deficit
+        if total_deficit > 0:
+            deficit_routes = summary["fleet"]["routes_with_deficit"]
+            summary["warnings"].append(
+                f"⚠ Fleet deficit: {total_deficit} buses short citywide. "
+                f"Affected routes: {', '.join(deficit_routes)}"
+            )
+
+        return summary
